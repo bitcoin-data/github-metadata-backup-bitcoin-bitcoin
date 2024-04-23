@@ -50,7 +50,7 @@
       }
     ],
     "created_at": "2023-11-29T16:25:29Z",
-    "updated_at": "2024-04-23T12:55:59Z",
+    "updated_at": "2024-04-23T13:25:54Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "cf872a90ffb06dbc5f34ae9b2c3202fa4a355556",
@@ -286,9 +286,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 35264,
-        "stargazers_count": 75935,
-        "watchers_count": 75935,
+        "forks_count": 35265,
+        "stargazers_count": 75936,
+        "watchers_count": 75936,
         "size": 254933,
         "default_branch": "master",
         "open_issues_count": 708,
@@ -308,9 +308,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-04-23T12:58:44Z",
+        "pushed_at": "2024-04-23T13:59:07Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-04-23T12:33:01Z",
+        "updated_at": "2024-04-23T13:10:22Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -339,7 +339,7 @@
     "deletions": 15,
     "changed_files": 11,
     "commits": 9,
-    "review_comments": 195,
+    "review_comments": 198,
     "comments": 24
   },
   "events": [
@@ -16376,6 +16376,162 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576208038"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3335,
+      "original_line": 3335,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576214320",
+      "pull_request_review_id": 2017182417,
+      "id": 1576214320,
+      "node_id": "PRRC_kwDOABII585d8x8w",
+      "diff_hunk": "@@ -3195,6 +3210,140 @@ void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef& tx, c\n     }\n }\n \n+void PeerManagerImpl::ProcessPackageResult(const Package& package, const PackageMempoolAcceptResult& package_result, const std::vector<NodeId>& senders)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    if (package_result.m_state.IsInvalid()) {\n+        m_recent_rejects_reconsiderable.insert(GetPackageHash(package));\n+    }\n+    // We currently only expect to process 1-parent-1-child packages. Remove if this changes.\n+    if (!Assume(package.size() == 2)) return;\n+\n+    // No package results to look through for PCKG_POLICY or PCKG_MEMPOOL_ERROR\n+    if (package_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY ||\n+        package_result.m_state.GetResult() == PackageValidationResult::PCKG_MEMPOOL_ERROR) return;\n+\n+    // Iterate backwards to erase in-package descendants from the orphanage before they become\n+    // relevant in AddChildrenToWorkSet.\n+    auto package_iter = package.rbegin();\n+    auto senders_iter = senders.rbegin();\n+    while (package_iter != package.rend()) {\n+        const auto& tx = *package_iter;\n+        const NodeId nodeid = *senders_iter;\n+        const auto it_result{package_result.m_tx_results.find(tx->GetWitnessHash())};\n+        if (Assume(it_result != package_result.m_tx_results.end())) {\n+            const auto& tx_result = it_result->second;\n+            switch (tx_result.m_result_type) {\n+                case MempoolAcceptResult::ResultType::VALID:\n+                {\n+                    Assume(tx_result.m_replaced_transactions.has_value());\n+                    std::list<CTransactionRef> empty_replacement_list;\n+                    ProcessValidTx(nodeid, tx, tx_result.m_replaced_transactions.value_or(empty_replacement_list));\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::INVALID:\n+                case MempoolAcceptResult::ResultType::DIFFERENT_WITNESS:\n+                {\n+                    // Don't add to vExtraTxnForCompact, as these transactions should have already been\n+                    // added there when added to the orphanage or rejected for TX_RECONSIDERABLE.\n+                    // This should be updated if package submission is ever used for transactions\n+                    // that haven't already been validated before.\n+                    ProcessInvalidTx(nodeid, tx, tx_result.m_state, /*maybe_add_extra_compact_tx=*/false);\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::MEMPOOL_ENTRY:\n+                {\n+                    // AlreadyHaveTx() should be catching transactions that are already in mempool.\n+                    Assume(false);\n+                    break;\n+                }\n+            }\n+        }\n+        package_iter++;\n+        // There should be a sender for each tx, but fall back to the last one otherwise.\n+        if (Assume(senders_iter != senders.rend())) senders_iter++;\n+    }\n+}\n+\n+void PeerManagerImpl::MaybeProcess1P1CPackage(const CTransactionRef& ptx, NodeId nodeid)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    const auto& parent_txid{ptx->GetHash()};\n+    const auto& parent_wtxid{ptx->GetWitnessHash()};\n+\n+    CTransactionRef tx_orphan{nullptr};\n+    NodeId orphan_sender{-1};\n+    Assume(m_recent_rejects_reconsiderable.contains(parent_wtxid.ToUint256()));\n+\n+    // Prefer children from this peer. This helps prevent censorship attempts in which an attacker\n+    // sends lots of fake children for the parent, and we (unluckily) keep selecting the fake\n+    // children instead of the real one provided by the honest peer.\n+    const auto cpfp_candidates_same_peer{m_orphanage.GetChildrenFromSamePeer(ptx, nodeid)};\n+\n+    // These children should be sorted from most newest to oldest. In the (probably uncommon) case\n+    // of children that replace each other, this helps us accept the highest feerate (probably the\n+    // most recent) one efficiently.\n+    for (const auto& child : cpfp_candidates_same_peer) {\n+        Package maybe_cpfp_package{ptx, child};\n+        if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+            tx_orphan = child;\n+            orphan_sender = nodeid;\n+            break;\n+        }\n+    }\n+\n+    // If no suitable candidate from the same peer is found, also try children that were provided by\n+    // a different peer. This is useful because sometimes multiple peers announce both transactions\n+    // to us, and we happen to download them from different peers (we wouldn't have known that these\n+    // 2 transactions are related). We still want to find 1p1c packages then.\n+    //\n+    // If we start tracking all announcers of orphans, we can restrict this logic to parent + child\n+    // pairs in which both were provided by the same peer, i.e. delete this step.\n+    if (!tx_orphan) {\n+        const auto cpfp_candidates_different_peer{m_orphanage.GetChildrenFromDifferentPeer(ptx, nodeid)};\n+\n+        // Find the first 1p1c that hasn't already been rejected. We randomize the order to not\n+        // create a bias that attackers can use to delay package acceptance.\n+        //\n+        // Create a random permutation of the indices.\n+        std::vector<size_t> tx_indices(cpfp_candidates_different_peer.size());\n+        std::iota(tx_indices.begin(), tx_indices.end(), 0);\n+        Shuffle(tx_indices.begin(), tx_indices.end(), m_rng);\n+\n+        for (const auto index : tx_indices) {\n+            // If we already tried a package and failed for any reason, the combined hash was\n+            // cached in m_recent_rejects_reconsiderable.\n+            Package maybe_cpfp_package{ptx, cpfp_candidates_different_peer.at(index).first};\n+            if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+                tx_orphan = cpfp_candidates_different_peer.at(index).first;\n+                orphan_sender = cpfp_candidates_different_peer.at(index).second;\n+                break;\n+            }\n+        }\n+    }\n+\n+    if (tx_orphan) {\n+        const Package package_1p1c{ptx, tx_orphan};\n+        const std::vector<NodeId> senders{nodeid, orphan_sender};\n+        const auto package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_1p1c, /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};\n+        LogDebug(BCLog::TXPACKAGES, \"package evaluation for parent %s (wtxid=%s) + child %s (wtxid=%s) in orphanage: %s\\n\",",
+      "path": "src/net_processing.cpp",
+      "position": 255,
+      "original_position": 148,
+      "commit_id": "55b1280c52af81aa6ea0860799fa16da49f51447",
+      "original_commit_id": "bb3bf0a39c036fbd94b99ed7002db7d9bdf0a1d6",
+      "in_reply_to_id": 1576164670,
+      "user": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "> though I'm not convinced this really will make a difference\r\n\r\nIs the suggestion to drop this and only try same-peer packages?",
+      "created_at": "2024-04-23T13:00:19Z",
+      "updated_at": "2024-04-23T13:00:48Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1576214320",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576214320"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3335,
+      "original_line": 3335,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576220246",
+      "pull_request_review_id": 2017192534,
+      "id": 1576220246,
+      "node_id": "PRRC_kwDOABII585d8zZW",
+      "diff_hunk": "@@ -3195,6 +3210,140 @@ void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef& tx, c\n     }\n }\n \n+void PeerManagerImpl::ProcessPackageResult(const Package& package, const PackageMempoolAcceptResult& package_result, const std::vector<NodeId>& senders)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    if (package_result.m_state.IsInvalid()) {\n+        m_recent_rejects_reconsiderable.insert(GetPackageHash(package));\n+    }\n+    // We currently only expect to process 1-parent-1-child packages. Remove if this changes.\n+    if (!Assume(package.size() == 2)) return;\n+\n+    // No package results to look through for PCKG_POLICY or PCKG_MEMPOOL_ERROR\n+    if (package_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY ||\n+        package_result.m_state.GetResult() == PackageValidationResult::PCKG_MEMPOOL_ERROR) return;\n+\n+    // Iterate backwards to erase in-package descendants from the orphanage before they become\n+    // relevant in AddChildrenToWorkSet.\n+    auto package_iter = package.rbegin();\n+    auto senders_iter = senders.rbegin();\n+    while (package_iter != package.rend()) {\n+        const auto& tx = *package_iter;\n+        const NodeId nodeid = *senders_iter;\n+        const auto it_result{package_result.m_tx_results.find(tx->GetWitnessHash())};\n+        if (Assume(it_result != package_result.m_tx_results.end())) {\n+            const auto& tx_result = it_result->second;\n+            switch (tx_result.m_result_type) {\n+                case MempoolAcceptResult::ResultType::VALID:\n+                {\n+                    Assume(tx_result.m_replaced_transactions.has_value());\n+                    std::list<CTransactionRef> empty_replacement_list;\n+                    ProcessValidTx(nodeid, tx, tx_result.m_replaced_transactions.value_or(empty_replacement_list));\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::INVALID:\n+                case MempoolAcceptResult::ResultType::DIFFERENT_WITNESS:\n+                {\n+                    // Don't add to vExtraTxnForCompact, as these transactions should have already been\n+                    // added there when added to the orphanage or rejected for TX_RECONSIDERABLE.\n+                    // This should be updated if package submission is ever used for transactions\n+                    // that haven't already been validated before.\n+                    ProcessInvalidTx(nodeid, tx, tx_result.m_state, /*maybe_add_extra_compact_tx=*/false);\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::MEMPOOL_ENTRY:\n+                {\n+                    // AlreadyHaveTx() should be catching transactions that are already in mempool.\n+                    Assume(false);\n+                    break;\n+                }\n+            }\n+        }\n+        package_iter++;\n+        // There should be a sender for each tx, but fall back to the last one otherwise.\n+        if (Assume(senders_iter != senders.rend())) senders_iter++;\n+    }\n+}\n+\n+void PeerManagerImpl::MaybeProcess1P1CPackage(const CTransactionRef& ptx, NodeId nodeid)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    const auto& parent_txid{ptx->GetHash()};\n+    const auto& parent_wtxid{ptx->GetWitnessHash()};\n+\n+    CTransactionRef tx_orphan{nullptr};\n+    NodeId orphan_sender{-1};\n+    Assume(m_recent_rejects_reconsiderable.contains(parent_wtxid.ToUint256()));\n+\n+    // Prefer children from this peer. This helps prevent censorship attempts in which an attacker\n+    // sends lots of fake children for the parent, and we (unluckily) keep selecting the fake\n+    // children instead of the real one provided by the honest peer.\n+    const auto cpfp_candidates_same_peer{m_orphanage.GetChildrenFromSamePeer(ptx, nodeid)};\n+\n+    // These children should be sorted from most newest to oldest. In the (probably uncommon) case\n+    // of children that replace each other, this helps us accept the highest feerate (probably the\n+    // most recent) one efficiently.\n+    for (const auto& child : cpfp_candidates_same_peer) {\n+        Package maybe_cpfp_package{ptx, child};\n+        if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+            tx_orphan = child;\n+            orphan_sender = nodeid;\n+            break;\n+        }\n+    }\n+\n+    // If no suitable candidate from the same peer is found, also try children that were provided by\n+    // a different peer. This is useful because sometimes multiple peers announce both transactions\n+    // to us, and we happen to download them from different peers (we wouldn't have known that these\n+    // 2 transactions are related). We still want to find 1p1c packages then.\n+    //\n+    // If we start tracking all announcers of orphans, we can restrict this logic to parent + child\n+    // pairs in which both were provided by the same peer, i.e. delete this step.\n+    if (!tx_orphan) {\n+        const auto cpfp_candidates_different_peer{m_orphanage.GetChildrenFromDifferentPeer(ptx, nodeid)};\n+\n+        // Find the first 1p1c that hasn't already been rejected. We randomize the order to not\n+        // create a bias that attackers can use to delay package acceptance.\n+        //\n+        // Create a random permutation of the indices.\n+        std::vector<size_t> tx_indices(cpfp_candidates_different_peer.size());\n+        std::iota(tx_indices.begin(), tx_indices.end(), 0);\n+        Shuffle(tx_indices.begin(), tx_indices.end(), m_rng);\n+\n+        for (const auto index : tx_indices) {\n+            // If we already tried a package and failed for any reason, the combined hash was\n+            // cached in m_recent_rejects_reconsiderable.\n+            Package maybe_cpfp_package{ptx, cpfp_candidates_different_peer.at(index).first};\n+            if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+                tx_orphan = cpfp_candidates_different_peer.at(index).first;\n+                orphan_sender = cpfp_candidates_different_peer.at(index).second;\n+                break;\n+            }\n+        }\n+    }\n+\n+    if (tx_orphan) {\n+        const Package package_1p1c{ptx, tx_orphan};\n+        const std::vector<NodeId> senders{nodeid, orphan_sender};\n+        const auto package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_1p1c, /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};\n+        LogDebug(BCLog::TXPACKAGES, \"package evaluation for parent %s (wtxid=%s) + child %s (wtxid=%s) in orphanage: %s\\n\",",
+      "path": "src/net_processing.cpp",
+      "position": 255,
+      "original_position": 148,
+      "commit_id": "55b1280c52af81aa6ea0860799fa16da49f51447",
+      "original_commit_id": "bb3bf0a39c036fbd94b99ed7002db7d9bdf0a1d6",
+      "in_reply_to_id": 1576164670,
+      "user": {
+        "login": "sdaftuar",
+        "id": 7463573,
+        "node_id": "MDQ6VXNlcjc0NjM1NzM=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7463573?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sdaftuar",
+        "html_url": "https://github.com/sdaftuar",
+        "followers_url": "https://api.github.com/users/sdaftuar/followers",
+        "following_url": "https://api.github.com/users/sdaftuar/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sdaftuar/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sdaftuar/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sdaftuar/subscriptions",
+        "organizations_url": "https://api.github.com/users/sdaftuar/orgs",
+        "repos_url": "https://api.github.com/users/sdaftuar/repos",
+        "events_url": "https://api.github.com/users/sdaftuar/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sdaftuar/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "> I guess it'll likely be something like:\r\n> \r\n> 1. peer A sends child, child is put in orphanage and parent tx request queued(but not yet sent)\r\n> 2. peer B has slightly out of date feefilter for your node, sends INV for parent\r\n\r\nWhat I'd expect to happen is that we get inv's for parent+child from both Peer A and Peer B, and we happen to request the parent from A and the child from B, but the child arrives first -- it's put in the orphanage, and since a request for the parent is already in flight to A, we don't send another request for the parent to B.\r\n\r\n(In this scenario I guess I'm assuming no feefilter, or that the feefilter value is slightly stale.)\r\n",
+      "created_at": "2024-04-23T13:04:12Z",
+      "updated_at": "2024-04-23T13:04:57Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1576220246",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576220246"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3335,
+      "original_line": 3335,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576261445",
+      "pull_request_review_id": 2017269003,
+      "id": 1576261445,
+      "node_id": "PRRC_kwDOABII585d89dF",
+      "diff_hunk": "@@ -3195,6 +3210,140 @@ void PeerManagerImpl::ProcessValidTx(NodeId nodeid, const CTransactionRef& tx, c\n     }\n }\n \n+void PeerManagerImpl::ProcessPackageResult(const Package& package, const PackageMempoolAcceptResult& package_result, const std::vector<NodeId>& senders)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    if (package_result.m_state.IsInvalid()) {\n+        m_recent_rejects_reconsiderable.insert(GetPackageHash(package));\n+    }\n+    // We currently only expect to process 1-parent-1-child packages. Remove if this changes.\n+    if (!Assume(package.size() == 2)) return;\n+\n+    // No package results to look through for PCKG_POLICY or PCKG_MEMPOOL_ERROR\n+    if (package_result.m_state.GetResult() == PackageValidationResult::PCKG_POLICY ||\n+        package_result.m_state.GetResult() == PackageValidationResult::PCKG_MEMPOOL_ERROR) return;\n+\n+    // Iterate backwards to erase in-package descendants from the orphanage before they become\n+    // relevant in AddChildrenToWorkSet.\n+    auto package_iter = package.rbegin();\n+    auto senders_iter = senders.rbegin();\n+    while (package_iter != package.rend()) {\n+        const auto& tx = *package_iter;\n+        const NodeId nodeid = *senders_iter;\n+        const auto it_result{package_result.m_tx_results.find(tx->GetWitnessHash())};\n+        if (Assume(it_result != package_result.m_tx_results.end())) {\n+            const auto& tx_result = it_result->second;\n+            switch (tx_result.m_result_type) {\n+                case MempoolAcceptResult::ResultType::VALID:\n+                {\n+                    Assume(tx_result.m_replaced_transactions.has_value());\n+                    std::list<CTransactionRef> empty_replacement_list;\n+                    ProcessValidTx(nodeid, tx, tx_result.m_replaced_transactions.value_or(empty_replacement_list));\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::INVALID:\n+                case MempoolAcceptResult::ResultType::DIFFERENT_WITNESS:\n+                {\n+                    // Don't add to vExtraTxnForCompact, as these transactions should have already been\n+                    // added there when added to the orphanage or rejected for TX_RECONSIDERABLE.\n+                    // This should be updated if package submission is ever used for transactions\n+                    // that haven't already been validated before.\n+                    ProcessInvalidTx(nodeid, tx, tx_result.m_state, /*maybe_add_extra_compact_tx=*/false);\n+                    break;\n+                }\n+                case MempoolAcceptResult::ResultType::MEMPOOL_ENTRY:\n+                {\n+                    // AlreadyHaveTx() should be catching transactions that are already in mempool.\n+                    Assume(false);\n+                    break;\n+                }\n+            }\n+        }\n+        package_iter++;\n+        // There should be a sender for each tx, but fall back to the last one otherwise.\n+        if (Assume(senders_iter != senders.rend())) senders_iter++;\n+    }\n+}\n+\n+void PeerManagerImpl::MaybeProcess1P1CPackage(const CTransactionRef& ptx, NodeId nodeid)\n+{\n+    AssertLockNotHeld(m_peer_mutex);\n+    AssertLockHeld(g_msgproc_mutex);\n+    AssertLockHeld(cs_main);\n+\n+    const auto& parent_txid{ptx->GetHash()};\n+    const auto& parent_wtxid{ptx->GetWitnessHash()};\n+\n+    CTransactionRef tx_orphan{nullptr};\n+    NodeId orphan_sender{-1};\n+    Assume(m_recent_rejects_reconsiderable.contains(parent_wtxid.ToUint256()));\n+\n+    // Prefer children from this peer. This helps prevent censorship attempts in which an attacker\n+    // sends lots of fake children for the parent, and we (unluckily) keep selecting the fake\n+    // children instead of the real one provided by the honest peer.\n+    const auto cpfp_candidates_same_peer{m_orphanage.GetChildrenFromSamePeer(ptx, nodeid)};\n+\n+    // These children should be sorted from most newest to oldest. In the (probably uncommon) case\n+    // of children that replace each other, this helps us accept the highest feerate (probably the\n+    // most recent) one efficiently.\n+    for (const auto& child : cpfp_candidates_same_peer) {\n+        Package maybe_cpfp_package{ptx, child};\n+        if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+            tx_orphan = child;\n+            orphan_sender = nodeid;\n+            break;\n+        }\n+    }\n+\n+    // If no suitable candidate from the same peer is found, also try children that were provided by\n+    // a different peer. This is useful because sometimes multiple peers announce both transactions\n+    // to us, and we happen to download them from different peers (we wouldn't have known that these\n+    // 2 transactions are related). We still want to find 1p1c packages then.\n+    //\n+    // If we start tracking all announcers of orphans, we can restrict this logic to parent + child\n+    // pairs in which both were provided by the same peer, i.e. delete this step.\n+    if (!tx_orphan) {\n+        const auto cpfp_candidates_different_peer{m_orphanage.GetChildrenFromDifferentPeer(ptx, nodeid)};\n+\n+        // Find the first 1p1c that hasn't already been rejected. We randomize the order to not\n+        // create a bias that attackers can use to delay package acceptance.\n+        //\n+        // Create a random permutation of the indices.\n+        std::vector<size_t> tx_indices(cpfp_candidates_different_peer.size());\n+        std::iota(tx_indices.begin(), tx_indices.end(), 0);\n+        Shuffle(tx_indices.begin(), tx_indices.end(), m_rng);\n+\n+        for (const auto index : tx_indices) {\n+            // If we already tried a package and failed for any reason, the combined hash was\n+            // cached in m_recent_rejects_reconsiderable.\n+            Package maybe_cpfp_package{ptx, cpfp_candidates_different_peer.at(index).first};\n+            if (!m_recent_rejects_reconsiderable.contains(GetPackageHash(maybe_cpfp_package))) {\n+                tx_orphan = cpfp_candidates_different_peer.at(index).first;\n+                orphan_sender = cpfp_candidates_different_peer.at(index).second;\n+                break;\n+            }\n+        }\n+    }\n+\n+    if (tx_orphan) {\n+        const Package package_1p1c{ptx, tx_orphan};\n+        const std::vector<NodeId> senders{nodeid, orphan_sender};\n+        const auto package_result{ProcessNewPackage(m_chainman.ActiveChainstate(), m_mempool, package_1p1c, /*test_accept=*/false, /*client_maxfeerate=*/std::nullopt)};\n+        LogDebug(BCLog::TXPACKAGES, \"package evaluation for parent %s (wtxid=%s) + child %s (wtxid=%s) in orphanage: %s\\n\",",
+      "path": "src/net_processing.cpp",
+      "position": 255,
+      "original_position": 148,
+      "commit_id": "55b1280c52af81aa6ea0860799fa16da49f51447",
+      "original_commit_id": "bb3bf0a39c036fbd94b99ed7002db7d9bdf0a1d6",
+      "in_reply_to_id": 1576164670,
+      "user": {
+        "login": "instagibbs",
+        "id": 5767891,
+        "node_id": "MDQ6VXNlcjU3Njc4OTE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5767891?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/instagibbs",
+        "html_url": "https://github.com/instagibbs",
+        "followers_url": "https://api.github.com/users/instagibbs/followers",
+        "following_url": "https://api.github.com/users/instagibbs/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/instagibbs/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/instagibbs/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/instagibbs/subscriptions",
+        "organizations_url": "https://api.github.com/users/instagibbs/orgs",
+        "repos_url": "https://api.github.com/users/instagibbs/repos",
+        "events_url": "https://api.github.com/users/instagibbs/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/instagibbs/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "> Is the suggestion to drop this and only try same-peer packages?\r\n\r\nIf this is hitting actual usage, no, because it's coded and I actually reviewed it, and tests seem to cover it. I'm unsure if in BIP331-like world it would be used since it would be receiver-driven, but that might be thinking too far ahead.\r\n\r\n> (In this scenario I guess I'm assuming no feefilter, or that the feefilter value is slightly stale.)\r\n\r\nLatter scenario seems likely in practice as I see things right on the bubble all the time.",
+      "created_at": "2024-04-23T13:25:54Z",
+      "updated_at": "2024-04-23T13:26:15Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28970#discussion_r1576261445",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1576261445"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28970"
