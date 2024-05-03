@@ -41,7 +41,7 @@
     "body": "To supplement the [ongoing conceptual discussion about a testnet reset](https://groups.google.com/g/bitcoindev/c/9bL00vRj7OU/m/9yCPo3uUBwAJ) I have drafted a move to v4 including a fix to the difficulty adjustment mechanism, which was part of the motivation that started the discussion.\r\n\r\nConceptual considerations:\r\n- The conceptual discussion about doing a testnet4 or softforking the fix into testnet3 is outside of the scope of this PR and I would ask reviewers to contribute their opinions on this on the ML instead. However, I am happy to adapt this PR to a softfork change on testnet3 if there is consensus for that instead.\r\n- The difficulty adjustment fix suggested here touches the `CalculateNextWorkRequired` function and uses the same logic used in `GetNextWorkRequired` to find the last previous block that was not mined with difficulty 1 under the exceptionf. An alternative fix briefly mentioned on the mailing list by Jameson Lopp would be to \"restrict the special testnet minimum difficulty rule so that it can't be triggered on the block right before a difficulty retarget\". That would also fix the issue but I find my suggestion here a bit more elegant.",
     "labels": [],
     "created_at": "2024-03-31T22:55:22Z",
-    "updated_at": "2024-05-03T08:55:42Z",
+    "updated_at": "2024-05-03T09:59:47Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "c36b69ee7f83ef72529a3acb88c1bb96fe531c18",
@@ -278,11 +278,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 35337,
-        "stargazers_count": 76136,
-        "watchers_count": 76136,
+        "stargazers_count": 76137,
+        "watchers_count": 76137,
         "size": 258017,
         "default_branch": "master",
-        "open_issues_count": 691,
+        "open_issues_count": 693,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -299,9 +299,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-05-03T08:40:43Z",
+        "pushed_at": "2024-05-03T09:41:50Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-05-03T08:42:25Z",
+        "updated_at": "2024-05-03T09:06:09Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -3427,6 +3427,42 @@
       "submitted_at": "2024-05-03T08:50:54Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29775"
+    },
+    {
+      "event": "reviewed",
+      "id": 2037697561,
+      "node_id": "PRR_kwDOABII5855dMwZ",
+      "url": null,
+      "actor": null,
+      "commit_id": "56ce6b8a70becf01ddf334c82cb0651f8841087d",
+      "commit_url": null,
+      "created_at": null,
+      "author_association": "MEMBER",
+      "body": "Partial code review: the first commit 4e8b29ae234a05181ff9fd64ab3a74ba997e2eac looks good to me (of course it would partially change if we get a new genesis block).\r\n\r\nI thought a bit more about block storms...\r\n\r\nThe only (relevant) thing that distinguishes testnet3 from mainnet is `fPowAllowMinDifficultyBlocks`. In our `miner.cpp` code we potentially lower `pblock->nBits` of the block we're trying to mine once enough time has passed. This works because both the miner and validation rely on `GetNextWorkRequired` to tell us what the difficulty of a given block needs to be.\r\n\r\nBecause we \"mess with\" `nBits` itself, the code that handles difficulty adjustment (also `GetNextWorkRequired`, at the bottom) can be tricked. It takes the timestamp of the first block in the retarget period and passes it to `CalculateNextWorkRequired` along with the last block of retarget period (don't worry about off-by-one here). The low difficulty blocks probably came in fast, so difficulty goes up by a factor 4. But that factor 4 is applied to the last nbits value, which is the minimum difficulty.\r\n\r\nAnd so we have a situation where difficulty has to go all the way from 1 to something matching the actual hash power.\r\n\r\nOne way to fix that is, as discussed earlier, is to simply increase the minimum difficulty (maximum target) to something that requires a small ASIC. That would make block storms very expensive, but completely removes the ability to CPU mine.\r\n\r\n@fjahr's earlier code (https://github.com/bitcoin/bitcoin/pull/29775#pullrequestreview-2035943330) did not change `consensus.powLimit` but instead changed `GetNextWorkRequired` to enforce this. As a consequence the initial blocks after genesis could have difficulty 1, but once the difficulty goes above a typical S9, it can no longer drop below that. That seems confusing (in addition to the above).\r\n\r\nOne can always find a friend with an S9 space heater to mine a block, if this is really the only way to prevent block storms, but another solution would be better.\r\n\r\nSo we want:\r\n1. a way to CPU mine at very low difficulty, if nobody else mines a block within reasonable time\r\n2. not (dramatically) reduce the difficulty (a gradual decrease does seem desirable, so normal mining can continue with whatever hash power is structurally available)\r\n\r\nI think the key to that is to ensure difficulty adjustment is based on the last real-work nBits value.\r\n\r\n@ajtowns suggested doing so by storing it in the `nVersion` field. I think it's conceptually easier if we stop lowering the nBits value, but instead simply _ignore_ the nBits value for blocks that are 2 x 10 minutes in the future. That way the difficulty adjustment calculation is not affected anymore.\r\n\r\nUnfortunately that allows anyone to override the most proof-of-work chain by producing blocks 20.01 minutes apart. That ability is capped by the 2-hour-future rule, but it still makes ASIC's basically useless.\r\n\r\nSo then we get to @fjahr's proposed solution in 598f563687280fa6832ac42b9dc97c3ae7f7581d. We keep the low `nBits` value in blocks, but when calculating the difficulty for the next retarget period, we look at the last \"real\" `nBits` value.\r\n\r\n@ajtowns's suggestion to use nVersion could make sense if performance is a big issue, but otherwise I prefer the simplicity of @fjahr's approach.\r\n\r\nThis still allows for ~2000 difficulty 1 blocks in a given retarget period, since anyone can just set their clock 20 minutes in the future at the start of each retarget period. It wouldn't be a storm, but it would seem to make it fairly useless to point an ASIC at testnet.\r\n\r\nThese low difficulty blocks can be easily reorged by an ASIC, since they have very little total work. But in practice that requires them to invalidate the first block in such a series, because by default we produce block templates on our tip, even if it's \"brittle\" tip.\r\n\r\nThis last problem could be dealt with by changing `getblocktemplate` to build an empty block on top of the last non-special-min-difficulty-rules-block.\r\n\r\n(I haven't thought about how the time warp bug interacts with any of this)",
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29775#pullrequestreview-2037697561",
+      "submitted_at": "2024-05-03T09:56:43Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29775"
     }
   ],
   "comments": [
@@ -3688,6 +3724,58 @@
       "start_side": null,
       "line": null,
       "original_line": 28,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1588929328",
+      "pull_request_review_id": 2037697561,
+      "id": 1588929328,
+      "node_id": "PRRC_kwDOABII585etSMw",
+      "diff_hunk": "@@ -43,6 +44,8 @@ std::unique_ptr<CBaseChainParams> CreateBaseChainParams(const ChainType chain)\n         return std::make_unique<CBaseChainParams>(\"\", 8332, 8334);\n     case ChainType::TESTNET:\n         return std::make_unique<CBaseChainParams>(\"testnet3\", 18332, 18334);\n+    case ChainType::TESTNET4:\n+        return std::make_unique<CBaseChainParams>(\"testnet4\", 48332, 48334);",
+      "path": "src/chainparamsbase.cpp",
+      "position": 15,
+      "original_position": 15,
+      "commit_id": "56ce6b8a70becf01ddf334c82cb0651f8841087d",
+      "original_commit_id": "4e8b29ae234a05181ff9fd64ab3a74ba997e2eac",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "4e8b29ae234a05181ff9fd64ab3a74ba997e2eac: in order to not run out of ports by testnet6, testnet5 should probably use ports 1833x again.",
+      "created_at": "2024-05-03T08:55:42Z",
+      "updated_at": "2024-05-03T09:56:43Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29775#discussion_r1588929328",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1588929328"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29775"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 48,
+      "original_line": 48,
       "side": "RIGHT"
     }
   ]
