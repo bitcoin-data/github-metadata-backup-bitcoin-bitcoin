@@ -41,7 +41,7 @@
     "body": "Broken out from #28201 \r\n\r\n---\r\n\r\nThe wallet returns an untweaked internal key for taproot outputs. If the output commits to a tree of scripts, this key needs to be tweaked with the merkle root. Even if the output does not commit to a tree of scripts, BIP341/342 recommend commiting to a hash of the public key.\r\n\r\nPreviously, this logic for applying the taptweak was implemented in the `CKey::SignSchnorr` method.\r\n\r\nThis PR moves this logic to its own method, `CKey::ApplyTapTweak` and refactors `CKey::SignSchnorr` to use this new method.\r\n\r\nThe motivation is to be able to use the `::ApplyTapTweak` logic outside of signing, e.g. in silent payments when retrieving the private key. Outside of silent payments, having this method would support any future use cases where the tweaked key is needed outside of signing.\r\n\r\nNote: while this is mostly a move-only commit, it is not strictly a refactor. If signing with the `merkle_root` passed as an argument,`::SignSchnorr` will now require two calls to `secp256k1_keypair_create`. While this is not a big difference, its also not negligible.\r\n\r\n## Alternatives\r\n\r\nAn alternative that would avoid the extra `secp256k1_keypair` call is to make a BIP352 specific function for applying the Taptweak (either as a method on `CKey` or as a function that takes a key and returns a tweaked key), but that at the cost of having the merkle root tweak logic written in two places. I have a slight preference for having a generic method on `CKey` to a) avoid duplicating the logic and b) avoid needing to revisit this if a use case outside of silent payments also needs access to the tweaked key outside of a signing context, but happy to go this route if there are concerns with this approach.",
     "labels": [],
     "created_at": "2024-05-06T11:00:17Z",
-    "updated_at": "2024-05-08T16:48:49Z",
+    "updated_at": "2024-05-08T18:26:18Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "541226ab845113890f69a4733a1e3e91934f5b1f",
@@ -277,12 +277,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 35372,
+        "forks_count": 35374,
         "stargazers_count": 76288,
         "watchers_count": 76288,
         "size": 258129,
         "default_branch": "master",
-        "open_issues_count": 691,
+        "open_issues_count": 690,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -299,9 +299,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-05-08T16:47:03Z",
+        "pushed_at": "2024-05-08T18:45:03Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-05-08T12:46:48Z",
+        "updated_at": "2024-05-08T18:06:26Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -330,7 +330,7 @@
     "deletions": 8,
     "changed_files": 2,
     "commits": 1,
-    "review_comments": 2,
+    "review_comments": 3,
     "comments": 4
   },
   "events": [
@@ -1130,6 +1130,58 @@
       "start_side": null,
       "line": 317,
       "original_line": 317,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1594465354",
+      "pull_request_review_id": 2046365854,
+      "id": 1594465354,
+      "node_id": "PRRC_kwDOABII585fCZxK",
+      "diff_hunk": "@@ -275,20 +275,51 @@ bool CKey::SignCompact(const uint256 &hash, std::vector<unsigned char>& vchSig)\n     return true;\n }\n \n+bool ComputeTapTweak(const CKey& internal_key, const uint256& merkle_root, CKey& tweaked_key)\n+{\n+    secp256k1_keypair keypair;\n+    if (!secp256k1_keypair_create(secp256k1_context_sign, &keypair, UCharCast(internal_key.begin()))) return false;\n+    secp256k1_xonly_pubkey pubkey;\n+    if (!secp256k1_keypair_xonly_pub(secp256k1_context_sign, &pubkey, nullptr, &keypair)) {\n+        memory_cleanse(&keypair, sizeof(keypair));\n+        return false;\n+    }\n+    unsigned char pubkey_bytes[32];\n+    if (!secp256k1_xonly_pubkey_serialize(secp256k1_context_sign, pubkey_bytes, &pubkey)) {\n+        memory_cleanse(&keypair, sizeof(keypair));\n+        return false;\n+    }\n+    uint256 tweak = XOnlyPubKey(pubkey_bytes).ComputeTapTweakHash(merkle_root.IsNull() ? nullptr : &merkle_root);\n+    if (!secp256k1_keypair_xonly_tweak_add(secp256k1_context_static, &keypair, tweak.data())) {\n+        memory_cleanse(&keypair, sizeof(keypair));\n+        return false;\n+    }\n+    unsigned char tweaked_secret_bytes[32];\n+    if (!secp256k1_keypair_sec(secp256k1_context_sign, tweaked_secret_bytes, &keypair)) {\n+        memory_cleanse(&keypair, sizeof(keypair));\n+        return false;\n+    }\n+    tweaked_key.Set(std::begin(tweaked_secret_bytes), std::end(tweaked_secret_bytes), true);\n+    memory_cleanse(&keypair, sizeof(keypair));\n+    memory_cleanse(tweaked_secret_bytes, sizeof(tweaked_secret_bytes));\n+    return tweaked_key.IsValid();\n+}\n+\n bool CKey::SignSchnorr(const uint256& hash, Span<unsigned char> sig, const uint256* merkle_root, const uint256& aux) const\n {\n     assert(sig.size() == 64);\n+    bool ret;\n     secp256k1_keypair keypair;\n-    if (!secp256k1_keypair_create(secp256k1_context_sign, &keypair, UCharCast(begin()))) return false;\n     if (merkle_root) {\n-        secp256k1_xonly_pubkey pubkey;\n-        if (!secp256k1_keypair_xonly_pub(secp256k1_context_sign, &pubkey, nullptr, &keypair)) return false;\n-        unsigned char pubkey_bytes[32];\n-        if (!secp256k1_xonly_pubkey_serialize(secp256k1_context_sign, pubkey_bytes, &pubkey)) return false;\n-        uint256 tweak = XOnlyPubKey(pubkey_bytes).ComputeTapTweakHash(merkle_root->IsNull() ? nullptr : merkle_root);\n-        if (!secp256k1_keypair_xonly_tweak_add(secp256k1_context_static, &keypair, tweak.data())) return false;\n+        CKey tweaked_key;",
+      "path": "src/key.cpp",
+      "position": 47,
+      "original_position": 47,
+      "commit_id": "6cc72ced115828c60520c2f598795ee7d41275c9",
+      "original_commit_id": "6cc72ced115828c60520c2f598795ee7d41275c9",
+      "in_reply_to_id": 1594325841,
+      "user": {
+        "login": "josibake",
+        "id": 7444140,
+        "node_id": "MDQ6VXNlcjc0NDQxNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7444140?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/josibake",
+        "html_url": "https://github.com/josibake",
+        "followers_url": "https://api.github.com/users/josibake/followers",
+        "following_url": "https://api.github.com/users/josibake/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/josibake/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/josibake/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/josibake/subscriptions",
+        "organizations_url": "https://api.github.com/users/josibake/orgs",
+        "repos_url": "https://api.github.com/users/josibake/repos",
+        "events_url": "https://api.github.com/users/josibake/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/josibake/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Yep! From the description:\r\n\r\n> The motivation is to be able to use the ::ApplyTapTweak logic outside of signing, e.g. in silent payments when retrieving the private key. Outside of silent payments, having this method would support any future use cases where the tweaked key is needed outside of signing.\r\n\r\nThis commit was broken out of the silent payments sending PR, because there we need the tweaked `CKey`. However, we do eventually turn it back into a `keypair` when passing it to libsecp, so maybe there is an argument for just returning the `keypair`? But passing around libsecp types seemed a bit weird..",
+      "created_at": "2024-05-08T18:26:18Z",
+      "updated_at": "2024-05-08T18:26:19Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30051#discussion_r1594465354",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1594465354"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30051"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 314,
+      "original_line": 314,
       "side": "RIGHT"
     }
   ]
