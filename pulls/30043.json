@@ -68,7 +68,7 @@
       }
     ],
     "created_at": "2024-05-05T18:35:03Z",
-    "updated_at": "2024-06-19T09:58:41Z",
+    "updated_at": "2024-06-19T10:07:30Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "3c40d21453664a90b5e9dcd912eb5f3806ac0780",
@@ -332,7 +332,7 @@
         "forks_count": 35533,
         "stargazers_count": 76954,
         "watchers_count": 76954,
-        "size": 261800,
+        "size": 261752,
         "default_branch": "master",
         "open_issues_count": 685,
         "is_template": false,
@@ -351,9 +351,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-06-19T09:17:27Z",
+        "pushed_at": "2024-06-19T10:47:44Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-06-19T09:49:35Z",
+        "updated_at": "2024-06-19T10:41:00Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -382,7 +382,7 @@
     "deletions": 305,
     "changed_files": 39,
     "commits": 10,
-    "review_comments": 119,
+    "review_comments": 121,
     "comments": 70
   },
   "events": [
@@ -14369,6 +14369,110 @@
       "start_side": null,
       "line": 20,
       "original_line": 20,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1645849656",
+      "pull_request_review_id": 2127753795,
+      "id": 1645849656,
+      "node_id": "PRRC_kwDOABII585iGaw4",
+      "diff_hunk": "@@ -0,0 +1,520 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <util/pcp.h>\n+\n+#include <crypto/common.h>\n+#include <logging.h>\n+#include <netaddress.h>\n+#include <random.h>\n+#include <span.h>\n+#include <util/check.h>\n+#include <util/netif.h>\n+#include <util/readwritefile.h>\n+#include <util/sock.h>\n+#include <util/strencodings.h>\n+\n+// RFC6886 NAT-PMP and RFC6887 Port Control Protocol (PCP) implementation.\n+// NAT-PMP and PCP use network byte order (big-endian).\n+\n+// NAT-PMP (v0) protocol constants.\n+//! NAT-PMP uses a fixed server port number (RFC6887 section 1.1).\n+constexpr uint16_t NATPMP_SERVER_PORT = 5351;\n+//! Version byte for NATPMP (RFC6886 1.1)\n+constexpr uint8_t NATPMP_VERSION = 0;\n+//! Request opcode base (RFC6886 3).\n+constexpr uint8_t NATPMP_REQUEST = 0x00;\n+//! Response opcode base (RFC6886 3).\n+constexpr uint8_t NATPMP_RESPONSE = 0x80;\n+//! Get external address (RFC6886 3.2)\n+constexpr uint8_t NATPMP_OP_GETEXTERNAL = 0x00;\n+//! Map TCP port (RFC6886 3.3)\n+constexpr uint8_t NATPMP_OP_MAP_TCP = 0x02;\n+//! Shared request header size in bytes.\n+constexpr size_t NATPMP_REQUEST_HDR_SIZE = 2;\n+//! Shared response header (minimum) size in bytes.\n+constexpr size_t NATPMP_RESPONSE_HDR_SIZE = 8;\n+//! GETEXTERNAL request size in bytes, including header (RFC6886 3.2).\n+constexpr size_t NATPMP_GETEXTERNAL_REQUEST_SIZE = NATPMP_REQUEST_HDR_SIZE + 0;\n+//! GETEXTERNAL response size in bytes, including header (RFC6886 3.2).\n+constexpr size_t NATPMP_GETEXTERNAL_RESPONSE_SIZE = NATPMP_RESPONSE_HDR_SIZE + 4;\n+//! MAP request size in bytes, including header (RFC6886 3.3).\n+constexpr size_t NATPMP_MAP_REQUEST_SIZE = NATPMP_REQUEST_HDR_SIZE + 10;\n+//! MAP response size in bytes, including header (RFC6886 3.3).\n+constexpr size_t NATPMP_MAP_RESPONSE_SIZE = NATPMP_RESPONSE_HDR_SIZE + 8;\n+\n+// Shared header offsets (RFC6886 3.2, 3.3), relative to start of packet.\n+//!  Offset of version field in packets.\n+constexpr size_t NATPMP_HDR_VERSION_OFS = 0;\n+//!  Offset of opcode field in packets\n+constexpr size_t NATPMP_HDR_OP_OFS = 1;\n+//!  Offset of result code in packets. Result codes are 16 bit in NAT-PMP instead of 8 bit in PCP.\n+constexpr size_t NATPMP_RESPONSE_HDR_RESULT_OFS = 2;\n+\n+// GETEXTERNAL response offsets (RFC6886 3.2), relative to start of packet.\n+//!  Returned external address\n+constexpr size_t NATPMP_GETEXTERNAL_RESPONSE_IP_OFS = 8;\n+\n+// MAP request offsets (RFC6886 3.3), relative to start of packet.\n+//!  Internal port to be mapped.\n+constexpr size_t NATPMP_MAP_REQUEST_INTERNAL_PORT_OFS = 4;\n+//!  Suggested external port for mapping.\n+constexpr size_t NATPMP_MAP_REQUEST_EXTERNAL_PORT_OFS = 6;\n+//!  Requested port mapping lifetime in seconds.\n+constexpr size_t NATPMP_MAP_REQUEST_LIFETIME_OFS = 8;\n+\n+// MAP response offsets (RFC6886 3.3), relative to start of packet.\n+//!  Internal port for mapping (will match internal port of request).\n+constexpr size_t NATPMP_MAP_RESPONSE_INTERNAL_PORT_OFS = 8;\n+//!  External port for mapping.\n+constexpr size_t NATPMP_MAP_RESPONSE_EXTERNAL_PORT_OFS = 10;\n+//!  Created port mapping lifetime in seconds.\n+constexpr size_t NATPMP_MAP_RESPONSE_LIFETIME_OFS = 12;\n+\n+// Relevant NETPMP result codes (RFC6886 3.5).\n+//! Result code representing success status.\n+constexpr uint8_t NATPMP_RESULT_SUCCESS = 0;\n+//! Result code representing unsupported version.\n+constexpr uint8_t NATPMP_RESULT_UNSUPP_VERSION = 1;\n+//! Result code representing lack of resources.\n+constexpr uint8_t NATPMP_RESULT_NO_RESOURCES = 4;\n+\n+//! Mapping of NATPMP result code to string (RFC6886 3.5). Result codes <=2 match PCP.\n+static const std::map<uint8_t, std::string> NATPMP_RESULT_STR{\n+    {0,  \"SUCCESS\"},\n+    {1,  \"UNSUPP_VERSION\"},\n+    {2,  \"NOT_AUTHORIZED\"},\n+    {3,  \"NETWORK_FAILURE\"},\n+    {4,  \"NO_RESOURCES\"},\n+    {5,  \"UNSUPP_OPCODE\"},\n+};\n+\n+// PCP (v2) protocol constants.\n+//! Maximum packet size in bytes (RFC6887 section 7).\n+constexpr size_t PCP_MAX_SIZE = 1100;\n+//! PCP uses a fixed server port number (RFC6887 section 19.1). Shared with NAT-PMP.\n+constexpr uint16_t PCP_SERVER_PORT = NATPMP_SERVER_PORT;\n+//! Version byte. 0 is NAT-PMP (RFC6886), 1 is forbidden, 2 for PCP (RFC6887).\n+constexpr uint8_t PCP_VERSION = 2;\n+//! PCP Request Header. See RFC6887 section 7.1. Shared with NAT-PMP.\n+constexpr uint8_t PCP_REQUEST = NATPMP_REQUEST; // R = 0\n+//! PCP Response Header. See RFC6887 section 7.2. Shared with NAT-PMP.\n+constexpr uint8_t PCP_RESPONSE = NATPMP_RESPONSE; // R = 1\n+//! Map opcode. See RFC6887 section 19.2\n+constexpr uint8_t PCP_OP_MAP = 0x01;\n+//! TCP protocol number (IANA).\n+constexpr uint16_t PCP_PROTOCOL_TCP = 6;\n+//! Request and response header size in bytes (RFC6887 section 7.1).\n+constexpr size_t PCP_HDR_SIZE = 24;\n+//! Map request and response size in bytes (RFC6887 section 11.1).\n+constexpr size_t PCP_MAP_SIZE = 36;\n+\n+// Header offsets shared between request and responses (RFC6887 7.1, 7.2), relative to start of packet.\n+//!  Version field (1 byte).\n+constexpr size_t PCP_HDR_VERSION_OFS = NATPMP_HDR_VERSION_OFS;\n+//!  Opcode field (1 byte).\n+constexpr size_t PCP_HDR_OP_OFS = NATPMP_HDR_OP_OFS;\n+//!  Requested lifetime (request), granted lifetime (response) (2 bytes).\n+constexpr size_t PCP_HDR_LIFETIME_OFS = 4;\n+\n+// Request header offsets (RFC6887 7.1), relative to start of packet.\n+//!  PCP client's IP address (16 bytes).\n+constexpr size_t PCP_REQUEST_HDR_IP_OFS = 8;\n+\n+// Response header offsets (RFC6887 7.2), relative to start of packet.\n+//!  Result code (1 byte).\n+constexpr size_t PCP_RESPONSE_HDR_RESULT_OFS = 3;\n+\n+// MAP request/response offsets (RFC6887 11.1), relative to start of opcode-specific data.\n+//!  Mapping nonce (12 bytes).\n+constexpr size_t PCP_MAP_NONCE_OFS = 0;\n+//!  Protocol (1 byte).\n+constexpr size_t PCP_MAP_PROTOCOL_OFS = 12;\n+//!  Internal port for mapping (2 bytes).\n+constexpr size_t PCP_MAP_INTERNAL_PORT_OFS = 16;\n+//!  Suggested external port (request), assigned external port (response) (2 bytes).\n+constexpr size_t PCP_MAP_EXTERNAL_PORT_OFS = 18;\n+//!  Suggested external IP (request), assigned external IP (response) (16 bytes).\n+constexpr size_t PCP_MAP_EXTERNAL_IP_OFS = 20;\n+\n+//! Result code representing success (RFC6887 7.4), shared with NAT-PMP.\n+constexpr uint8_t PCP_RESULT_SUCCESS = NATPMP_RESULT_SUCCESS;\n+//! Result code representing lack of resources (RFC6887 7.4).\n+constexpr uint8_t PCP_RESULT_NO_RESOURCES = 8;\n+\n+//! Mapping of PCP result code to string (RFC6887 7.4). Result codes <=2 match NAT-PMP.\n+static const std::map<uint8_t, std::string> PCP_RESULT_STR{\n+    {0,  \"SUCCESS\"},\n+    {1,  \"UNSUPP_VERSION\"},\n+    {2,  \"NOT_AUTHORIZED\"},\n+    {3,  \"MALFORMED_REQUEST\"},\n+    {4,  \"UNSUPP_OPCODE\"},\n+    {5,  \"UNSUPP_OPTION\"},\n+    {6,  \"MALFORMED_OPTION\"},\n+    {7,  \"NETWORK_FAILURE\"},\n+    {8,  \"NO_RESOURCES\"},\n+    {9,  \"UNSUPP_PROTOCOL\"},\n+    {10, \"USER_EX_QUOTA\"},\n+    {11, \"CANNOT_PROVIDE_EXTERNAL\"},\n+    {12, \"ADDRESS_MISMATCH\"},\n+    {13, \"EXCESSIVE_REMOTE_PEER\"},\n+};\n+\n+//! Return human-readable string from NATPMP result code.\n+static std::string NATPMPResultString(uint8_t result_code)\n+{\n+    auto result_i = NATPMP_RESULT_STR.find(result_code);\n+    return strprintf(\"%s (code %d)\", result_i == NATPMP_RESULT_STR.end() ? \"(unknown)\" : result_i->second,  result_code);\n+}\n+\n+//! Return human-readable string from PCP result code.\n+static std::string PCPResultString(uint8_t result_code)\n+{\n+    auto result_i = PCP_RESULT_STR.find(result_code);\n+    return strprintf(\"%s (code %d)\", result_i == PCP_RESULT_STR.end() ? \"(unknown)\" : result_i->second,  result_code);\n+}\n+\n+//! Wrap address in IPv6 according to RFC6887. wrapped_addr needs to be able to store 16 bytes.\n+[[nodiscard]] static bool PCPWrapAddress(Span<uint8_t> wrapped_addr, const CNetAddr &addr)\n+{\n+    Assume(wrapped_addr.size() == ADDR_IPV6_SIZE);\n+    if (addr.IsIPv4()) {\n+        struct in_addr addr4;\n+        if (!addr.GetInAddr(&addr4)) return false;\n+        // Section 5: \"When the address field holds an IPv4 address, an IPv4-mapped IPv6 address [RFC4291] is used (::ffff:0:0/96).\"\n+        std::memcpy(wrapped_addr.data(), IPV4_IN_IPV6_PREFIX.data(), IPV4_IN_IPV6_PREFIX.size());\n+        std::memcpy(wrapped_addr.data() + IPV4_IN_IPV6_PREFIX.size(), &addr4, ADDR_IPV4_SIZE);\n+        return true;\n+    } else if (addr.IsIPv6()) {\n+        struct in6_addr addr6;\n+        if (!addr.GetIn6Addr(&addr6)) return false;\n+        std::memcpy(wrapped_addr.data(), &addr6, ADDR_IPV6_SIZE);\n+        return true;\n+    } else {\n+        return false;\n+    }\n+}\n+\n+//! Unwrap PCP-encoded address according to RFC6887.\n+static CNetAddr PCPUnwrapAddress(Span<const uint8_t> wrapped_addr)\n+{\n+    Assume(wrapped_addr.size() == ADDR_IPV6_SIZE);\n+    if (util::HasPrefix(wrapped_addr, IPV4_IN_IPV6_PREFIX)) {\n+        struct in_addr addr4;\n+        std::memcpy(&addr4, wrapped_addr.data() + IPV4_IN_IPV6_PREFIX.size(), ADDR_IPV4_SIZE);\n+        return CNetAddr(addr4);\n+    } else {\n+        struct in6_addr addr6;\n+        std::memcpy(&addr6, wrapped_addr.data(), ADDR_IPV6_SIZE);\n+        return CNetAddr(addr6);\n+    }\n+}\n+\n+//! PCP or NAT-PMP send-receive loop.\n+static std::optional<std::vector<uint8_t>> PCPSendRecv(Sock &sock, const std::string &protocol, Span<const uint8_t> request, int num_tries,\n+        std::chrono::milliseconds timeout_per_try,\n+        std::function<bool(const Span<const uint8_t>)> check_packet)\n+{\n+    // UDP is a potentially lossy protocol, so we try to send again a few times.\n+    uint8_t response[PCP_MAX_SIZE];\n+    bool got_response = false;\n+    int recvsz = 0;\n+    for (int ntry = 0; !got_response && ntry < num_tries; ++ntry) {\n+        if (ntry > 0) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"%s: Retrying (%d)\\n\", protocol, ntry);\n+        }\n+        // Dispatch packet to gateway.\n+        if (sock.Send(request.data(), request.size(), 0) != static_cast<ssize_t>(request.size())) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"%s: Could not send request: %s\\n\", protocol, NetworkErrorString(WSAGetLastError()));\n+            return std::nullopt; // Network-level error, probably no use retrying.\n+        }\n+\n+        // Wait for response(s) until we get a valid response, a network error, or time out.\n+        auto cur_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now());\n+        auto deadline = cur_time + timeout_per_try;\n+        while ((cur_time = std::chrono::time_point_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now())) < deadline) {\n+            Sock::Event occurred = 0;\n+            if (!sock.Wait(deadline - cur_time, Sock::RECV, &occurred)) {\n+                LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"%s: Could not wait on socket: %s\\n\", protocol, NetworkErrorString(WSAGetLastError()));\n+                return std::nullopt; // Network-level error, probably no use retrying.\n+            }\n+            if (!occurred) {\n+                LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"%s: Timeout\\n\", protocol);\n+                break; // Retry.\n+            }\n+\n+            // Receive response.\n+            recvsz = sock.Recv(response, sizeof(response), MSG_DONTWAIT);\n+            if (recvsz < 0) {\n+                LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"%s: Could not receive response: %s\\n\", protocol, NetworkErrorString(WSAGetLastError()));\n+                return std::nullopt; // Network-level error, probably no use retrying.\n+            }\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"%s: Received response of %d bytes: %s\\n\", protocol, recvsz, HexStr(Span(response, recvsz)));\n+\n+            if (check_packet(Span<uint8_t>(response, recvsz))) {\n+                got_response = true; // Got expected response, break from receive loop as well as from retry loop.\n+                break;\n+            }\n+        }\n+    }\n+    if (!got_response) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"%s: Giving up after %d tries\\n\", protocol, num_tries);\n+        return std::nullopt;\n+    }\n+    return std::vector<uint8_t>(response, response + recvsz);\n+}\n+\n+std::variant<MappingResult, MappingError> NATPMPRequestPortMap(const CNetAddr &gateway, uint16_t port, uint32_t lifetime, int num_tries, std::chrono::milliseconds timeout_per_try)\n+{\n+    struct sockaddr_storage dest_addr;\n+    socklen_t dest_addrlen = sizeof(struct sockaddr_storage);\n+\n+    LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"natpmp: Requesting port mapping port %d from gateway %s\\n\", port, gateway.ToStringAddr());\n+\n+    // Validate gateway, make sure it's IPv4. NAT-PMP does not support IPv6.\n+    if (!CService(gateway, PCP_SERVER_PORT).GetSockAddr((struct sockaddr*)&dest_addr, &dest_addrlen)) return MappingError::NETWORK_ERROR;\n+    if (dest_addr.ss_family != AF_INET) return MappingError::NETWORK_ERROR;\n+\n+    // Create IPv4 UDP socket\n+    SOCKET sock_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);\n+    if (sock_fd == INVALID_SOCKET) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"natpmp: Could not create UDP socket: %s\\n\", NetworkErrorString(WSAGetLastError()));\n+        return MappingError::NETWORK_ERROR;\n+    }\n+    Sock sock(sock_fd);\n+\n+    // Associate UDP socket to gateway.\n+    if (sock.Connect((struct sockaddr*)&dest_addr, dest_addrlen) != 0) {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"natpmp: Could not connect to gateway: %s\\n\", NetworkErrorString(WSAGetLastError()));\n+        return MappingError::NETWORK_ERROR;\n+    }\n+\n+    // Use getsockname to get the address toward the default gateway (the internal address).",
+      "path": "src/util/pcp.cpp",
+      "position": 293,
+      "original_position": 293,
+      "commit_id": "faacd264417bd7f3f08c5ff497458030b3a54fbc",
+      "original_commit_id": "44316c39006a4ea906e9ae41a3fdbdf28f318ce5",
+      "in_reply_to_id": 1644941149,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "The internal address is *our* internal address toward the gateway, not the gateway's address (so the address that the port is to be forwarded to from the external address). For IPv6 this is the same as the public address, and we explicitly bind to it before communicating (`getsockname` will just get it back, you're right). For IPv4 it could be anything in the router's private subnet, so we bind to INADDR_ANY and need to get it with `getsockname`.",
+      "created_at": "2024-06-19T10:05:07Z",
+      "updated_at": "2024-06-19T10:12:56Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1645849656",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1645849656"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 293,
+      "original_line": 293,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1645852506",
+      "pull_request_review_id": 2127758463,
+      "id": 1645852506,
+      "node_id": "PRRC_kwDOABII585iGbda",
+      "diff_hunk": "@@ -0,0 +1,68 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_PCP_H\n+#define BITCOIN_UTIL_PCP_H\n+\n+#include <netaddress.h>\n+\n+#include <variant>\n+\n+// RFC6886 NAT-PMP and RFC6887 Port Control Protocol (PCP) implementation.\n+// NAT-PMP and PCP use network byte order (big-endian).\n+\n+//! Mapping nonce size in bytes (see RFC6887 section 11.1).\n+constexpr size_t PCP_MAP_NONCE_SIZE = 12;\n+\n+//! PCP mapping nonce. Arbitrary data chosen by the client to identify a mapping.\n+typedef std::array<uint8_t, PCP_MAP_NONCE_SIZE> PCPMappingNonce;\n+\n+//! Unsuccessful response to a port mapping.\n+enum class MappingError {\n+    NETWORK_ERROR,  ///< Any kind of network-level error.\n+    PROTOCOL_ERROR, ///< Any kind of protocol-level error, except unsupported version or no resources.\n+    UNSUPP_VERSION, ///< Unsupported protocol version.\n+    NO_RESOURCES,   ///< No resources available (port probably already mapped).\n+};\n+\n+//! Successful response to a port mapping.\n+struct MappingResult {\n+    MappingResult(uint8_t version, const CService &internal_in, const CService &external_in, uint32_t lifetime_in):\n+        version(version), internal(internal_in), external(external_in), lifetime(lifetime_in) {}\n+    //! Protocol version, one of NATPMP_VERSION or PCP_VERSION.\n+    uint8_t version;\n+    //! Internal host:port.\n+    CService internal;\n+    //! External host:port.\n+    CService external;\n+    //! Granted lifetime of binding (seconds).\n+    uint32_t lifetime;\n+\n+    //! Format mapping as string for logging.\n+    std::string ToString();\n+};\n+\n+//! Try to open a port using RFC 6886 NAT-PMP. IPv4 only.\n+//!\n+//! * gateway: Destination address for PCP requests (usually the default gateway).\n+//! * port: Internal port, and desired external port.\n+//! * lifetime: Requested lifetime in seconds for mapping. The server may assign as shorter or longer lifetime. A lifetime of 0 deletes the mapping.\n+//! * num_tries: Number of tries in case of no response.\n+//!\n+//! Returns the external_ip:external_port of the mapping if successful, otherwise a MappingError.\n+std::variant<MappingResult, MappingError> NATPMPRequestPortMap(const CNetAddr &gateway, uint16_t port, uint32_t lifetime, int num_tries = 3, std::chrono::milliseconds timeout_per_try = std::chrono::milliseconds(1000));",
+      "path": "src/util/pcp.h",
+      "position": 54,
+      "original_position": 54,
+      "commit_id": "faacd264417bd7f3f08c5ff497458030b3a54fbc",
+      "original_commit_id": "44316c39006a4ea906e9ae41a3fdbdf28f318ce5",
+      "in_reply_to_id": 1644962602,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "It would be great to cut down on the verbosity here, but as this is a header, i don't think we want to use `using` there because that will leak into anything that includes it? Or am i misunderstanding?",
+      "created_at": "2024-06-19T10:07:30Z",
+      "updated_at": "2024-06-19T10:07:30Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1645852506",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1645852506"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 54,
+      "original_line": 54,
       "side": "RIGHT"
     }
   ]
