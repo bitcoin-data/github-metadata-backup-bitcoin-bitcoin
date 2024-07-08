@@ -77,7 +77,7 @@
       }
     ],
     "created_at": "2024-05-05T18:35:03Z",
-    "updated_at": "2024-07-08T00:09:52Z",
+    "updated_at": "2024-07-08T07:57:36Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "c983251d227843d5afc428e3b93b519ba0814846",
@@ -298,11 +298,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 35613,
-        "stargazers_count": 77127,
-        "watchers_count": 77127,
+        "stargazers_count": 77123,
+        "watchers_count": 77123,
         "size": 262585,
         "default_branch": "master",
-        "open_issues_count": 684,
+        "open_issues_count": 683,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -319,9 +319,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-07-07T23:36:07Z",
+        "pushed_at": "2024-07-08T04:36:03Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-07-07T23:42:31Z",
+        "updated_at": "2024-07-08T06:46:42Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -350,7 +350,7 @@
     "deletions": 304,
     "changed_files": 39,
     "commits": 10,
-    "review_comments": 169,
+    "review_comments": 171,
     "comments": 73
   },
   "events": [
@@ -17549,6 +17549,110 @@
       "start_side": "RIGHT",
       "line": 408,
       "original_line": 408,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1668158370",
+      "pull_request_review_id": 2162545915,
+      "id": 1668158370,
+      "node_id": "PRRC_kwDOABII585jbhOi",
+      "diff_hunk": "@@ -46,104 +43,96 @@ using namespace std::chrono_literals;\n static constexpr auto PORT_MAPPING_REANNOUNCE_PERIOD{20min};\n static constexpr auto PORT_MAPPING_RETRY_PERIOD{5min};\n \n-#ifdef USE_NATPMP\n-static uint16_t g_mapport_external_port = 0;\n-static bool NatpmpInit(natpmp_t* natpmp)\n+static bool ProcessPCP()\n {\n-    const int r_init = initnatpmp(natpmp, /* detect gateway automatically */ 0, /* forced gateway - NOT APPLIED*/ 0);\n-    if (r_init == 0) return true;\n-    LogPrintf(\"natpmp: initnatpmp() failed with %d error.\\n\", r_init);\n-    return false;\n-}\n+    // The same nonce is used for all mappings, this is allowed by the spec, and simplifies keeping track of them.\n+    PCPMappingNonce pcp_nonce;\n+    GetRandBytes(pcp_nonce);\n \n-static bool NatpmpDiscover(natpmp_t* natpmp, struct in_addr& external_ipv4_addr)\n-{\n-    const int r_send = sendpublicaddressrequest(natpmp);\n-    if (r_send == 2 /* OK */) {\n-        int r_read;\n-        natpmpresp_t response;\n-        do {\n-            r_read = readnatpmpresponseorretry(natpmp, &response);\n-        } while (r_read == NATPMP_TRYAGAIN);\n-\n-        if (r_read == 0) {\n-            external_ipv4_addr = response.pnu.publicaddress.addr;\n-            return true;\n-        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n-            LogPrintf(\"natpmp: The gateway does not support NAT-PMP.\\n\");\n+    bool ret = false;\n+    bool no_resources = false;\n+    const uint16_t private_port = GetListenPort();\n+    // Multiply the reannounce period by two, as we'll try to renew approximately halfway.\n+    const uint32_t requested_lifetime = std::chrono::seconds(PORT_MAPPING_REANNOUNCE_PERIOD * 2).count();\n+    uint32_t actual_lifetime = 0;\n+    std::chrono::milliseconds sleep_time;\n+\n+    // Local functor to handle result from PCP/NATPMP mapping.\n+    auto handle_mapping = [&](std::variant<MappingResult, MappingError> &res) -> void {\n+        if (MappingResult* mapping = std::get_if<MappingResult>(&res)) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Info, \"portmap: Added mapping %s\\n\", mapping->ToString());\n+            AddLocal(mapping->external, LOCAL_MAPPED);\n+            ret = true;\n+            actual_lifetime = std::min(actual_lifetime, mapping->lifetime);\n+        } else if (MappingError *err = std::get_if<MappingError>(&res)) {\n+            // Detailed error will already have been logged internally in respective Portmap function.\n+            if (*err == MappingError::NO_RESOURCES) {\n+                no_resources = true;\n+            }\n+        }\n+    };\n+\n+    do {\n+        actual_lifetime = requested_lifetime;\n+        no_resources = false; // Set to true if there was any \"no resources\" error.\n+        ret = false; // Set to true if any mapping succeeds.\n+\n+        // IPv4\n+        std::optional<CNetAddr> gateway4 = QueryDefaultGateway(NET_IPV4);\n+        if (!gateway4) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: Could not determine IPv4 default gateway\\n\");\n         } else {\n-            LogPrintf(\"natpmp: readnatpmpresponseorretry() for public address failed with %d error.\\n\", r_read);\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: gateway [IPv4]: %s\\n\", gateway4->ToStringAddr());\n+\n+            // Open a port mapping on whatever local address we have toward the gateway.\n+            struct in_addr inaddr_any;\n+            inaddr_any.s_addr = htonl(INADDR_ANY);\n+            auto res = PCPRequestPortMap(pcp_nonce, *gateway4, CNetAddr(inaddr_any), private_port, requested_lifetime);\n+            MappingError* pcp_err = std::get_if<MappingError>(&res);\n+            if (pcp_err && *pcp_err == MappingError::UNSUPP_VERSION) {\n+                LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: Got unsupported PCP version response, falling back to NAT-PMP\\n\");\n+                res = NATPMPRequestPortMap(*gateway4, private_port, requested_lifetime);\n+            }\n+            handle_mapping(res);\n         }\n-    } else {\n-        LogPrintf(\"natpmp: sendpublicaddressrequest() failed with %d error.\\n\", r_send);\n-    }\n \n-    return false;\n-}\n+        // IPv6\n+        std::optional<CNetAddr> gateway6 = QueryDefaultGateway(NET_IPV6);\n+        if (!gateway6) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: Could not determine IPv6 default gateway\\n\");\n+        } else {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: gateway [IPv6]: %s\\n\", gateway6->ToStringAddr());\n \n-static bool NatpmpMapping(natpmp_t* natpmp, const struct in_addr& external_ipv4_addr, uint16_t private_port, bool& external_ip_discovered)\n-{\n-    const uint16_t suggested_external_port = g_mapport_external_port ? g_mapport_external_port : private_port;\n-    const int r_send = sendnewportmappingrequest(natpmp, NATPMP_PROTOCOL_TCP, private_port, suggested_external_port, 3600 /*seconds*/);\n-    if (r_send == 12 /* OK */) {\n-        int r_read;\n-        natpmpresp_t response;\n-        do {\n-            r_read = readnatpmpresponseorretry(natpmp, &response);\n-        } while (r_read == NATPMP_TRYAGAIN);\n-\n-        if (r_read == 0) {\n-            auto pm = response.pnu.newportmapping;\n-            if (private_port == pm.privateport && pm.lifetime > 0) {\n-                g_mapport_external_port = pm.mappedpublicport;\n-                const CService external{external_ipv4_addr, pm.mappedpublicport};\n-                if (!external_ip_discovered && fDiscover) {\n-                    AddLocal(external, LOCAL_MAPPED);\n-                    external_ip_discovered = true;\n-                }\n-                LogPrintf(\"natpmp: Port mapping successful. External address = %s\\n\", external.ToStringAddrPort());\n-                return true;\n-            } else {\n-                LogPrintf(\"natpmp: Port mapping failed.\\n\");\n+            // Try to open pinholes for all routable local IPv6 addresses.\n+            for (const auto &addr: GetLocalAddresses()) {\n+                if (!addr.IsRoutable() || !addr.IsIPv6()) continue;\n+                auto res = PCPRequestPortMap(pcp_nonce, *gateway6, addr, private_port, requested_lifetime);",
+      "path": "src/mapport.cpp",
+      "position": 146,
+      "original_position": 146,
+      "commit_id": "23916f2a7717b463799207b4b81b5795f2e9d7e3",
+      "original_commit_id": "23916f2a7717b463799207b4b81b5795f2e9d7e3",
+      "in_reply_to_id": 1658879358,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": ">> I think it is going to result in multiple mappings on the same external IPv6 address but on different ports.\r\n\r\n> i don't think so? We only request one mapping per IPv6 address at most.\r\n\r\nAfaik PCP always uses a pinhole, which does not involve assigning a (different) port.\r\n\r\nWe do end up with our node being announced multiple times with different IP addresses, which could cause some other node to connect to us twice. That can already happen when you have IPv4 and IPv6 (and Tor and I2P) enabled.\r\n\r\nIf we're really worried about this, it might make sense to try each IPv6 address sequentially and stop when one is acknowledged. I think that can wait for a followup.",
+      "created_at": "2024-07-08T07:54:51Z",
+      "updated_at": "2024-07-08T07:55:24Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1668158370",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1668158370"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+        }
+      },
+      "start_line": 106,
+      "original_start_line": 106,
+      "start_side": "RIGHT",
+      "line": 109,
+      "original_line": 109,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1668161856",
+      "pull_request_review_id": 2162551604,
+      "id": 1668161856,
+      "node_id": "PRRC_kwDOABII585jbiFA",
+      "diff_hunk": "@@ -46,104 +43,96 @@ using namespace std::chrono_literals;\n static constexpr auto PORT_MAPPING_REANNOUNCE_PERIOD{20min};\n static constexpr auto PORT_MAPPING_RETRY_PERIOD{5min};\n \n-#ifdef USE_NATPMP\n-static uint16_t g_mapport_external_port = 0;\n-static bool NatpmpInit(natpmp_t* natpmp)\n+static bool ProcessPCP()\n {\n-    const int r_init = initnatpmp(natpmp, /* detect gateway automatically */ 0, /* forced gateway - NOT APPLIED*/ 0);\n-    if (r_init == 0) return true;\n-    LogPrintf(\"natpmp: initnatpmp() failed with %d error.\\n\", r_init);\n-    return false;\n-}\n+    // The same nonce is used for all mappings, this is allowed by the spec, and simplifies keeping track of them.\n+    PCPMappingNonce pcp_nonce;\n+    GetRandBytes(pcp_nonce);\n \n-static bool NatpmpDiscover(natpmp_t* natpmp, struct in_addr& external_ipv4_addr)\n-{\n-    const int r_send = sendpublicaddressrequest(natpmp);\n-    if (r_send == 2 /* OK */) {\n-        int r_read;\n-        natpmpresp_t response;\n-        do {\n-            r_read = readnatpmpresponseorretry(natpmp, &response);\n-        } while (r_read == NATPMP_TRYAGAIN);\n-\n-        if (r_read == 0) {\n-            external_ipv4_addr = response.pnu.publicaddress.addr;\n-            return true;\n-        } else if (r_read == NATPMP_ERR_NOGATEWAYSUPPORT) {\n-            LogPrintf(\"natpmp: The gateway does not support NAT-PMP.\\n\");\n+    bool ret = false;\n+    bool no_resources = false;\n+    const uint16_t private_port = GetListenPort();\n+    // Multiply the reannounce period by two, as we'll try to renew approximately halfway.\n+    const uint32_t requested_lifetime = std::chrono::seconds(PORT_MAPPING_REANNOUNCE_PERIOD * 2).count();\n+    uint32_t actual_lifetime = 0;\n+    std::chrono::milliseconds sleep_time;\n+\n+    // Local functor to handle result from PCP/NATPMP mapping.\n+    auto handle_mapping = [&](std::variant<MappingResult, MappingError> &res) -> void {\n+        if (MappingResult* mapping = std::get_if<MappingResult>(&res)) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Info, \"portmap: Added mapping %s\\n\", mapping->ToString());\n+            AddLocal(mapping->external, LOCAL_MAPPED);\n+            ret = true;\n+            actual_lifetime = std::min(actual_lifetime, mapping->lifetime);\n+        } else if (MappingError *err = std::get_if<MappingError>(&res)) {\n+            // Detailed error will already have been logged internally in respective Portmap function.\n+            if (*err == MappingError::NO_RESOURCES) {\n+                no_resources = true;\n+            }\n+        }\n+    };\n+\n+    do {\n+        actual_lifetime = requested_lifetime;\n+        no_resources = false; // Set to true if there was any \"no resources\" error.\n+        ret = false; // Set to true if any mapping succeeds.\n+\n+        // IPv4\n+        std::optional<CNetAddr> gateway4 = QueryDefaultGateway(NET_IPV4);\n+        if (!gateway4) {\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: Could not determine IPv4 default gateway\\n\");\n         } else {\n-            LogPrintf(\"natpmp: readnatpmpresponseorretry() for public address failed with %d error.\\n\", r_read);\n+            LogPrintLevel(BCLog::NET, BCLog::Level::Debug, \"portmap: gateway [IPv4]: %s\\n\", gateway4->ToStringAddr());\n+\n+            // Open a port mapping on whatever local address we have toward the gateway.\n+            struct in_addr inaddr_any;\n+            inaddr_any.s_addr = htonl(INADDR_ANY);\n+            auto res = PCPRequestPortMap(pcp_nonce, *gateway4, CNetAddr(inaddr_any), private_port, requested_lifetime);",
+      "path": "src/mapport.cpp",
+      "position": 98,
+      "original_position": 98,
+      "commit_id": "23916f2a7717b463799207b4b81b5795f2e9d7e3",
+      "original_commit_id": "23916f2a7717b463799207b4b81b5795f2e9d7e3",
+      "in_reply_to_id": 1658779455,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Indeed. Maybe just add a comment that this is intentional.",
+      "created_at": "2024-07-08T07:57:35Z",
+      "updated_at": "2024-07-08T07:57:36Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30043#discussion_r1668161856",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1668161856"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30043"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 90,
+      "original_line": 90,
       "side": "RIGHT"
     }
   ]
