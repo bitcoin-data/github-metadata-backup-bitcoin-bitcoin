@@ -41,7 +41,7 @@
     "body": "Since https://github.com/bitcoin/bitcoin/pull/17487 we no longer need to clear the coins cache when syncing to disk. A warm coins cache significantly speeds up block connection, and only needs to be fully flushed when nearing the `dbcache` limit.\r\n\r\nFor frequent pruning flushes there's no need to empty the cache and kill connect block speed. However, simply using `Sync` in place of `Flush` actually slows down a pruned full IBD with a high `dbcache` value. This is because as the cache grows, sync takes longer since every coin in the cache is scanned to check if it's dirty. For frequent prune flushes and a large cache this constant scanning starts to really slow IBD down, and just emptying the cache on every prune becomes faster.\r\n\r\nTo fix this, we can add two pointers to each cache entry and construct a doubly linked list of dirty entries. We can then only iterate through all dirty entries on each `Sync`, and simply clear the pointers after.\r\n\r\nWith this approach a full IBD with `dbcache=16384` and `prune=550` was 32% faster than master. For default `dbcache=450` speedup was ~9%. All benchmarks were run with `stopatheight=800000`.\r\n\r\n|  | prune | dbcache | time | max RSS | speedup |\r\n|-----------:|----------:|------------:|--------:|-------------:|--------------:|\r\n| master | 550 | 16384 | 8:52:57 | 2,417,464k | - |\r\n| branch | 550 | 16384 | 6:01:00 | 16,216,736k | 32% |\r\n| branch | 550 | 450 | 8:05:08 | 2,818,072k | 8.8% |\r\n| master | 10000 | 5000 | 8:19:59 | 2,962,752k | - |\r\n| branch | 10000 | 5000| 5:56:39 | 6,179,764k | 28.8% |\r\n| master | 0 | 16384 | 4:51:53 | 14,726,408k | - |\r\n| branch | 0 | 16384 | 4:43:11 | 16,526,348k | 2.7% |\r\n| master | 0 | 450 | 7:08:07 | 3,005,892k | - |\r\n| branch | 0 | 450 | 6:57:24 | 3,013,556k |2.6%|\r\n\r\nWhile the 2 pointers add memory to each cache entry, it did not slow down IBD. For non-pruned IBD results were similar for this branch and master. When I performed the initial IBD, the full UTXO set could be held in memory when using the max `dbcache` value. For non-pruned IBD with max `dbcache` to tip ended up using 12% more memory, but it was also 2.7% faster somehow. For smaller `dbcache` values the `dbcache` limit is respected so does not consume more memory, and the potentially more frequent flushes were not significant enough to cause any slowdown.\r\n\r\nFor reviewers, the commits in order do the following:\r\nFirst 4 commits encapsulate all accesses to `flags` on cache entries, and then the 5th makes `flags` private.\r\nCommits `refactor: add CoinsCachePair alias` to `coins: call ClearFlags in CCoinsCacheEntry destructor` create the linked list head nodes and cache entry self references and pass them into `AddFlags`.\r\nCommit `coins: track flagged cache entries in linked list` actually adds the entries into a linked list when they are flagged DIRTY or FRESH and removes them from the linked list when they are destroyed or the flags are cleared manually. However, the linked list is not yet used anywhere.\r\nCommit `test: add cache entry linked list tests` adds unit tests for the linked list.\r\nCommit `coins: pass linked list of flagged entries to BatchWrite` uses the linked list to iterate through DIRTY entries instead of using the entire coins cache.\r\nCommit `validation: don't erase coins cache on prune flushes` uses `Sync` instead of `Flush` for pruning flushes, so the cache is no longer cleared. \r\n\r\nInspired by [this comment](https://github.com/bitcoin/bitcoin/pull/15265#issuecomment-457720636).\r\n\r\nFixes https://github.com/bitcoin/bitcoin/issues/11315.",
     "labels": [],
     "created_at": "2023-08-16T22:38:19Z",
-    "updated_at": "2024-07-07T17:26:55Z",
+    "updated_at": "2024-07-08T04:30:35Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "159af013f092414b6898b150a58110e81ce46863",
@@ -298,9 +298,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 35611,
-        "stargazers_count": 77123,
-        "watchers_count": 77123,
+        "forks_count": 35613,
+        "stargazers_count": 77129,
+        "watchers_count": 77129,
         "size": 262585,
         "default_branch": "master",
         "open_issues_count": 684,
@@ -320,9 +320,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-07-07T16:42:05Z",
+        "pushed_at": "2024-07-08T04:36:03Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-07-07T12:38:10Z",
+        "updated_at": "2024-07-08T04:21:02Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -351,7 +351,7 @@
     "deletions": 76,
     "changed_files": 10,
     "commits": 12,
-    "review_comments": 177,
+    "review_comments": 180,
     "comments": 49
   },
   "events": [
@@ -17002,6 +17002,162 @@
       "start_side": null,
       "line": null,
       "original_line": 275,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667968459",
+      "pull_request_review_id": 2162225320,
+      "id": 1667968459,
+      "node_id": "PRRC_kwDOABII585jay3L",
+      "diff_hunk": "@@ -178,80 +189,91 @@ void CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {\n     hashBlock = hashBlockIn;\n }\n \n-bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlockIn, bool erase) {\n-    for (CCoinsMap::iterator it = mapCoins.begin();\n-            it != mapCoins.end();\n-            it = erase ? mapCoins.erase(it) : std::next(it)) {\n+bool CCoinsViewCache::BatchWrite(CCoinsMap& mapCoins, CoinsCachePair &sentinel, size_t &childCachedCoinsUsage, const uint256 &hashBlockIn, bool erase) {\n+    for (auto it{sentinel.second.Next()}; it != &sentinel; ) {\n         // Ignore non-dirty entries (optimization).\n-        if (!(it->second.flags & CCoinsCacheEntry::DIRTY)) {\n+        if (!(it->second.IsDirty())) {\n+            const auto next_entry{it->second.Next(/*clear_flags=*/true)};\n+            if (!erase && it->second.coin.IsSpent()) {\n+                childCachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();\n+                mapCoins.erase(it->first);",
+      "path": "src/coins.cpp",
+      "position": 101,
+      "original_position": 101,
+      "commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "original_commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "in_reply_to_id": 1667730042,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Ok, but is there no C++-fu incantation that can get us from a `std::pair<const COutpoint, CCoinsCacheEntry>*` to a `CCoinsMap::iterator`? I can't figure out a way to get that to compile but I'm sure there's a way using `void*` or something.",
+      "created_at": "2024-07-08T04:13:42Z",
+      "updated_at": "2024-07-08T04:13:42Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28280#discussion_r1667968459",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667968459"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28280"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 199,
+      "original_line": 199,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667970205",
+      "pull_request_review_id": 2162228072,
+      "id": 1667970205,
+      "node_id": "PRRC_kwDOABII585jazSd",
+      "diff_hunk": "@@ -178,80 +189,91 @@ void CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {\n     hashBlock = hashBlockIn;\n }\n \n-bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlockIn, bool erase) {\n-    for (CCoinsMap::iterator it = mapCoins.begin();\n-            it != mapCoins.end();\n-            it = erase ? mapCoins.erase(it) : std::next(it)) {\n+bool CCoinsViewCache::BatchWrite(CCoinsMap& mapCoins, CoinsCachePair &sentinel, size_t &childCachedCoinsUsage, const uint256 &hashBlockIn, bool erase) {\n+    for (auto it{sentinel.second.Next()}; it != &sentinel; ) {\n         // Ignore non-dirty entries (optimization).\n-        if (!(it->second.flags & CCoinsCacheEntry::DIRTY)) {\n+        if (!(it->second.IsDirty())) {\n+            const auto next_entry{it->second.Next(/*clear_flags=*/true)};\n+            if (!erase && it->second.coin.IsSpent()) {\n+                childCachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();\n+                mapCoins.erase(it->first);",
+      "path": "src/coins.cpp",
+      "position": 101,
+      "original_position": 101,
+      "commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "original_commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "in_reply_to_id": 1667730042,
+      "user": {
+        "login": "sipa",
+        "id": 548488,
+        "node_id": "MDQ6VXNlcjU0ODQ4OA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/548488?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sipa",
+        "html_url": "https://github.com/sipa",
+        "followers_url": "https://api.github.com/users/sipa/followers",
+        "following_url": "https://api.github.com/users/sipa/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sipa/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sipa/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sipa/subscriptions",
+        "organizations_url": "https://api.github.com/users/sipa/orgs",
+        "repos_url": "https://api.github.com/users/sipa/repos",
+        "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sipa/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "It might be possible to construct something that works for a specific libstdc++ or libc++ version, but it would be very ugly.",
+      "created_at": "2024-07-08T04:17:39Z",
+      "updated_at": "2024-07-08T04:17:39Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28280#discussion_r1667970205",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667970205"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28280"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 199,
+      "original_line": 199,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667977013",
+      "pull_request_review_id": 2162238647,
+      "id": 1667977013,
+      "node_id": "PRRC_kwDOABII585ja081",
+      "diff_hunk": "@@ -178,80 +189,91 @@ void CCoinsViewCache::SetBestBlock(const uint256 &hashBlockIn) {\n     hashBlock = hashBlockIn;\n }\n \n-bool CCoinsViewCache::BatchWrite(CCoinsMap &mapCoins, const uint256 &hashBlockIn, bool erase) {\n-    for (CCoinsMap::iterator it = mapCoins.begin();\n-            it != mapCoins.end();\n-            it = erase ? mapCoins.erase(it) : std::next(it)) {\n+bool CCoinsViewCache::BatchWrite(CCoinsMap& mapCoins, CoinsCachePair &sentinel, size_t &childCachedCoinsUsage, const uint256 &hashBlockIn, bool erase) {\n+    for (auto it{sentinel.second.Next()}; it != &sentinel; ) {\n         // Ignore non-dirty entries (optimization).\n-        if (!(it->second.flags & CCoinsCacheEntry::DIRTY)) {\n+        if (!(it->second.IsDirty())) {\n+            const auto next_entry{it->second.Next(/*clear_flags=*/true)};\n+            if (!erase && it->second.coin.IsSpent()) {\n+                childCachedCoinsUsage -= it->second.coin.DynamicMemoryUsage();\n+                mapCoins.erase(it->first);",
+      "path": "src/coins.cpp",
+      "position": 101,
+      "original_position": 101,
+      "commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "original_commit_id": "91c262bae99e0659a1c087cea70b1b62d7cfebde",
+      "in_reply_to_id": 1667730042,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Can you point me to the way of that ugliness? :pray:",
+      "created_at": "2024-07-08T04:30:35Z",
+      "updated_at": "2024-07-08T04:30:35Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/28280#discussion_r1667977013",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1667977013"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/28280"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 199,
+      "original_line": 199,
       "side": "RIGHT"
     }
   ]
