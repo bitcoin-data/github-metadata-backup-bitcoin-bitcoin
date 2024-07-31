@@ -10,8 +10,8 @@
     "events_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30543/events",
     "html_url": "https://github.com/bitcoin/bitcoin/issues/30543",
     "number": 30543,
-    "state": "open",
-    "state_reason": null,
+    "state": "closed",
+    "state_reason": "completed",
     "title": "tests: the python test framework mixes/confuses messages to different peers",
     "body": "### Is there an existing issue for this?\r\n\r\n- [X] I have searched the existing issues\r\n\r\n### Current behaviour\r\n\r\nThe `P2PInterface.last_message['tx']` is unreliable because it may end up with a transaction sent to another peer. To observe this:\r\n\r\n* Modify Bitcoin Core so that it repeatedly sends back a transaction to the peer it received it from.\r\n* Write a test with one Bitcoin Core node and two python `P2PInterface` peers and have each peer send one transaction to the node, e.g. peer0 sends tx0 and peer1 sends tx1. Expect peer0 to repeatedly receive back tx0 from the node and peer1 to repeatedly receive back tx1.\r\n* The test fails because either peer0 receives back tx1 or peer1 receives back tx0.\r\n\r\nThis looks so strange that I think that I must be doing something wrong.\r\n\r\n<details>\r\n<summary>Modification to Bitcoin Core to repeatedly echo back a transaction</summary>\r\n\r\n```diff\r\ndiff --git c/src/net_processing.cpp i/src/net_processing.cpp\r\nindex d674758abd..00204e47cd 100644\r\n--- c/src/net_processing.cpp\r\n+++ i/src/net_processing.cpp\r\n@@ -2504,15 +2504,17 @@ void PeerManagerImpl::ProcessGetBlockData(CNode& pfrom, Peer& peer, const CInv&\r\n                 // CMerkleBlock just contains hashes, so also push any transactions in the block the client did not see\r\n                 // This avoids hurting performance by pointlessly requiring a round-trip\r\n                 // Note that there is currently no way for a node to request any single transactions we didn't send here -\r\n                 // they must either disconnect and retry or request the full block.\r\n                 // Thus, the protocol spec specified allows for us to provide duplicate txn here,\r\n                 // however we MUST always provide at least what the remote peer needs\r\n+#if 0\r\n                 typedef std::pair<unsigned int, uint256> PairType;\r\n                 for (PairType& pair : merkleBlock.vMatchedTxn)\r\n                     MakeAndPushMessage(pfrom, NetMsgType::TX, TX_NO_WITNESS(*pblock->vtx[pair.first]));\r\n+#endif\r\n             }\r\n             // else\r\n             // no response\r\n         } else if (inv.IsMsgCmpctBlk()) {\r\n             // If a peer is asking for old blocks, we're almost guaranteed\r\n             // they won't have a useful mempool to match against a compact block,\r\n@@ -2591,15 +2593,17 @@ void PeerManagerImpl::ProcessGetData(CNode& pfrom, Peer& peer, const std::atomic\r\n             // peers and peers that asked us not to announce transactions.\r\n             continue;\r\n         }\r\n \r\n         CTransactionRef tx = FindTxForGetData(*tx_relay, ToGenTxid(inv));\r\n         if (tx) {\r\n+#if 0\r\n             // WTX and WITNESS_TX imply we serialize with witness\r\n             const auto maybe_with_witness = (inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS);\r\n             MakeAndPushMessage(pfrom, NetMsgType::TX, maybe_with_witness(*tx));\r\n+#endif\r\n             m_mempool.RemoveUnbroadcastTx(tx->GetHash());\r\n         } else {\r\n             vNotFound.push_back(inv);\r\n         }\r\n     }\r\n \r\n@@ -3652,12 +3656,15 @@ void PeerManagerImpl::ProcessCompactBlockTxns(CNode& pfrom, Peer& peer, const Bl\r\n         // in compact block optimistic reconstruction handling.\r\n         ProcessBlock(pfrom, pblock, /*force_processing=*/true, /*min_pow_checked=*/true);\r\n     }\r\n     return;\r\n }\r\n \r\n+// Remember which peer send us which transaction and then echo it back repeatedly.\r\n+static std::unordered_map<NodeId, CTransactionRef> g_echo_tx;\r\n+\r\n void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, DataStream& vRecv,\r\n                                      const std::chrono::microseconds time_received,\r\n                                      const std::atomic<bool>& interruptMsgProc)\r\n {\r\n     AssertLockHeld(g_msgproc_mutex);\r\n \r\n@@ -4497,12 +4504,15 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n         if (m_chainman.IsInitialBlockDownload()) return;\r\n \r\n         CTransactionRef ptx;\r\n         vRecv >> TX_WITH_WITNESS(ptx);\r\n         const CTransaction& tx = *ptx;\r\n \r\n+        // Save the received transaction with the peer id.\r\n+        g_echo_tx.emplace(pfrom.GetId(), ptx);\r\n+\r\n         const uint256& txid = ptx->GetHash();\r\n         const uint256& wtxid = ptx->GetWitnessHash();\r\n \r\n         const uint256& hash = peer->m_wtxid_relay ? wtxid : txid;\r\n         AddKnownTx(*peer, hash);\r\n \r\n@@ -5327,12 +5337,19 @@ bool PeerManagerImpl::ProcessMessages(CNode* pfrom, std::atomic<bool>& interrupt\r\n     if (peer == nullptr) return false;\r\n \r\n     // For outbound connections, ensure that the initial VERSION message\r\n     // has been sent first before processing any incoming messages\r\n     if (!pfrom->IsInboundConn() && !peer->m_outbound_version_message_sent) return false;\r\n \r\n+    // If this peer has sent us a transaction before, then send it back\r\n+    // on each call to ProcessMessages().\r\n+    auto it = g_echo_tx.find(pfrom->GetId());\r\n+    if (it != g_echo_tx.end()) {\r\n+        MakeAndPushMessage(*pfrom, NetMsgType::TX, TX_WITH_WITNESS(*it->second));\r\n+    }\r\n+\r\n     {\r\n         LOCK(peer->m_getdata_requests_mutex);\r\n         if (!peer->m_getdata_requests.empty()) {\r\n             ProcessGetData(*pfrom, *peer, interruptMsgProc);\r\n         }\r\n     }\r\n```\r\n</details>\r\n\r\n<details>\r\n<summary>Attach a name to each P2PInterface() and use it in the logs to make it easy to distinguish which peer logged what</summary>\r\n\r\n```diff\r\ndiff --git c/test/functional/test_framework/p2p.py i/test/functional/test_framework/p2p.py\r\nindex 4f1265eb54..18f19d40a6 100755\r\n--- c/test/functional/test_framework/p2p.py\r\n+++ i/test/functional/test_framework/p2p.py\r\n@@ -158,13 +158,14 @@ class P2PConnection(asyncio.Protocol):\r\n     - deserializing and serializing the P2P message header\r\n     - logging messages as they are sent and received\r\n \r\n     This class contains no logic for handing the P2P message payloads. It must be\r\n     sub-classed and the on_message() callback overridden.\"\"\"\r\n \r\n-    def __init__(self):\r\n+    def __init__(self, name):\r\n+        self.name = name\r\n         # The underlying transport of the connection.\r\n         # Should only call methods on this from the NetworkThread, c.f. call_soon_threadsafe\r\n         self._transport = None\r\n         # This lock is acquired before sending messages over the socket. There's an implied lock order and\r\n         # p2p_lock must not be acquired after _send_lock as it could result in deadlocks.\r\n         self._send_lock = threading.Lock()\r\n@@ -419,16 +420,17 @@ class P2PConnection(asyncio.Protocol):\r\n             tmsg += h[:4]\r\n             tmsg += data\r\n             return tmsg\r\n \r\n     def _log_message(self, direction, msg):\r\n         \"\"\"Logs a message being sent or received over the connection.\"\"\"\r\n+        log_message = f\"[{self.name}] \"\r\n         if direction == \"send\":\r\n-            log_message = \"Send message to \"\r\n+            log_message += \"Send message to \"\r\n         elif direction == \"receive\":\r\n-            log_message = \"Received message from \"\r\n+            log_message += \"Received message from \"\r\n         log_message += \"%s:%d: %s\" % (self.dstaddr, self.dstport, repr(msg)[:500])\r\n         if len(log_message) > 500:\r\n             log_message += \"... (msg truncated)\"\r\n         logger.debug(log_message)\r\n \r\n \r\n@@ -438,14 +440,14 @@ class P2PInterface(P2PConnection):\r\n     This class provides high-level callbacks for processing P2P message\r\n     payloads, as well as convenience methods for interacting with the\r\n     node over P2P.\r\n \r\n     Individual testcases should subclass this and override the on_* methods\r\n     if they want to alter message handling behaviour.\"\"\"\r\n-    def __init__(self, support_addrv2=False, wtxidrelay=True):\r\n-        super().__init__()\r\n+    def __init__(self, name, support_addrv2=False, wtxidrelay=True):\r\n+        super().__init__(name)\r\n \r\n         # Track number of messages of each type received.\r\n         # Should be read-only in a test.\r\n         self.message_count = defaultdict(int)\r\n \r\n         # Track the most recent message of each type.\r\n```\r\n</details>\r\n\r\n<details>\r\n<summary>A test that should pass</summary>\r\n\r\n```python\r\n#!/usr/bin/env python3\r\n# Copyright (c) 2017-present The Bitcoin Core developers\r\n# Distributed under the MIT software license, see the accompanying\r\n# file COPYING or http://www.opensource.org/licenses/mit-license.php.\r\n\"\"\"\r\n\"\"\"\r\n\r\nfrom test_framework.p2p import (\r\n    P2PInterface,\r\n)\r\nfrom test_framework.messages import (\r\n    msg_tx,\r\n)\r\nfrom test_framework.test_framework import (\r\n    BitcoinTestFramework,\r\n)\r\nfrom test_framework.wallet import (\r\n    MiniWallet,\r\n)\r\n\r\n\r\nclass P2PTtt(BitcoinTestFramework):\r\n    def set_test_params(self):\r\n        self.num_nodes = 1\r\n\r\n    def run_test(self):\r\n        node0 = self.nodes[0]\r\n        p0 = node0.add_outbound_p2p_connection(P2PInterface(\"p0\"), p2p_idx=0)\r\n        p1 = node0.add_outbound_p2p_connection(P2PInterface(\"p1\"), p2p_idx=1)\r\n\r\n        wallet = MiniWallet(node0)\r\n\r\n        txs = wallet.create_self_transfer_chain(chain_length=2)\r\n        self.log.info(f\"Created txid={txs[0]['txid']}, spends {txs[0]['tx'].vin[0].prevout}\")\r\n        self.log.info(f\"Created txid={txs[1]['txid']}, spends {txs[1]['tx'].vin[0].prevout}\")\r\n\r\n        p0.send_message(msg_tx(txs[0][\"tx\"]))\r\n        p1.send_message(msg_tx(txs[1][\"tx\"]))\r\n\r\n        self.wait_until(lambda: len(node0.getrawmempool()) > 0)\r\n        self.wait_until(lambda: p0.message_count[\"tx\"] > 0)\r\n        self.wait_until(lambda: p1.message_count[\"tx\"] > 0)\r\n        while p1.message_count[\"tx\"] < 10:\r\n            if txs[0][\"txid\"] != p0.last_message[\"tx\"].tx.rehash():\r\n                self.log.error(f\"p0 was expecting transaction {txs[0]['txid']} \"\r\n                               f\"but instead received transaction {p0.last_message['tx'].tx.rehash()}\")\r\n                assert False\r\n            if txs[1][\"txid\"] != p1.last_message[\"tx\"].tx.rehash():\r\n                self.log.error(f\"p1 was expecting transaction {txs[1]['txid']} \"\r\n                               f\"but instead received transaction {p1.last_message['tx'].tx.rehash()}\")\r\n                assert False\r\n\r\n\r\nif __name__ == \"__main__\":\r\n    P2PTtt(__file__).main()\r\n```\r\n</details>\r\n\r\n### Expected behaviour\r\n\r\nThe test should pass.\r\n\r\n### Steps to reproduce\r\n\r\nModify Bitcoin Core with the attached patch and run the attached test.\r\n\r\n### Relevant log output\r\n\r\n```\r\n# this is ok, as expected, p0 receives tx 3833 which spends ff07:0\r\n test  2024-07-29T14:52:48.905000Z TestFramework.p2p (DEBUG): [p0] Received message from 0:0: msg_tx(tx=CTransaction(version=2 vin=[CTxIn(prevout=COutPoint(hash=ff07cc811d2826c6f5a6386dce61cdd3adfcdbacad4de26f3024d68d6dc16d13 n=0) scriptSig= nSequence=0)] vout=[CTxOut(nValue=49.99968800 scriptPubKey=51202913b252fe537830f843bfdc5fa7d20ba48639a87c86ff837b92d083c55ad7c1)] wit=CTxWitness(CScriptWitness(51,c00000000000000000000000000000000000000000000000000000000000000001)) nLockTime=0)) \r\n\r\n# this is ok, as expected, p1 receives tx e746 which spends 3833:0\r\n test  2024-07-29T14:52:48.905000Z TestFramework.p2p (DEBUG): [p1] Received message from 0:0: msg_tx(tx=CTransaction(version=2 vin=[CTxIn(prevout=COutPoint(hash=38335600f2465c0f8bb2b86d5830a34851d86fa879800c0e1434ddfc78c42898 n=0) scriptSig= nSequence=0)] vout=[CTxOut(nValue=49.99937600 scriptPubKey=51202913b252fe537830f843bfdc5fa7d20ba48639a87c86ff837b92d083c55ad7c1)] wit=CTxWitness(CScriptWitness(51,c00000000000000000000000000000000000000000000000000000000000000001)) nLockTime=0)) \r\n\r\n# there are no other \"TestFramework.p2p ... Received message ... msg_tx\" messages\r\n\r\n# then p0.last_message[\"tx\"].tx.rehash() contains e746!?\r\n test  2024-07-29T14:52:48.956000Z TestFramework (ERROR): p0 was expecting transaction 38335600f2465c0f8bb2b86d5830a34851d86fa879800c0e1434ddfc78c42898 but instead received transaction e74691cbd1b181269301baed4266a2174cd4198fcf95591048c4ad17640f9f5b \r\n```\r\n\r\n[full_log.txt](https://github.com/user-attachments/files/16415211/full_log.txt)\r\n\r\n### How did you obtain Bitcoin Core\r\n\r\nCompiled from source\r\n\r\n### What version of Bitcoin Core are you using?\r\n\r\nmaster@8754d055c65e11fd2afa59f9e5de7c60a9e0ec23\r\n\r\n### Operating system and version\r\n\r\nPython 3.11.9\r\n\r\n### Machine specifications\r\n\r\n_No response_",
     "user": {
@@ -39,8 +39,9 @@
     "author_association": "CONTRIBUTOR",
     "locked": false,
     "comments": 7,
+    "closed_at": "2024-07-31T11:01:37Z",
     "created_at": "2024-07-29T15:01:08Z",
-    "updated_at": "2024-07-30T21:58:57Z"
+    "updated_at": "2024-07-31T11:01:37Z"
   },
   "events": [
     {
@@ -536,6 +537,64 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/30543#issuecomment-2259260024",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30543"
+    },
+    {
+      "event": "closed",
+      "id": 13708202040,
+      "node_id": "CE_lADOABII586RLVR8zwAAAAMxEpA4",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/13708202040",
+      "actor": {
+        "login": "fanquake",
+        "id": 863730,
+        "node_id": "MDQ6VXNlcjg2MzczMA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/863730?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/fanquake",
+        "html_url": "https://github.com/fanquake",
+        "followers_url": "https://api.github.com/users/fanquake/followers",
+        "following_url": "https://api.github.com/users/fanquake/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/fanquake/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/fanquake/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/fanquake/subscriptions",
+        "organizations_url": "https://api.github.com/users/fanquake/orgs",
+        "repos_url": "https://api.github.com/users/fanquake/repos",
+        "events_url": "https://api.github.com/users/fanquake/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/fanquake/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": "be969292db72ddac32bbf101f0706e3665e059e2",
+      "commit_url": "https://api.github.com/repos/bitcoin/bitcoin/commits/be969292db72ddac32bbf101f0706e3665e059e2",
+      "created_at": "2024-07-31T11:01:38Z"
+    },
+    {
+      "event": "referenced",
+      "id": 13708204936,
+      "node_id": "REFE_lADOABII586RLVR8zwAAAAMxEpuI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/13708204936",
+      "actor": {
+        "login": "fanquake",
+        "id": 863730,
+        "node_id": "MDQ6VXNlcjg2MzczMA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/863730?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/fanquake",
+        "html_url": "https://github.com/fanquake",
+        "followers_url": "https://api.github.com/users/fanquake/followers",
+        "following_url": "https://api.github.com/users/fanquake/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/fanquake/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/fanquake/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/fanquake/subscriptions",
+        "organizations_url": "https://api.github.com/users/fanquake/orgs",
+        "repos_url": "https://api.github.com/users/fanquake/repos",
+        "events_url": "https://api.github.com/users/fanquake/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/fanquake/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": "be969292db72ddac32bbf101f0706e3665e059e2",
+      "commit_url": "https://api.github.com/repos/fanquake/bitcoin/commits/be969292db72ddac32bbf101f0706e3665e059e2",
+      "created_at": "2024-07-31T11:01:52Z"
     }
   ]
 }
