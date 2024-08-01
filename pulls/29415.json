@@ -41,10 +41,10 @@
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to 5 (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: move peers counting before grant acquisition in ThreadOpenConnections()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvements (also opened as a standalone PR at https://github.com/bitcoin/bitcoin/pull/29420):\r\n  * `test: improve debug log message from P2PConnection::connection_made()`\r\n  * `test: extend the SOCKS5 Python proxy to actually connect to a destination`\r\n  * `test: support WTX INVs from P2PDataStore and fix a comment`\r\n  * `test: set P2PConnection::p2p_connected_to_node in peer_connect_helper()`\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n</details>\r\n\r\n---\r\n\r\nThis addresses:\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\n\r\nRelated, but different:\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions of this planned for subsequent PRs:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
     "labels": [],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2024-08-01T13:52:41Z",
+    "updated_at": "2024-08-01T17:44:15Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "3f0ef1bb5f863ed74ab97cd152eeab5575c3dd5e",
+    "merge_commit_sha": "0bd92f1e2088b3d02f949d547c0b1a0cff4422f4",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -318,10 +318,10 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 35694,
-        "stargazers_count": 77435,
-        "watchers_count": 77435,
-        "size": 264043,
+        "forks_count": 35710,
+        "stargazers_count": 77452,
+        "watchers_count": 77452,
+        "size": 264436,
         "default_branch": "master",
         "open_issues_count": 670,
         "is_template": false,
@@ -340,9 +340,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-08-01T13:45:26Z",
+        "pushed_at": "2024-08-01T17:01:18Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-08-01T12:57:18Z",
+        "updated_at": "2024-08-01T17:49:23Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -371,7 +371,7 @@
     "deletions": 228,
     "changed_files": 36,
     "commits": 19,
-    "review_comments": 194,
+    "review_comments": 197,
     "comments": 39
   },
   "events": [
@@ -16238,6 +16238,162 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700086637"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1995,
+      "original_line": 1995,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700564090",
+      "pull_request_review_id": 2213455212,
+      "id": 1700564090,
+      "node_id": "PRRC_kwDOABII585lXIx6",
+      "diff_hunk": "@@ -643,6 +643,18 @@ void SetupServerArgs(ArgsManager& argsman)\n                    OptionsCategory::NODE_RELAY);\n     argsman.AddArg(\"-minrelaytxfee=<amt>\", strprintf(\"Fees (in %s/kvB) smaller than this are considered zero fee for relaying, mining and transaction creation (default: %s)\",\n         CURRENCY_UNIT, FormatMoney(DEFAULT_MIN_RELAY_TX_FEE)), ArgsManager::ALLOW_ANY, OptionsCategory::NODE_RELAY);\n+    argsman.AddArg(\"-privatebroadcast\",\n+                   strprintf(\n+                       \"Broadcast transactions submitted via sendrawtransaction RPC using short lived \"\n+                       \"connections to Tor or I2P peers without putting them in the mempool first. \"",
+      "path": "src/init.cpp",
+      "position": 16,
+      "original_position": 16,
+      "commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "in_reply_to_id": 1700042799,
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Yes, it needs to be updated, thanks for spotting this! How about this:\r\n\r\n```diff\r\n +                       \"Broadcast transactions submitted via sendrawtransaction RPC using short lived \"\r\n-+                       \"connections to Tor or I2P peers without putting them in the mempool first. \"\r\n++                       \"connections through the Tor or I2P networks without putting them in the mempool first. \"\r\n```",
+      "created_at": "2024-08-01T17:37:04Z",
+      "updated_at": "2024-08-01T17:37:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r1700564090",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700564090"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 649,
+      "original_line": 649,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700566275",
+      "pull_request_review_id": 2213458821,
+      "id": 1700566275,
+      "node_id": "PRRC_kwDOABII585lXJUD",
+      "diff_hunk": "@@ -2496,6 +2517,11 @@ void CConnman::ThreadOpenConnections(const std::vector<std::string> connect)\n         LogPrintf(\"Fixed seeds are disabled\\n\");\n     }\n \n+    // Private broadcast connections are opened with priority over others, but only half\n+    // of the time to avoid depriving other connection types if private broadcast is\n+    // needed but opening such connections is unsuccessful for some reason.\n+    std::optional<Network> open_private_broadcast_to;",
+      "path": "src/net.cpp",
+      "position": 61,
+      "original_position": 61,
+      "commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "in_reply_to_id": 1700052316,
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "This does not look like the whole warning? I only see `in member function ... : note: '...' was declared here`.",
+      "created_at": "2024-08-01T17:39:03Z",
+      "updated_at": "2024-08-01T17:39:03Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r1700566275",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700566275"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 2523,
+      "original_line": 2523,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700571980",
+      "pull_request_review_id": 2213469059,
+      "id": 1700571980,
+      "node_id": "PRRC_kwDOABII585lXKtM",
+      "diff_hunk": "@@ -1952,6 +1984,31 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)\n \n     connOptions.m_i2p_accept_incoming = args.GetBoolArg(\"-i2pacceptincoming\", DEFAULT_I2P_ACCEPT_INCOMING);\n \n+    if (args.GetBoolArg(\"-privatebroadcast\", DEFAULT_PRIVATE_BROADCAST)) {\n+        // If -listenonion is set, then NET_ONION may not be reachable now\n+        // but may become reachable later, thus only error here if it is not\n+        // reachable and will not become reachable for sure.\n+        const bool onion_may_become_reachable{listenonion && (!args.IsArgSet(\"-onlynet\") || onlynet_used_with_onion)};\n+        if (!g_reachable_nets.Contains(NET_I2P) &&\n+            !g_reachable_nets.Contains(NET_ONION) &&\n+            !onion_may_become_reachable) {\n+            return InitError(_(\"Private broadcast of own transactions requested (-privatebroadcast), \"",
+      "path": "src/init.cpp",
+      "position": 110,
+      "original_position": 110,
+      "commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "in_reply_to_id": 1700086637,
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Emitting errors from the RPC is also an option, but I prefer to keep the current way because it clearly shows something is misconfigured and starting up knowing that the RPC will never work and always give errors seems like a bad user experience. I would prefer that the user stops and is forced to fix the misconfiguration of the node. `bitcoin-qt` also has a RPC console.",
+      "created_at": "2024-08-01T17:44:15Z",
+      "updated_at": "2024-08-01T17:44:15Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r1700571980",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1700571980"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
