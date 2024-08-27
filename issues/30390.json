@@ -64,9 +64,9 @@
     "assignees": [],
     "author_association": "MEMBER",
     "locked": false,
-    "comments": 7,
+    "comments": 8,
     "created_at": "2024-07-04T08:40:22Z",
-    "updated_at": "2024-08-27T06:43:45Z"
+    "updated_at": "2024-08-27T07:31:29Z"
   },
   "events": [
     {
@@ -304,9 +304,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2024-08-26T21:56:08Z",
-      "updated_at": "2024-08-26T21:56:08Z",
+      "updated_at": "2024-08-27T07:30:13Z",
       "author_association": "CONTRIBUTOR",
-      "body": "Would something like this be useful in helping approach the root cause of this?\r\n```diff\r\n--- a/test/functional/test_framework/test_node.py\r\n+++ b/test/functional/test_framework/test_node.py\r\n@@ -5,6 +5,7 @@\r\n \"\"\"Class for bitcoind node under test\"\"\"\r\n \r\n import contextlib\r\n+from collections import Counter\r\n import decimal\r\n import errno\r\n from enum import Enum\r\n@@ -260,6 +261,7 @@ class TestNode():\r\n         \"\"\"Sets up an RPC connection to the bitcoind process. Returns False if unable to connect.\"\"\"\r\n         # Poll at a rate of four times per second\r\n         poll_per_s = 4\r\n+        ignored_errors = Counter()\r\n         for _ in range(poll_per_s * self.rpc_timeout):\r\n             if self.process.poll() is not None:\r\n                 # Attach abrupt shutdown error/s to the exception message\r\n@@ -308,25 +310,31 @@ class TestNode():\r\n                 return\r\n             except JSONRPCException as e:  # Initialization phase\r\n                 # -28 RPC in warmup\r\n-                # -342 Service unavailable, RPC server started but is shutting down due to error\r\n-                if e.error['code'] != -28 and e.error['code'] != -342:\r\n+                if e.error['code'] == -28:\r\n+                    ignored_errors[\"-28 warmup\"] += 1\r\n+                else:\r\n                     raise  # unknown JSON RPC exception\r\n             except ConnectionResetError:\r\n                 # This might happen when the RPC server is in warmup, but shut down before the call to getblockcount\r\n                 # succeeds. Try again to properly raise the FailedToStartError\r\n+                ignored_errors[\"ConnectionResetError\"] += 1\r\n                 pass\r\n             except OSError as e:\r\n                 if e.errno == errno.ETIMEDOUT:\r\n+                    ignored_errors[\"OSError.ETIMEDOUT\"] += 1\r\n                     pass  # Treat identical to ConnectionResetError\r\n                 elif e.errno == errno.ECONNREFUSED:\r\n+                    ignored_errors[\"OSError.ETIMEDOUT\"] += 1\r\n                     pass  # Port not yet open?\r\n                 else:\r\n                     raise  # unknown OS error\r\n             except ValueError as e:  # cookie file not found and no rpcuser or rpcpassword; bitcoind is still starting\r\n-                if \"No RPC credentials\" not in str(e):\r\n+                if \"No RPC credentials\" in str(e):\r\n+                    ignored_errors[\"Waiting_for_credentials\"] += 1\r\n+                else:\r\n                     raise\r\n             time.sleep(1.0 / poll_per_s)\r\n-        self._raise_assertion_error(\"Unable to connect to bitcoind after {}s\".format(self.rpc_timeout))\r\n+        self._raise_assertion_error(\"Unable to connect to bitcoind after {}s (ignored_errors: {})\".format(self.rpc_timeout, str(dict(ignored_errors))))\r\n \r\n     def wait_for_cookie_credentials(self):\r\n         \"\"\"Ensures auth cookie credentials can be read, e.g. for testing CLI with -rpcwait before RPC connection is up.\"\"\"\r\n```\r\nNot sure if patches like this could be applied to some subset of CI to help debug CI-only issues, slightly unclean, but maybe you've done similar things before?\r\n\r\n**Notable**: I removed the case for \"-342 Service unavailable, RPC server started but is shutting down due to error\". Seems like we should be failing if the server is shutting down instead of *silently ignoring it*.",
+      "body": "Would something like this be useful in helping approach the root cause of this?\r\n\r\n(Edit: updated diff based off [1](https://github.com/bitcoin/bitcoin/issues/30390#issuecomment-2311591619) [2](https://github.com/bitcoin/bitcoin/issues/30390#issuecomment-2311697202))\r\n```diff\r\n--- a/test/functional/test_framework/test_node.py\r\n+++ b/test/functional/test_framework/test_node.py\r\n@@ -5,6 +5,7 @@\r\n \"\"\"Class for bitcoind node under test\"\"\"\r\n \r\n import contextlib\r\n+from collections import Counter\r\n import decimal\r\n import errno\r\n from enum import Enum\r\n@@ -260,6 +261,7 @@ class TestNode():\r\n         \"\"\"Sets up an RPC connection to the bitcoind process. Returns False if unable to connect.\"\"\"\r\n         # Poll at a rate of four times per second\r\n         poll_per_s = 4\r\n+        ignored_errors = Counter()\r\n         for _ in range(poll_per_s * self.rpc_timeout):\r\n             if self.process.poll() is not None:\r\n                 # Attach abrupt shutdown error/s to the exception message\r\n@@ -308,25 +310,32 @@ class TestNode():\r\n                 return\r\n             except JSONRPCException as e:  # Initialization phase\r\n                 # -28 RPC in warmup\r\n+                if e.error['code'] == -28:\r\n+                    ignored_errors[\"JSONRPCException -28\"] += 1\r\n                 # -342 Service unavailable, RPC server started but is shutting down due to error\r\n-                if e.error['code'] != -28 and e.error['code'] != -342:\r\n+                # - Ignore the exception to properly raise the FailedToStartError.\r\n+                elif e.error['code'] == -342:\r\n+                    ignored_errors[\"JSONRPCException -342\"] += 1\r\n+                else:\r\n                     raise  # unknown JSON RPC exception\r\n-            except ConnectionResetError:\r\n-                # This might happen when the RPC server is in warmup, but shut down before the call to getblockcount\r\n-                # succeeds. Try again to properly raise the FailedToStartError\r\n-                pass\r\n             except OSError as e:\r\n-                if e.errno == errno.ETIMEDOUT:\r\n-                    pass  # Treat identical to ConnectionResetError\r\n+                if e.errno == errno.ECONNRESET:\r\n+                    # This might happen when the RPC server is in warmup, but shut down before the call to getblockcount\r\n+                    # succeeds. Try again to properly raise the FailedToStartError\r\n+                    ignored_errors[\"OSError.ECONNRESET\"] += 1\r\n+                elif e.errno == errno.ETIMEDOUT:\r\n+                    ignored_errors[\"OSError.ETIMEDOUT\"] += 1 # Treat identical to ECONNRESET\r\n                 elif e.errno == errno.ECONNREFUSED:\r\n-                    pass  # Port not yet open?\r\n+                    ignored_errors[\"OSError.ECONNREFUSED\"] += 1 # Port not yet open?\r\n                 else:\r\n                     raise  # unknown OS error\r\n             except ValueError as e:  # cookie file not found and no rpcuser or rpcpassword; bitcoind is still starting\r\n-                if \"No RPC credentials\" not in str(e):\r\n+                if \"No RPC credentials\" in str(e):\r\n+                    ignored_errors[\"missing_credentials\"] += 1\r\n+                else:\r\n                     raise\r\n             time.sleep(1.0 / poll_per_s)\r\n-        self._raise_assertion_error(\"Unable to connect to bitcoind after {}s\".format(self.rpc_timeout))\r\n+        self._raise_assertion_error(\"Unable to connect to bitcoind after {}s (ignored_errors: {})\".format(self.rpc_timeout, str(dict(ignored_errors))))\r\n \r\n     def wait_for_cookie_credentials(self):\r\n         \"\"\"Ensures auth cookie credentials can be read, e.g. for testing CLI with -rpcwait before RPC connection is up.\"\"\"\r\n```\r\nNot sure if patches like this could be applied to some subset of CI to help debug CI-only issues, slightly unclean, but maybe you've done similar things before?\r\n\r\n~**Notable**: I removed the case for \"-342 Service unavailable, RPC server started but is shutting down due to error\". Seems like we should be failing if the server is shutting down instead of *silently ignoring it*.~",
       "user": {
         "login": "hodlinator",
         "id": 172445034,
@@ -544,6 +544,60 @@
         "site_admin": false
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/30390#issuecomment-2311697202",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30390"
+    },
+    {
+      "event": "commented",
+      "id": 2311773405,
+      "node_id": "IC_kwDOABII586Jytzd",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2311773405",
+      "actor": {
+        "login": "hodlinator",
+        "id": 172445034,
+        "node_id": "U_kgDOCkdNag",
+        "avatar_url": "https://avatars.githubusercontent.com/u/172445034?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/hodlinator",
+        "html_url": "https://github.com/hodlinator",
+        "followers_url": "https://api.github.com/users/hodlinator/followers",
+        "following_url": "https://api.github.com/users/hodlinator/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/hodlinator/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/hodlinator/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/hodlinator/subscriptions",
+        "organizations_url": "https://api.github.com/users/hodlinator/orgs",
+        "repos_url": "https://api.github.com/users/hodlinator/repos",
+        "events_url": "https://api.github.com/users/hodlinator/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/hodlinator/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-08-27T07:31:28Z",
+      "updated_at": "2024-08-27T07:31:28Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Thanks, I should have searched for why the -342 check was introduced before I suggested removing it. :facepalm: And my git-fu could do with some leveling up, that's impressive how it can single out the right commit.\r\n\r\nUpdated my [suggested diff](https://github.com/bitcoin/bitcoin/issues/30390#issuecomment-2311170636), bringing back the -342 check.\r\n\r\n> As for the ignored_errors counter, I presume it will just count errno.ECONNREFUSED for WinError 10061?\r\n\r\nYes, that's what [ConnectionRefusedError seems to contain](https://docs.python.org/3/library/exceptions.html#ConnectionRefusedError). Also corrected & updated that part of the diff.",
+      "user": {
+        "login": "hodlinator",
+        "id": 172445034,
+        "node_id": "U_kgDOCkdNag",
+        "avatar_url": "https://avatars.githubusercontent.com/u/172445034?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/hodlinator",
+        "html_url": "https://github.com/hodlinator",
+        "followers_url": "https://api.github.com/users/hodlinator/followers",
+        "following_url": "https://api.github.com/users/hodlinator/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/hodlinator/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/hodlinator/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/hodlinator/subscriptions",
+        "organizations_url": "https://api.github.com/users/hodlinator/orgs",
+        "repos_url": "https://api.github.com/users/hodlinator/repos",
+        "events_url": "https://api.github.com/users/hodlinator/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/hodlinator/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/issues/30390#issuecomment-2311773405",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30390"
     }
   ]
