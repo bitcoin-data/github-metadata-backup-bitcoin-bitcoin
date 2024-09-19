@@ -39,12 +39,22 @@
       "site_admin": false
     },
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to 5 (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: move peers counting before grant acquisition in ThreadOpenConnections()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvements (also opened as a standalone PR at https://github.com/bitcoin/bitcoin/pull/29420):\r\n  * `test: improve debug log message from P2PConnection::connection_made()`\r\n  * `test: extend the SOCKS5 Python proxy to actually connect to a destination`\r\n  * `test: support WTX INVs from P2PDataStore and fix a comment`\r\n  * `test: set P2PConnection::p2p_connected_to_node in peer_connect_helper()`\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n</details>\r\n\r\n---\r\n\r\nThis addresses:\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\n\r\nRelated, but different:\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions of this planned for subsequent PRs:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2024-09-18T14:41:13Z",
+    "updated_at": "2024-09-19T12:19:56Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "fd6fb882e4c1cd907da42f1cc38e0246bf7a1488",
+    "merge_commit_sha": "ee05214ec4e93a2041ee83f144ed383adb28dd5a",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -189,7 +199,7 @@
         "forks_count": 1,
         "stargazers_count": 5,
         "watchers_count": 5,
-        "size": 244322,
+        "size": 244378,
         "default_branch": "master",
         "open_issues_count": 2,
         "is_template": false,
@@ -202,9 +212,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-09-18T04:31:36Z",
+        "pushed_at": "2024-09-19T07:20:28Z",
         "created_at": "2018-02-07T11:52:47Z",
-        "updated_at": "2024-09-18T04:32:14Z",
+        "updated_at": "2024-09-19T07:20:39Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -318,12 +328,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36166,
-        "stargazers_count": 78436,
-        "watchers_count": 78436,
-        "size": 268764,
+        "forks_count": 36170,
+        "stargazers_count": 78453,
+        "watchers_count": 78453,
+        "size": 268828,
         "default_branch": "master",
-        "open_issues_count": 652,
+        "open_issues_count": 647,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -340,9 +350,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-09-18T09:17:31Z",
+        "pushed_at": "2024-09-19T11:17:22Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-09-18T14:29:07Z",
+        "updated_at": "2024-09-19T11:47:28Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -372,7 +382,7 @@
     "changed_files": 36,
     "commits": 20,
     "review_comments": 208,
-    "comments": 54
+    "comments": 55
   },
   "events": [
     {
@@ -7833,6 +7843,93 @@
         "name": "CI failed",
         "color": "cccccc"
       }
+    },
+    {
+      "event": "labeled",
+      "id": 14323208737,
+      "node_id": "LE_lADOABII585-yiT2zwAAAANVutIh",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/14323208737",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-09-19T12:19:54Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2360838083,
+      "node_id": "IC_kwDOABII586Mt4fD",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2360838083",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-09-19T12:19:55Z",
+      "updated_at": "2024-09-19T12:19:55Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--85328a0da195eb286784d51f73fa0af9-->\n🚧 At least one of the CI tasks failed.\n<sub>Debug: https://github.com/bitcoin/bitcoin/runs/29995994415</sub>\n\n<details><summary>Hints</summary>\n\nMake sure to run all tests locally, according to the documentation.\n\nThe failure may happen due to a number of reasons, for example:\n\n* Possibly due to a silent merge conflict (the changes in this pull request being\nincompatible with the current code in the target branch). If so, make sure to rebase on the latest\ncommit of the target branch.\n\n* A sanitizer issue, which can only be found by compiling with the sanitizer and running the\n  affected test.\n\n* An intermittent issue.\n\nLeave a comment here, if you need help tracking down a confusing failure.\n\n</details>\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2360838083",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
     }
   ],
   "comments": [
