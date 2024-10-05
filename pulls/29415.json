@@ -41,6 +41,15 @@
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to 5 (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: move peers counting before grant acquisition in ThreadOpenConnections()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvements (also opened as a standalone PR at https://github.com/bitcoin/bitcoin/pull/29420):\r\n  * `test: improve debug log message from P2PConnection::connection_made()`\r\n  * `test: extend the SOCKS5 Python proxy to actually connect to a destination`\r\n  * `test: support WTX INVs from P2PDataStore and fix a comment`\r\n  * `test: set P2PConnection::p2p_connected_to_node in peer_connect_helper()`\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n</details>\r\n\r\n---\r\n\r\nThis addresses:\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\n\r\nRelated, but different:\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions of this planned for subsequent PRs:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
     "labels": [
       {
+        "id": 955867938,
+        "node_id": "MDU6TGFiZWw5NTU4Njc5Mzg=",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20rebase",
+        "name": "Needs rebase",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      },
+      {
         "id": 5334691551,
         "node_id": "LA_kwDOABII588AAAABPfju3w",
         "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
@@ -51,9 +60,9 @@
       }
     ],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2024-10-05T04:11:01Z",
-    "mergeable": true,
-    "mergeable_state": "blocked",
+    "updated_at": "2024-10-05T16:17:03Z",
+    "mergeable": false,
+    "mergeable_state": "dirty",
     "merge_commit_sha": "41a6f48788d671303334b011223b8c5f62e052f9",
     "assignees": [],
     "requested_reviewers": [
@@ -99,7 +108,7 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": true,
+    "rebaseable": false,
     "head": {
       "label": "vasild:private_broadcast",
       "ref": "private_broadcast",
@@ -328,12 +337,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36215,
-        "stargazers_count": 78690,
-        "watchers_count": 78690,
-        "size": 269385,
+        "forks_count": 36219,
+        "stargazers_count": 78694,
+        "watchers_count": 78694,
+        "size": 269432,
         "default_branch": "master",
-        "open_issues_count": 677,
+        "open_issues_count": 675,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -350,9 +359,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-10-04T10:22:12Z",
+        "pushed_at": "2024-10-05T15:20:27Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-10-05T04:35:53Z",
+        "updated_at": "2024-10-05T16:41:34Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -382,7 +391,7 @@
     "changed_files": 36,
     "commits": 20,
     "review_comments": 222,
-    "comments": 57
+    "comments": 58
   },
   "events": [
     {
@@ -8159,6 +8168,93 @@
         "site_admin": false
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2391079413",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
+    },
+    {
+      "event": "labeled",
+      "id": 14528347562,
+      "node_id": "LE_lADOABII585-yiT2zwAAAANh9P2q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/14528347562",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-10-05T16:17:01Z",
+      "label": {
+        "name": "Needs rebase",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2395106324,
+      "node_id": "IC_kwDOABII586OwmwU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2395106324",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-10-05T16:17:02Z",
+      "updated_at": "2024-10-05T16:17:02Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--cf906140f33d8803c4a75a2196329ecb-->\n🐙 This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2395106324",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
     }
   ],
@@ -19687,9 +19783,9 @@
         "type": "User",
         "site_admin": false
       },
-      "body": "Here is the change:\r\n\r\n<details>\r\n<summary>[patch] only remove if accepted in mempool</summary>\r\n\r\n```diff\r\n--- i/src/net_processing.cpp\r\n+++ w/src/net_processing.cpp\r\n@@ -4803,27 +4803,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n         const uint256& txid = ptx->GetHash();\r\n         const uint256& wtxid = ptx->GetWitnessHash();\r\n \r\n         const uint256& hash = peer->m_wtxid_relay ? wtxid : txid;\r\n         AddKnownTx(*peer, hash);\r\n \r\n-        if (auto num_broadcasted = m_tx_for_private_broadcast.Remove(ptx)) {\r\n-            LogPrintLevel(BCLog::PRIVATE_BROADCAST,\r\n-                          BCLog::Level::Info,\r\n-                          \"Received our privately broadcast transaction (txid=%s) from the \"\r\n-                          \"network from peer=%d%s; stopping private broadcast attempts\\n\",\r\n-                          txid.ToString(),\r\n-                          pfrom.GetId(),\r\n-                          fLogIPs ? strprintf(\", peeraddr=%s\", pfrom.addr.ToStringAddrPort()) : \"\");\r\n-            if (NUM_PRIVATE_BROADCAST_PER_TX > num_broadcasted.value()) {\r\n-                // Not all of the initial NUM_PRIVATE_BROADCAST_PER_TX connections were needed.\r\n-                // Tell CConnman it does not need to start the remaining ones.\r\n-                m_connman.m_private_broadcast.NumToOpenSub(NUM_PRIVATE_BROADCAST_PER_TX - num_broadcasted.value());\r\n-            }\r\n-        }\r\n-\r\n         LOCK2(cs_main, m_tx_download_mutex);\r\n \r\n         m_txrequest.ReceivedResponse(pfrom.GetId(), txid);\r\n         if (tx.HasWitness()) m_txrequest.ReceivedResponse(pfrom.GetId(), wtxid);\r\n \r\n         // We do the AlreadyHaveTx() check using wtxid, rather than txid - in the\r\n@@ -4878,21 +4863,37 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n             //\r\n             // Note that m_lazy_recent_rejects doesn't just record DoSy or invalid\r\n             // transactions, but any tx not accepted by the mempool, which may be\r\n             // due to node policy (vs. consensus). So we can't blanket penalize a\r\n             // peer simply for relaying a tx that our m_lazy_recent_rejects has caught,\r\n             // regardless of false positives.\r\n+            // XXX what about Remove() also here?\r\n             return;\r\n         }\r\n \r\n         const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);\r\n         const TxValidationState& state = result.m_state;\r\n \r\n         if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\r\n             ProcessValidTx(pfrom.GetId(), ptx, result.m_replaced_transactions);\r\n             pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();\r\n+\r\n+            if (auto num_broadcasted = m_tx_for_private_broadcast.Remove(ptx)) {\r\n+                LogPrintLevel(BCLog::PRIVATE_BROADCAST,\r\n+                              BCLog::Level::Info,\r\n+                              \"Received our privately broadcast transaction (txid=%s) from the \"\r\n+                              \"network from peer=%d%s; stopping private broadcast attempts\\n\",\r\n+                              txid.ToString(),\r\n+                              pfrom.GetId(),\r\n+                              fLogIPs ? strprintf(\", peeraddr=%s\", pfrom.addr.ToStringAddrPort()) : \"\");\r\n+                if (NUM_PRIVATE_BROADCAST_PER_TX > num_broadcasted.value()) {\r\n+                    // Not all of the initial NUM_PRIVATE_BROADCAST_PER_TX connections were needed.\r\n+                    // Tell CConnman it does not need to start the remaining ones.\r\n+                    m_connman.m_private_broadcast.NumToOpenSub(NUM_PRIVATE_BROADCAST_PER_TX - num_broadcasted.value());\r\n+                }\r\n+            }\r\n         }\r\n         else if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS)\r\n         {\r\n             bool fRejectedParents = false; // It may be the case that the orphans parents have all been rejected\r\n \r\n             // Deduplicate parent txids, so that we don't have to loop over\r\n```\r\n</details>\r\n\r\nNote that if the tx is not accepted in our mempool because it has too low fee for our mempool, but is accepted in everybody else's mempool, then we would do the remaining broadcasts up to `NUM_PRIVATE_BROADCAST_PER_TX` (5), then it would get stale and will be removed by `PeerManagerImpl::ReattemptPrivateBroadcast()`. Whereas currently, without this change it will be removed right away and we will not do the remaining broadcasts (up to 5).\r\n\r\nI got another idea - remove the transaction only if the received tx it has the same txid and the same wtxid as the one that we broadcast.\r\n\r\n<details>\r\n<summary>[patch] check also wtxid</summary>\r\n\r\n```diff\r\n--- i/src/private_broadcast.cpp\r\n+++ w/src/private_broadcast.cpp\r\n@@ -21,13 +21,13 @@ bool PrivateBroadcast::Add(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(!\r\n }\r\n \r\n std::optional<size_t> PrivateBroadcast::Remove(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\r\n {                 \r\n     LOCK(m_mutex);\r\n     auto iters = Find(tx->GetHash());\r\n-    if (!iters) {\r\n+    if (!iters || iters->by_txid->second.tx->GetWitnessHash() != tx->GetWitnessHash()) {\r\n         return std::nullopt;\r\n     }\r\n     const size_t num_broadcasted{iters->by_priority->first.num_broadcasted};\r\n     m_by_priority.erase(iters->by_priority);\r\n     m_by_txid.erase(iters->by_txid);\r\n     return num_broadcasted;\r\n```\r\n</details>\r\n\r\nWith this, if a malleated and valid transaction makes it to our mempool, then we would keep broadcasting the original one, up to 5 times, and then it will be removed by `PeerManagerImpl::ReattemptPrivateBroadcast()`.\r\n\r\nWhich one?",
+      "body": "Here is the change:\r\n\r\n<details>\r\n<summary>[patch] only remove if accepted in mempool</summary>\r\n\r\n```diff\r\n--- i/src/net_processing.cpp\r\n+++ w/src/net_processing.cpp\r\n@@ -4803,27 +4803,12 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n         const uint256& txid = ptx->GetHash();\r\n         const uint256& wtxid = ptx->GetWitnessHash();\r\n \r\n         const uint256& hash = peer->m_wtxid_relay ? wtxid : txid;\r\n         AddKnownTx(*peer, hash);\r\n \r\n-        if (auto num_broadcasted = m_tx_for_private_broadcast.Remove(ptx)) {\r\n-            LogPrintLevel(BCLog::PRIVATE_BROADCAST,\r\n-                          BCLog::Level::Info,\r\n-                          \"Received our privately broadcast transaction (txid=%s) from the \"\r\n-                          \"network from peer=%d%s; stopping private broadcast attempts\\n\",\r\n-                          txid.ToString(),\r\n-                          pfrom.GetId(),\r\n-                          fLogIPs ? strprintf(\", peeraddr=%s\", pfrom.addr.ToStringAddrPort()) : \"\");\r\n-            if (NUM_PRIVATE_BROADCAST_PER_TX > num_broadcasted.value()) {\r\n-                // Not all of the initial NUM_PRIVATE_BROADCAST_PER_TX connections were needed.\r\n-                // Tell CConnman it does not need to start the remaining ones.\r\n-                m_connman.m_private_broadcast.NumToOpenSub(NUM_PRIVATE_BROADCAST_PER_TX - num_broadcasted.value());\r\n-            }\r\n-        }\r\n-\r\n         LOCK2(cs_main, m_tx_download_mutex);\r\n \r\n         m_txrequest.ReceivedResponse(pfrom.GetId(), txid);\r\n         if (tx.HasWitness()) m_txrequest.ReceivedResponse(pfrom.GetId(), wtxid);\r\n \r\n         // We do the AlreadyHaveTx() check using wtxid, rather than txid - in the\r\n@@ -4878,21 +4863,37 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type,\r\n             //\r\n             // Note that m_lazy_recent_rejects doesn't just record DoSy or invalid\r\n             // transactions, but any tx not accepted by the mempool, which may be\r\n             // due to node policy (vs. consensus). So we can't blanket penalize a\r\n             // peer simply for relaying a tx that our m_lazy_recent_rejects has caught,\r\n             // regardless of false positives.\r\n+            // XXX what about Remove() also here?\r\n             return;\r\n         }\r\n \r\n         const MempoolAcceptResult result = m_chainman.ProcessTransaction(ptx);\r\n         const TxValidationState& state = result.m_state;\r\n \r\n         if (result.m_result_type == MempoolAcceptResult::ResultType::VALID) {\r\n             ProcessValidTx(pfrom.GetId(), ptx, result.m_replaced_transactions);\r\n             pfrom.m_last_tx_time = GetTime<std::chrono::seconds>();\r\n+\r\n+            if (auto num_broadcasted = m_tx_for_private_broadcast.Remove(ptx)) {\r\n+                LogPrintLevel(BCLog::PRIVATE_BROADCAST,\r\n+                              BCLog::Level::Info,\r\n+                              \"Received our privately broadcast transaction (txid=%s) from the \"\r\n+                              \"network from peer=%d%s; stopping private broadcast attempts\\n\",\r\n+                              txid.ToString(),\r\n+                              pfrom.GetId(),\r\n+                              fLogIPs ? strprintf(\", peeraddr=%s\", pfrom.addr.ToStringAddrPort()) : \"\");\r\n+                if (NUM_PRIVATE_BROADCAST_PER_TX > num_broadcasted.value()) {\r\n+                    // Not all of the initial NUM_PRIVATE_BROADCAST_PER_TX connections were needed.\r\n+                    // Tell CConnman it does not need to start the remaining ones.\r\n+                    m_connman.m_private_broadcast.NumToOpenSub(NUM_PRIVATE_BROADCAST_PER_TX - num_broadcasted.value());\r\n+                }\r\n+            }\r\n         }\r\n         else if (state.GetResult() == TxValidationResult::TX_MISSING_INPUTS)\r\n         {\r\n             bool fRejectedParents = false; // It may be the case that the orphans parents have all been rejected\r\n \r\n             // Deduplicate parent txids, so that we don't have to loop over\r\n```\r\n</details>\r\n\r\nNote that if the tx is not accepted in our mempool because it has too low fee for our mempool, but is accepted in everybody else's mempool, then we would do the remaining broadcasts up to `NUM_PRIVATE_BROADCAST_PER_TX` (5), then it would get stale and will be removed by `PeerManagerImpl::ReattemptPrivateBroadcast()`. Whereas currently, without this change it will be removed right away and we will not do the remaining broadcasts (up to 5).\r\n\r\nI got another idea - remove the transaction only if the received tx has the same txid and the same wtxid as the one that we broadcast. Currently we only compare the txid.\r\n\r\n<details>\r\n<summary>[patch] check also wtxid</summary>\r\n\r\n```diff\r\n--- i/src/private_broadcast.cpp\r\n+++ w/src/private_broadcast.cpp\r\n@@ -21,13 +21,13 @@ bool PrivateBroadcast::Add(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(!\r\n }\r\n \r\n std::optional<size_t> PrivateBroadcast::Remove(const CTransactionRef& tx) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\r\n {                 \r\n     LOCK(m_mutex);\r\n     auto iters = Find(tx->GetHash());\r\n-    if (!iters) {\r\n+    if (!iters || iters->by_txid->second.tx->GetWitnessHash() != tx->GetWitnessHash()) {\r\n         return std::nullopt;\r\n     }\r\n     const size_t num_broadcasted{iters->by_priority->first.num_broadcasted};\r\n     m_by_priority.erase(iters->by_priority);\r\n     m_by_txid.erase(iters->by_txid);\r\n     return num_broadcasted;\r\n```\r\n</details>\r\n\r\nWith this, if a malleated and valid transaction makes it to our mempool, then we would keep broadcasting the original one, up to 5 times, and then it will be removed by `PeerManagerImpl::ReattemptPrivateBroadcast()`.\r\n\r\nWhich one?",
       "created_at": "2024-10-04T12:28:52Z",
-      "updated_at": "2024-10-04T12:28:52Z",
+      "updated_at": "2024-10-05T05:20:16Z",
       "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r1787644002",
       "author_association": "CONTRIBUTOR",
       "_links": {
