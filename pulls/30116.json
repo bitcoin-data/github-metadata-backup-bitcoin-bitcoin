@@ -50,10 +50,10 @@
       }
     ],
     "created_at": "2024-05-15T20:01:38Z",
-    "updated_at": "2024-10-12T16:19:21Z",
+    "updated_at": "2024-10-23T15:44:23Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "dfbfe8b40236fe4c743542d6967fcafd380ed3b3",
+    "merge_commit_sha": "69b4e2e1775131f7bbbf3c34f75d79ccfe454de7",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -286,12 +286,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36243,
-        "stargazers_count": 78832,
-        "watchers_count": 78832,
-        "size": 269888,
+        "forks_count": 36266,
+        "stargazers_count": 78992,
+        "watchers_count": 78992,
+        "size": 270025,
         "default_branch": "master",
-        "open_issues_count": 682,
+        "open_issues_count": 653,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -308,9 +308,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-10-11T12:46:43Z",
+        "pushed_at": "2024-10-22T14:52:58Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-10-12T16:05:10Z",
+        "updated_at": "2024-10-23T15:53:16Z",
         "license": {
           "key": "mit",
           "name": "MIT License",
@@ -339,7 +339,7 @@
     "deletions": 35,
     "changed_files": 8,
     "commits": 12,
-    "review_comments": 34,
+    "review_comments": 36,
     "comments": 11
   },
   "events": [
@@ -4613,6 +4613,110 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1797721753"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30116"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 457,
+      "original_line": 457,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1812987095",
+      "pull_request_review_id": 2389107187,
+      "id": 1812987095,
+      "node_id": "PRRC_kwDOABII585sD_zX",
+      "diff_hunk": "@@ -142,15 +378,166 @@ class TxReconciliationTracker::Impl\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    // Not const because of caching.\n+    bool IsFanoutTarget(const Wtxid& wtxid, NodeId peer_id, bool we_initiate, double n) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        // First, try checking if the result is already cached, and return it if so\n+        if (const auto &it = m_tx_fanout_targets_cache_data.find(wtxid); it != m_tx_fanout_targets_cache_data.end()) {\n+            return std::binary_search(it->second.begin(), it->second.end(), peer_id);\n+        }\n+\n+        // We use the pre-determined randomness to give a consistent result per transaction, thus making sure that no transaction\n+        // gets \"unlucky\" if every per-peer roll fails. This means that, given a `wtxid`, the ordering will always be the same,\n+        // independently of what peer this is queried for. So some need to be picked eventually (as long as `n` doesn't shrink).\n+        CSipHasher deterministic_randomizer{m_deterministic_randomizer};\n+        deterministic_randomizer.Write(wtxid.ToUint256());\n+\n+        // We decide a peer is a fanout target for a given transaction deterministically at random based on two things: the wtxid of\n+        // the transaction to be relayed (which we used as a seed for the randomizer) and the likelihood to fanout this transaction\n+        // (which depends on how many non-erlay tx-relay peers we have, and the direction of the connection).\n+        // In order to do this, we sort the peers in random order, and then we pick the top `n` peers of the resulting collection.\n+        // If our chosen peer happens to be within the picked selection, we fanout to it, otherwise we reconcile.\n+        const size_t targets_size = ((deterministic_randomizer.Finalize() & 0xFFFFFFFF) + uint64_t(n * 0x100000000)) >> 32;\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers;\n+        best_peers.reserve(m_states.size());\n+\n+        for (const auto& [node_id, op_peer_state]: m_states) {\n+            const auto peer_state = std::get_if<TxReconciliationState>(&op_peer_state);\n+            if (peer_state && peer_state->m_we_initiate == we_initiate) {\n+                uint64_t hash_key = CSipHasher(deterministic_randomizer).Write(node_id).Finalize();\n+                best_peers.emplace_back(hash_key, node_id);\n+            }\n+        }\n+\n+        // Sort by the assigned key.\n+        std::sort(best_peers.begin(), best_peers.end());\n+        best_peers.resize(targets_size);\n+\n+        std::vector<NodeId> new_fanout_candidates;\n+        new_fanout_candidates.reserve(targets_size);\n+        for_each(best_peers.begin(), best_peers.end(),\n+                [&new_fanout_candidates](auto& keyed_peer) { new_fanout_candidates.push_back(keyed_peer.second); });\n+\n+        // Sort by NodeId.\n+        std::sort(new_fanout_candidates.begin(), new_fanout_candidates.end());\n+        const bool found = std::binary_search(new_fanout_candidates.begin(), new_fanout_candidates.end(), peer_id);\n+\n+        // If the cache is full, make room for the new entry.\n+        if (m_tx_fanout_targets_cache_order.size() == FANOUT_TARGETS_PER_TX_CACHE_SIZE) {\n+            const auto expired_tx = m_tx_fanout_targets_cache_order.front();\n+            m_tx_fanout_targets_cache_data.erase(expired_tx);\n+            m_tx_fanout_targets_cache_order.pop_front();\n+        }\n+        m_tx_fanout_targets_cache_data.emplace(wtxid, std::move(new_fanout_candidates));\n+        m_tx_fanout_targets_cache_order.push_back(wtxid);\n+\n+        return found;\n+    }\n+\n+    bool ShouldFanoutTo(const Wtxid& wtxid, NodeId peer_id,\n+                        size_t inbounds_fanout_tx_relay, size_t outbounds_fanout_tx_relay)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        auto peer_state = GetRegisteredPeerState(peer_id);\n+        if (!peer_state) return true;\n+        // We decide whether a particular peer is a low-fanout flood target differently\n+        // based on its connection direction:\n+        // - for outbounds we have a fixed number of flood destinations;\n+        // - for inbounds we use a fraction of all inbound peers supporting tx relay.\n+        //\n+        // We first decide how many reconciling peers of a given direction we want to flood to,\n+        // and then generate a list of peers of that size for a given transaction. We then see\n+        // whether the given peer falls into this list.\n+        double n;\n+        if (peer_state->m_we_initiate) {\n+            n = OUTBOUND_FANOUT_DESTINATIONS - outbounds_fanout_tx_relay;",
+      "path": "src/node/txreconciliation.cpp",
+      "position": 409,
+      "original_position": 409,
+      "commit_id": "20772c077832592265bd6a2876aa6b4cb7dbde7d",
+      "original_commit_id": "20772c077832592265bd6a2876aa6b4cb7dbde7d",
+      "in_reply_to_id": 1797721753,
+      "user": {
+        "login": "naumenkogs",
+        "id": 7975071,
+        "node_id": "MDQ6VXNlcjc5NzUwNzE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7975071?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/naumenkogs",
+        "html_url": "https://github.com/naumenkogs",
+        "followers_url": "https://api.github.com/users/naumenkogs/followers",
+        "following_url": "https://api.github.com/users/naumenkogs/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/naumenkogs/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/naumenkogs/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/naumenkogs/subscriptions",
+        "organizations_url": "https://api.github.com/users/naumenkogs/orgs",
+        "repos_url": "https://api.github.com/users/naumenkogs/repos",
+        "events_url": "https://api.github.com/users/naumenkogs/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/naumenkogs/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "working on a test and fix for this.",
+      "created_at": "2024-10-23T15:03:12Z",
+      "updated_at": "2024-10-23T15:03:13Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30116#discussion_r1812987095",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1812987095"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30116"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 457,
+      "original_line": 457,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1813071345",
+      "pull_request_review_id": 2389257068,
+      "id": 1813071345,
+      "node_id": "PRRC_kwDOABII585sEUXx",
+      "diff_hunk": "@@ -142,15 +378,166 @@ class TxReconciliationTracker::Impl\n         return (recon_state != m_states.end() &&\n                 std::holds_alternative<TxReconciliationState>(recon_state->second));\n     }\n+\n+    // Not const because of caching.\n+    bool IsFanoutTarget(const Wtxid& wtxid, NodeId peer_id, bool we_initiate, double n) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        // First, try checking if the result is already cached, and return it if so\n+        if (const auto &it = m_tx_fanout_targets_cache_data.find(wtxid); it != m_tx_fanout_targets_cache_data.end()) {\n+            return std::binary_search(it->second.begin(), it->second.end(), peer_id);\n+        }\n+\n+        // We use the pre-determined randomness to give a consistent result per transaction, thus making sure that no transaction\n+        // gets \"unlucky\" if every per-peer roll fails. This means that, given a `wtxid`, the ordering will always be the same,\n+        // independently of what peer this is queried for. So some need to be picked eventually (as long as `n` doesn't shrink).\n+        CSipHasher deterministic_randomizer{m_deterministic_randomizer};\n+        deterministic_randomizer.Write(wtxid.ToUint256());\n+\n+        // We decide a peer is a fanout target for a given transaction deterministically at random based on two things: the wtxid of\n+        // the transaction to be relayed (which we used as a seed for the randomizer) and the likelihood to fanout this transaction\n+        // (which depends on how many non-erlay tx-relay peers we have, and the direction of the connection).\n+        // In order to do this, we sort the peers in random order, and then we pick the top `n` peers of the resulting collection.\n+        // If our chosen peer happens to be within the picked selection, we fanout to it, otherwise we reconcile.\n+        const size_t targets_size = ((deterministic_randomizer.Finalize() & 0xFFFFFFFF) + uint64_t(n * 0x100000000)) >> 32;\n+\n+        std::vector<std::pair<uint64_t, NodeId>> best_peers;\n+        best_peers.reserve(m_states.size());\n+\n+        for (const auto& [node_id, op_peer_state]: m_states) {\n+            const auto peer_state = std::get_if<TxReconciliationState>(&op_peer_state);\n+            if (peer_state && peer_state->m_we_initiate == we_initiate) {\n+                uint64_t hash_key = CSipHasher(deterministic_randomizer).Write(node_id).Finalize();\n+                best_peers.emplace_back(hash_key, node_id);\n+            }\n+        }\n+\n+        // Sort by the assigned key.\n+        std::sort(best_peers.begin(), best_peers.end());\n+        best_peers.resize(targets_size);\n+\n+        std::vector<NodeId> new_fanout_candidates;\n+        new_fanout_candidates.reserve(targets_size);\n+        for_each(best_peers.begin(), best_peers.end(),\n+                [&new_fanout_candidates](auto& keyed_peer) { new_fanout_candidates.push_back(keyed_peer.second); });\n+\n+        // Sort by NodeId.\n+        std::sort(new_fanout_candidates.begin(), new_fanout_candidates.end());\n+        const bool found = std::binary_search(new_fanout_candidates.begin(), new_fanout_candidates.end(), peer_id);\n+\n+        // If the cache is full, make room for the new entry.\n+        if (m_tx_fanout_targets_cache_order.size() == FANOUT_TARGETS_PER_TX_CACHE_SIZE) {\n+            const auto expired_tx = m_tx_fanout_targets_cache_order.front();\n+            m_tx_fanout_targets_cache_data.erase(expired_tx);\n+            m_tx_fanout_targets_cache_order.pop_front();\n+        }\n+        m_tx_fanout_targets_cache_data.emplace(wtxid, std::move(new_fanout_candidates));\n+        m_tx_fanout_targets_cache_order.push_back(wtxid);\n+\n+        return found;\n+    }\n+\n+    bool ShouldFanoutTo(const Wtxid& wtxid, NodeId peer_id,\n+                        size_t inbounds_fanout_tx_relay, size_t outbounds_fanout_tx_relay)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_txreconciliation_mutex)\n+    {\n+        AssertLockNotHeld(m_txreconciliation_mutex);\n+        LOCK(m_txreconciliation_mutex);\n+        auto peer_state = GetRegisteredPeerState(peer_id);\n+        if (!peer_state) return true;\n+        // We decide whether a particular peer is a low-fanout flood target differently\n+        // based on its connection direction:\n+        // - for outbounds we have a fixed number of flood destinations;\n+        // - for inbounds we use a fraction of all inbound peers supporting tx relay.\n+        //\n+        // We first decide how many reconciling peers of a given direction we want to flood to,\n+        // and then generate a list of peers of that size for a given transaction. We then see\n+        // whether the given peer falls into this list.\n+        double n;\n+        if (peer_state->m_we_initiate) {\n+            n = OUTBOUND_FANOUT_DESTINATIONS - outbounds_fanout_tx_relay;",
+      "path": "src/node/txreconciliation.cpp",
+      "position": 409,
+      "original_position": 409,
+      "commit_id": "20772c077832592265bd6a2876aa6b4cb7dbde7d",
+      "original_commit_id": "20772c077832592265bd6a2876aa6b4cb7dbde7d",
+      "in_reply_to_id": 1797721753,
+      "user": {
+        "login": "sr-gi",
+        "id": 6665628,
+        "node_id": "MDQ6VXNlcjY2NjU2Mjg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6665628?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sr-gi",
+        "html_url": "https://github.com/sr-gi",
+        "followers_url": "https://api.github.com/users/sr-gi/followers",
+        "following_url": "https://api.github.com/users/sr-gi/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sr-gi/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sr-gi/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sr-gi/subscriptions",
+        "organizations_url": "https://api.github.com/users/sr-gi/orgs",
+        "repos_url": "https://api.github.com/users/sr-gi/repos",
+        "events_url": "https://api.github.com/users/sr-gi/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sr-gi/received_events",
+        "type": "User",
+        "site_admin": false
+      },
+      "body": "Oh sorry, I forgot to reply to this. We discussed this in person last week and this is indeed an issue. Happy to take your fix @naumenkogs",
+      "created_at": "2024-10-23T15:44:23Z",
+      "updated_at": "2024-10-23T15:44:48Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30116#discussion_r1813071345",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1813071345"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30116"
