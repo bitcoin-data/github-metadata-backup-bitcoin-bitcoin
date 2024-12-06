@@ -17,7 +17,7 @@
     "state": "open",
     "locked": false,
     "maintainer_can_modify": true,
-    "title": "optimization: change XOR obfuscation key from `std::vector<std::byte>{8}` to `uint64_t`",
+    "title": "optimization: speed up XOR by 4% (9% when disabled) by applying it in larger batches",
     "user": {
       "login": "l0rinc",
       "id": 1841944,
@@ -39,7 +39,7 @@
       "site_admin": false,
       "patch_url": null
     },
-    "body": "The recently merged [XOR obfuscation](https://github.com/bitcoin/bitcoin/pull/28207) introduced a minor serialization cost (seen during IBD benchmarking). This PR is meant to alleviate that.\r\n\r\n#### Changes in testing, benchmarking and implementation\r\n\r\n* Added new tests comparing randomized inputs against a trivial implementation and performing roundtrip checks with random chunks.\r\n* Updated the benchmark to reflect realistic scenarios by capturing every call of `util::Xor` for the first 860k blocks, creating a model with the same data distribution.\r\nAn additional benchmark checks the effect of short-circuiting XOR when the key is zero, ensuring no speed regression occurs when the obfuscation feature is disabled.\r\n* Optimized the Xor function to process in batches (64/32/16/8 bits instead of per-byte).\r\n* Migrated remaining `std::vector<std::byte>(8)` values to `uint64_t`.\r\n\r\n#### Reproducer and assembly\r\n\r\nMemory alignment is handled via `std::memcpy`, optimized out on tested platforms (see https://godbolt.org/z/dcxvh6abq):\r\n* _Clang_ (x86-64) - 32 bytes/iter using SSE vector operations\r\n* _GCC_ (x86-64) - 16 bytes/iter using unrolled 64-bit XORs\r\n* _RISC-V_ (32-bit) - 8 bytes/iter using load/XOR/store sequence\r\n* _s390x_ (big-endian) - 64 bytes/iter with unrolled 8-byte XORs\r\n\r\n#### Endianness\r\n\r\nThe only endianness issue was with bit rotation, intended to realign the key if obfuscation halted before full key consumption.\r\nElsewhere, memory is read, processed, and written back in the same endianness, preserving byte order.\r\nSince CI lacks a big-endian machine, testing was done locally via Docker.\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nbrew install podman pigz\r\nsoftwareupdate --install-rosetta\r\npodman machine init\r\npodman machine start\r\ndocker run --platform linux/s390x -it ubuntu:latest /bin/bash\r\n    apt update && apt install -y git build-essential cmake ccache pkg-config libevent-dev libboost-dev libssl-dev libsqlite3-dev && \\\r\n    cd /mnt && git clone https://github.com/bitcoin/bitcoin.git && cd bitcoin && git remote add l0rinc https://github.com/l0rinc/bitcoin.git && git fetch --all && git checkout l0rinc/optimize-xor && \\\r\n    cmake -B build && cmake --build build --target test_bitcoin -j$(nproc) && \\\r\n    ./build/src/test/test_bitcoin --run_test=streams_tests\r\n```\r\n\r\n</details>\r\n\r\n#### Performance\r\n\r\n```bash\r\n   cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release \\\r\n&& cmake --build build -j$(nproc) \\\r\n&& build/src/bench/bench_bitcoin -filter='XorHistogram|AutoFileXor' -min-time=10000\r\n```\r\n\r\n<details>\r\n<summary>Performance profile for 700k blocks</summary>\r\n\r\n#### C++ compiler .......................... AppleClang 16.0.0.16000026\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                1.46 |      684,148,318.55 |    0.9% |     10.17 | `AutoFileXor`\r\n|               21.57 |       46,357,868.35 |    0.3% |     10.93 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                0.14 |    7,071,717,185.75 |    0.9% |     11.25 | `AutoFileXor`\r\n|                9.25 |      108,126,826.70 |    0.4% |     11.00 | `XorHistogram`\r\n\r\n#### C++ compiler .......................... GNU 13.2.0\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                1.84 |      544,924,597.89 |    0.1% |            9.20 |            3.49 |  2.639 |           1.03 |    0.1% |     11.03 | `AutoFileXor`\r\n|               35.74 |       27,980,106.15 |    0.1% |          110.78 |          121.32 |  0.913 |          12.70 |    5.6% |     11.70 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.54 |    1,863,647,178.39 |    0.0% |            0.00 |            0.00 |  0.743 |           0.00 |    2.1% |     11.06 | `AutoFileXor`\r\n|               13.73 |       72,823,051.75 |    0.0% |           24.45 |           46.61 |  0.525 |           5.96 |   13.4% |     11.04 | `XorHistogram`\r\n\r\ni.e. roughly 2-2.5x faster for a representative sample.\r\n\r\n</details>\r\n\r\n\r\nThe [860k block profile](https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2457667761) contains a lot of very big arrays (96'233 separate sizes, biggest was 3'992'470 bytes long) - a big departure from the previous 400k and 700k blocks (having 1500 sizes, biggest was 9319 bytes long).\r\n\r\nThe performance characteristics are also quite different, now that we have more and bigger byte arrays:\r\n\r\n#### C++ compiler .......................... AppleClang 16.0.0.16000026\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                1.04 |      961,221,881.72 |    0.2% |     93.30 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                0.03 |   28,649,147,111.58 |    0.2% |      6.78 | `XorHistogram`\r\n\r\ni.e. ~30x faster with Clang at processing the data with representative histograms.\r\n\r\n#### C++ compiler .......................... GNU 13.2.0\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.97 |    1,032,916,679.87 |    0.0% |            9.01 |            3.29 |  2.738 |           1.00 |    0.0% |     86.58 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.10 |   10,369,097,976.62 |    0.0% |            0.32 |            0.33 |  0.985 |           0.06 |    0.6% |      8.63 | `XorHistogram`\r\n\r\ni.e. ~10x faster with GCC at processing the data with representative histograms.\r\n\r\n<details>\r\n<summary>A few other benchmarks that seem to have improved as well (tested with Clang only)</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        3,146,553.30 |              317.81 |    0.1% |     11.02 | `ReadBlockFromDiskTest`\r\n|        1,014,134.52 |              986.06 |    0.2% |     11.00 | `ReadRawBlockFromDiskTest`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        2,522,199.92 |              396.48 |    0.1% |     11.03 | `ReadBlockFromDiskTest`\r\n|           64,484.30 |           15,507.65 |    0.2% |     10.58 | `ReadRawBlockFromDiskTest`\r\n\r\n</details>\r\n\r\nAlso visible on https://corecheck.dev/bitcoin/bitcoin/pulls/31144\r\n\r\nThe obfuscation's effect on IBD seems' to be about 3%, see: https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2467888419",
+    "body": "The recently merged [XOR obfuscation](https://github.com/bitcoin/bitcoin/pull/28207) introduced a minor serialization cost (seen during IBD benchmarking). This PR is meant to alleviate that.\r\n\r\n#### Changes in testing, benchmarking and implementation\r\n\r\n* Added new tests comparing randomized inputs against a trivial implementation and performing roundtrip checks with random chunks.\r\n* Updated the benchmark to reflect realistic scenarios by capturing every call of `util::Xor` for the first 860k blocks, creating a model with the same data distribution.\r\nAn additional benchmark checks the effect of short-circuiting XOR when the key is zero, ensuring no speed regression occurs when the obfuscation feature is disabled.\r\n* Optimized the Xor function to process in batches (64/32/16/8 bits instead of per-byte).\r\n* Migrated remaining `std::vector<std::byte>(8)` values to `uint64_t`.\r\n\r\n#### Reproducer and assembly\r\n\r\nMemory alignment is handled via `std::memcpy`, optimized out on tested platforms (see https://godbolt.org/z/dcxvh6abq):\r\n* _Clang_ (x86-64) - 32 bytes/iter using SSE vector operations\r\n* _GCC_ (x86-64) - 16 bytes/iter using unrolled 64-bit XORs\r\n* _RISC-V_ (32-bit) - 8 bytes/iter using load/XOR/store sequence\r\n* _s390x_ (big-endian) - 64 bytes/iter with unrolled 8-byte XORs\r\n\r\n#### Endianness\r\n\r\nThe only endianness issue was with bit rotation, intended to realign the key if obfuscation halted before full key consumption.\r\nElsewhere, memory is read, processed, and written back in the same endianness, preserving byte order.\r\nSince CI lacks a big-endian machine, testing was done locally via Docker.\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nbrew install podman pigz\r\nsoftwareupdate --install-rosetta\r\npodman machine init\r\npodman machine start\r\ndocker run --platform linux/s390x -it ubuntu:latest /bin/bash\r\n    apt update && apt install -y git build-essential cmake ccache pkg-config libevent-dev libboost-dev libssl-dev libsqlite3-dev && \\\r\n    cd /mnt && git clone https://github.com/bitcoin/bitcoin.git && cd bitcoin && git remote add l0rinc https://github.com/l0rinc/bitcoin.git && git fetch --all && git checkout l0rinc/optimize-xor && \\\r\n    cmake -B build && cmake --build build --target test_bitcoin -j$(nproc) && \\\r\n    ./build/src/test/test_bitcoin --run_test=streams_tests\r\n```\r\n\r\n</details>\r\n\r\n#### Performance\r\n\r\n```bash\r\n   cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release \\\r\n&& cmake --build build -j$(nproc) \\\r\n&& build/src/bench/bench_bitcoin -filter='XorHistogram|AutoFileXor' -min-time=10000\r\n```\r\n\r\n<details>\r\n<summary>Performance profile for 700k blocks</summary>\r\n\r\n#### C++ compiler .......................... AppleClang 16.0.0.16000026\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                1.46 |      684,148,318.55 |    0.9% |     10.17 | `AutoFileXor`\r\n|               21.57 |       46,357,868.35 |    0.3% |     10.93 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                0.14 |    7,071,717,185.75 |    0.9% |     11.25 | `AutoFileXor`\r\n|                9.25 |      108,126,826.70 |    0.4% |     11.00 | `XorHistogram`\r\n\r\n#### C++ compiler .......................... GNU 13.2.0\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                1.84 |      544,924,597.89 |    0.1% |            9.20 |            3.49 |  2.639 |           1.03 |    0.1% |     11.03 | `AutoFileXor`\r\n|               35.74 |       27,980,106.15 |    0.1% |          110.78 |          121.32 |  0.913 |          12.70 |    5.6% |     11.70 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.54 |    1,863,647,178.39 |    0.0% |            0.00 |            0.00 |  0.743 |           0.00 |    2.1% |     11.06 | `AutoFileXor`\r\n|               13.73 |       72,823,051.75 |    0.0% |           24.45 |           46.61 |  0.525 |           5.96 |   13.4% |     11.04 | `XorHistogram`\r\n\r\ni.e. roughly 2-2.5x faster for a representative sample.\r\n\r\n</details>\r\n\r\n\r\nThe [860k block profile](https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2457667761) contains a lot of very big arrays (96'233 separate sizes, biggest was 3'992'470 bytes long) - a big departure from the previous 400k and 700k blocks (having 1500 sizes, biggest was 9319 bytes long).\r\n\r\nThe performance characteristics are also quite different, now that we have more and bigger byte arrays:\r\n\r\n#### C++ compiler .......................... AppleClang 16.0.0.16000026\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                1.04 |      961,221,881.72 |    0.2% |     93.30 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|                0.03 |   28,649,147,111.58 |    0.2% |      6.78 | `XorHistogram`\r\n\r\ni.e. ~30x faster with Clang at processing the data with representative histograms.\r\n\r\n#### C++ compiler .......................... GNU 13.2.0\r\n\r\n> Before:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.97 |    1,032,916,679.87 |    0.0% |            9.01 |            3.29 |  2.738 |           1.00 |    0.0% |     86.58 | `XorHistogram`\r\n\r\n> After:\r\n\r\n|             ns/byte |              byte/s |    err% |        ins/byte |        cyc/byte |    IPC |       bra/byte |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|                0.10 |   10,369,097,976.62 |    0.0% |            0.32 |            0.33 |  0.985 |           0.06 |    0.6% |      8.63 | `XorHistogram`\r\n\r\ni.e. ~10x faster with GCC at processing the data with representative histograms.\r\n\r\n<details>\r\n<summary>A few other benchmarks that seem to have improved as well (tested with Clang only)</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        3,146,553.30 |              317.81 |    0.1% |     11.02 | `ReadBlockFromDiskTest`\r\n|        1,014,134.52 |              986.06 |    0.2% |     11.00 | `ReadRawBlockFromDiskTest`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        2,522,199.92 |              396.48 |    0.1% |     11.03 | `ReadBlockFromDiskTest`\r\n|           64,484.30 |           15,507.65 |    0.2% |     10.58 | `ReadRawBlockFromDiskTest`\r\n\r\n</details>\r\n\r\nAlso visible on https://corecheck.dev/bitcoin/bitcoin/pulls/31144\r\n\r\nThe obfuscation's effect on IBD seems' to be about ~4% when it still has to be applied and ~9% when it's turned off, see: \r\n* https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2519764142\r\n* https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2523295114",
     "labels": [
       {
         "id": 219890555,
@@ -51,10 +51,10 @@
       }
     ],
     "created_at": "2024-10-24T07:11:11Z",
-    "updated_at": "2024-12-06T05:57:43Z",
+    "updated_at": "2024-12-06T13:54:37Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "564df94ea1a3d9ad2266e7024346ed94932d37c1",
+    "merge_commit_sha": "dc35e36b9c03ddbaca2185e0c185061bb1037884",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -292,12 +292,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36486,
-        "stargazers_count": 80076,
-        "watchers_count": 80076,
-        "size": 273256,
+        "forks_count": 36490,
+        "stargazers_count": 80095,
+        "watchers_count": 80095,
+        "size": 273394,
         "default_branch": "master",
-        "open_issues_count": 659,
+        "open_issues_count": 654,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -314,9 +314,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-12-05T20:47:48Z",
+        "pushed_at": "2024-12-06T11:38:53Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-12-06T05:50:41Z",
+        "updated_at": "2024-12-06T13:52:14Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -347,7 +347,7 @@
     "changed_files": 16,
     "commits": 4,
     "review_comments": 76,
-    "comments": 32
+    "comments": 33
   },
   "events": [
     {
@@ -4484,6 +4484,96 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2519783287",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31144"
+    },
+    {
+      "event": "commented",
+      "id": 2523295114,
+      "node_id": "IC_kwDOABII586WZm2K",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2523295114",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-12-06T13:48:59Z",
+      "updated_at": "2024-12-06T13:53:10Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "More context:\r\nThe previous benchmark was for completely turning off XOR - but we can only do that for new IBD by explicitly setting it to 0. But for the majority of cases we likely want to still to the xor, so this PR is meant to speed it up.\r\nI have remeasured it with doing full IBD until 800k blocks (two runs to measure stability, since reindex wouldn't cover all usages of XOR):\r\n\r\n<details>\r\n<summary>benchmark</summary>\r\n\r\n```bash\r\nhyperfine \\\r\n--runs 2 \\\r\n--export-json /mnt/my_storage/IBD-xor-rebased.json \\\r\n--parameter-list COMMIT e1074081c9f1895a4f629dfee347ceae484a10d3,f2fd1f7c043a2782cb2bf3c9fe7e2f94c17728b5 \\\r\n--prepare 'rm -rf /mnt/my_storage/BitcoinData/* && git checkout {COMMIT} && git clean -fxd && git reset --hard && cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_TESTS=OFF -DENABLE_WALLET=OFF -DINSTALL_MAN=OFF && cmake --build build -j$(nproc)' \\\r\n'COMMIT={COMMIT} ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=800000 -dbcache=10000 -printtoconsole=0'\r\n```\r\n\r\n</details>\r\n\r\n```bash\r\nBenchmark 1: COMMIT=e1074081c9f1895a4f629dfee347ceae484a10d3 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=800000 -dbcache=10000 -printtoconsole=0\r\n  Time (mean ± σ):     25601.461 s ± 65.686 s    [User: 27025.116 s, System: 1586.908 s]\r\n  Range (min … max):   25555.014 s … 25647.907 s    2 runs\r\n \r\nBenchmark 2: COMMIT=f2fd1f7c043a2782cb2bf3c9fe7e2f94c17728b5 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=800000 -dbcache=10000 -printtoconsole=0\r\n  Time (mean ± σ):     24526.781 s ± 389.029 s    [User: 25525.801 s, System: 1552.625 s]\r\n  Range (min … max):   24251.697 s … 24801.866 s    2 runs\r\n```\r\n\r\nWhich indicates that this will speed up IBD by roughly 4% on average (now that 30039 was merged the difference is more obvious):\r\n ```bash\r\nSummary\r\n  COMMIT=f2fd1f7c043a2782cb2bf3c9fe7e2f94c17728b5 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=800000 -dbcache=10000 -printtoconsole=0 ran\r\n    1.04 ± 0.02 times faster than COMMIT=e1074081c9f1895a4f629dfee347ceae484a10d3 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=800000 -dbcache=10000 -printtoconsole=0\r\n```",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31144#issuecomment-2523295114",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31144"
+    },
+    {
+      "event": "renamed",
+      "id": 15560727277,
+      "node_id": "RTE_lADOABII586bm_bxzwAAAAOffdrt",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/15560727277",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2024-12-06T13:52:17Z",
+      "rename": {
+        "from": "optimization: change XOR obfuscation key from `std::vector<std::byte>{8}` to `uint64_t`",
+        "to": "optimization: speed up XOR by 4% (9% when disabled) by applying it in larger batches"
+      }
     }
   ],
   "comments": [
