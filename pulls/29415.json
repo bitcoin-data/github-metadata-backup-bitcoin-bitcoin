@@ -42,10 +42,9 @@
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- INV/TX --------> tx-recipient (if we take the last commit: fixup!)\r\ntx-sender <--- GETDATA/TX ----< tx-recipient (if we take the last commit: fixup!)\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to 5 (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: move peers counting before grant acquisition in ThreadOpenConnections()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvements (also opened as a standalone PR at https://github.com/bitcoin/bitcoin/pull/29420):\r\n  * `test: improve debug log message from P2PConnection::connection_made()`\r\n  * `test: extend the SOCKS5 Python proxy to actually connect to a destination`\r\n  * `test: support WTX INVs from P2PDataStore and fix a comment`\r\n  * `test: set P2PConnection::p2p_connected_to_node in peer_connect_helper()`\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n</details>\r\n\r\n---\r\n\r\nThis addresses:\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\n\r\nRelated, but different:\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions of this planned for subsequent PRs:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
     "labels": [],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2024-12-07T00:50:06Z",
-    "mergeable": true,
-    "mergeable_state": "blocked",
-    "merge_commit_sha": "09ab76448d039bbac1346c779ed213102369f554",
+    "updated_at": "2024-12-11T03:02:45Z",
+    "mergeable_state": "unknown",
+    "merge_commit_sha": "b3ba9d607b5e4fd2ae315ef01e79e86ca287fd60",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -92,7 +91,6 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": true,
     "head": {
       "label": "vasild:private_broadcast",
       "ref": "private_broadcast",
@@ -194,7 +192,7 @@
         "forks_count": 1,
         "stargazers_count": 5,
         "watchers_count": 5,
-        "size": 248950,
+        "size": 249055,
         "default_branch": "master",
         "open_issues_count": 2,
         "is_template": false,
@@ -207,9 +205,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-12-06T16:30:06Z",
+        "pushed_at": "2024-12-10T11:58:41Z",
         "created_at": "2018-02-07T11:52:47Z",
-        "updated_at": "2024-12-05T14:22:58Z",
+        "updated_at": "2024-12-10T09:33:59Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -326,12 +324,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36496,
-        "stargazers_count": 80143,
-        "watchers_count": 80143,
-        "size": 273394,
+        "forks_count": 36531,
+        "stargazers_count": 80479,
+        "watchers_count": 80479,
+        "size": 273408,
         "default_branch": "master",
-        "open_issues_count": 656,
+        "open_issues_count": 665,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -348,9 +346,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2024-12-06T11:38:53Z",
+        "pushed_at": "2024-12-11T03:05:10Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2024-12-07T00:35:00Z",
+        "updated_at": "2024-12-11T03:59:06Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -413,9 +411,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2024-02-09T13:39:13Z",
-      "updated_at": "2024-12-07T00:50:06Z",
+      "updated_at": "2024-12-11T03:02:45Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/29415.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [andrewtoth](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2008043439), [zzzi2p](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2025920443), [nothingmuch](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-1984991157) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2203472829) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#31318](https://github.com/bitcoin/bitcoin/pull/31318) (Drop script_pub_key arg from createNewBlock by Sjors)\n* [#31282](https://github.com/bitcoin/bitcoin/pull/31282) (refactor: Make node_id a const& in RemoveBlockRequest by maflcko)\n* [#31260](https://github.com/bitcoin/bitcoin/pull/31260) (scripted-diff: Type-safe settings retrieval by ryanofsky)\n* [#31001](https://github.com/bitcoin/bitcoin/pull/31001) (refactor: ensure type safety for txid and wtxid in `RelayTransaction` by marcofleon)\n* [#30595](https://github.com/bitcoin/bitcoin/pull/30595) (kernel: Introduce initial C header API by TheCharlatan)\n* [#30381](https://github.com/bitcoin/bitcoin/pull/30381) ([WIP] net: return result from addnode RPC by willcl-ark)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29700](https://github.com/bitcoin/bitcoin/pull/29700) (kernel, refactor: return error status on all fatal errors by ryanofsky)\n* [#29680](https://github.com/bitcoin/bitcoin/pull/29680) (wallet: fix unrelated parent conflict doesn't cause child tx to be marked as conflict by Eunovo)\n* [#29278](https://github.com/bitcoin/bitcoin/pull/29278) (Wallet:  Add `maxfeerate` wallet startup option by ismaelsadeeq)\n* [#28584](https://github.com/bitcoin/bitcoin/pull/28584) (Fuzz: extend CConnman tests by vasild)\n* [#28521](https://github.com/bitcoin/bitcoin/pull/28521) (net, net_processing: additional and consistent disconnect logging by Sjors)\n* [#28488](https://github.com/bitcoin/bitcoin/pull/28488) (p2p: Evict outbound peers with high minFeeRate by naumenkogs)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n* [#28031](https://github.com/bitcoin/bitcoin/pull/28031) (Package Relay 1/3: Introduce TxDownloadManager and improve orphan-handling by glozow)\n* [#27865](https://github.com/bitcoin/bitcoin/pull/27865) (wallet: Track no-longer-spendable TXOs separately by achow101)\n* [#27826](https://github.com/bitcoin/bitcoin/pull/27826) (validation: log which peer sent us a header by Sjors)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/29415.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [andrewtoth](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2008043439), [zzzi2p](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2025920443), [nothingmuch](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-1984991157) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2203472829) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#31318](https://github.com/bitcoin/bitcoin/pull/31318) (Drop script_pub_key arg from createNewBlock by Sjors)\n* [#31282](https://github.com/bitcoin/bitcoin/pull/31282) (refactor: Make node_id a const& in RemoveBlockRequest by maflcko)\n* [#31260](https://github.com/bitcoin/bitcoin/pull/31260) (scripted-diff: Type-safe settings retrieval by ryanofsky)\n* [#31001](https://github.com/bitcoin/bitcoin/pull/31001) (refactor: ensure type safety for txid and wtxid in `RelayTransaction` by marcofleon)\n* [#30595](https://github.com/bitcoin/bitcoin/pull/30595) (kernel: Introduce initial C header API by TheCharlatan)\n* [#30381](https://github.com/bitcoin/bitcoin/pull/30381) ([WIP] net: return result from addnode RPC by willcl-ark)\n* [#30343](https://github.com/bitcoin/bitcoin/pull/30343) (wallet, logging: Replace WalletLogPrintf() with LogInfo() by ryanofsky)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29700](https://github.com/bitcoin/bitcoin/pull/29700) (kernel, refactor: return error status on all fatal errors by ryanofsky)\n* [#29680](https://github.com/bitcoin/bitcoin/pull/29680) (wallet: fix unrelated parent conflict doesn't cause child tx to be marked as conflict by Eunovo)\n* [#29278](https://github.com/bitcoin/bitcoin/pull/29278) (Wallet:  Add `maxfeerate` wallet startup option by ismaelsadeeq)\n* [#28710](https://github.com/bitcoin/bitcoin/pull/28710) (Remove the legacy wallet and BDB dependency by achow101)\n* [#28584](https://github.com/bitcoin/bitcoin/pull/28584) (Fuzz: extend CConnman tests by vasild)\n* [#28521](https://github.com/bitcoin/bitcoin/pull/28521) (net, net_processing: additional and consistent disconnect logging by Sjors)\n* [#28488](https://github.com/bitcoin/bitcoin/pull/28488) (p2p: Evict outbound peers with high minFeeRate by naumenkogs)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n* [#28031](https://github.com/bitcoin/bitcoin/pull/28031) (Package Relay 1/3: Introduce TxDownloadManager and improve orphan-handling by glozow)\n* [#27865](https://github.com/bitcoin/bitcoin/pull/27865) (wallet: Track no-longer-spendable TXOs separately by achow101)\n* [#27826](https://github.com/bitcoin/bitcoin/pull/27826) (validation: log which peer sent us a header by Sjors)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -556,8 +554,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "74ba7c7fb58e3a77eef7d69739145d22bb937f1c",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/74ba7c7fb58e3a77eef7d69739145d22bb937f1c",
       "created_at": "2024-02-10T11:50:15Z"
     },
     {
@@ -1008,8 +1006,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "6fad02cf03d6b37d0a22443a411ec92649b1d39d",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/6fad02cf03d6b37d0a22443a411ec92649b1d39d",
       "created_at": "2024-02-29T13:18:05Z"
     },
     {
@@ -1443,8 +1441,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "d10a0649b018638574fa7dc316b3e783bf6cee69",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/d10a0649b018638574fa7dc316b3e783bf6cee69",
       "created_at": "2024-03-11T17:56:06Z"
     },
     {
@@ -1600,8 +1598,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "5ca891f4e030b86eadeb9d01113de000f547d97c",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/5ca891f4e030b86eadeb9d01113de000f547d97c",
       "created_at": "2024-03-12T18:02:51Z"
     },
     {
@@ -1720,8 +1718,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "b6dce67064de0f55ea108e6fdcf7eae2e3c2c462",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/b6dce67064de0f55ea108e6fdcf7eae2e3c2c462",
       "created_at": "2024-03-12T18:06:07Z"
     },
     {
@@ -1840,8 +1838,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "cc867ebd6253deb0905be9547f915ab6d04aea8a",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/cc867ebd6253deb0905be9547f915ab6d04aea8a",
       "created_at": "2024-03-13T12:44:09Z"
     },
     {
@@ -2038,8 +2036,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "4828d462094d527dc95b8666627db0e1411f02a5",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/4828d462094d527dc95b8666627db0e1411f02a5",
       "created_at": "2024-03-18T14:32:42Z"
     },
     {
@@ -2441,8 +2439,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "09ad469cc10081594ac1e312043a0e47901ba547",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/09ad469cc10081594ac1e312043a0e47901ba547",
       "created_at": "2024-03-29T10:47:40Z"
     },
     {
@@ -2583,8 +2581,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "c7e4d5cb2bf01d9719702e71c8d6264ee670e988",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/c7e4d5cb2bf01d9719702e71c8d6264ee670e988",
       "created_at": "2024-03-29T11:41:10Z"
     },
     {
@@ -2883,8 +2881,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "413574e81ef4d608b9b0a2079f81a4e90ee2a341",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/413574e81ef4d608b9b0a2079f81a4e90ee2a341",
       "created_at": "2024-04-01T16:20:57Z"
     },
     {
@@ -3069,8 +3067,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "390e628a07ce62d32deae4bcfa1bdb31f5a0e125",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/390e628a07ce62d32deae4bcfa1bdb31f5a0e125",
       "created_at": "2024-04-02T16:39:40Z"
     },
     {
@@ -3226,8 +3224,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "9297437af2c2f45a7b9a12be78fa0e597c54ac79",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/9297437af2c2f45a7b9a12be78fa0e597c54ac79",
       "created_at": "2024-04-04T12:37:52Z"
     },
     {
@@ -3449,8 +3447,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "cc760207b80e5dc62ab9c88fea08623dba2881fa",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/cc760207b80e5dc62ab9c88fea08623dba2881fa",
       "created_at": "2024-04-23T17:19:27Z"
     },
     {
@@ -3625,8 +3623,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "ea1ca3715ed8ad42632537850a571031d4f54d47",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/ea1ca3715ed8ad42632537850a571031d4f54d47",
       "created_at": "2024-04-24T07:28:55Z"
     },
     {
@@ -3711,8 +3709,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "fd603b8f5c23c171e1cff70a73f5d64d6d74c4f7",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/fd603b8f5c23c171e1cff70a73f5d64d6d74c4f7",
       "created_at": "2024-04-24T13:35:59Z"
     },
     {
@@ -3882,8 +3880,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "42cb08060053a41de4c5c0ed681d939c3708c2e5",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/42cb08060053a41de4c5c0ed681d939c3708c2e5",
       "created_at": "2024-05-01T13:40:14Z"
     },
     {
@@ -3968,8 +3966,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "7a0debb8fbd1a6f2b49ff4f33defe103e73dcb8a",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/7a0debb8fbd1a6f2b49ff4f33defe103e73dcb8a",
       "created_at": "2024-05-01T13:47:09Z"
     },
     {
@@ -4032,8 +4030,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "65ba8d02034d8fd0eb4c680614197cab6f1892fc",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/65ba8d02034d8fd0eb4c680614197cab6f1892fc",
       "created_at": "2024-05-01T15:54:04Z"
     },
     {
@@ -4203,8 +4201,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "e85cc59badd357219213a6bda985a9fd93910a5c",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/e85cc59badd357219213a6bda985a9fd93910a5c",
       "created_at": "2024-05-21T13:17:50Z"
     },
     {
@@ -4325,8 +4323,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "057c79365c35ad802584379ebedb8b6542216214",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/057c79365c35ad802584379ebedb8b6542216214",
       "created_at": "2024-05-22T16:15:53Z"
     },
     {
@@ -4505,8 +4503,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "7a7e7d189dfe5efa6ab3c644f55f410412163503",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/7a7e7d189dfe5efa6ab3c644f55f410412163503",
       "created_at": "2024-06-20T13:44:34Z"
     },
     {
@@ -4880,8 +4878,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "3bd618a91fe3935399d380d254996e4263586c80",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/3bd618a91fe3935399d380d254996e4263586c80",
       "created_at": "2024-07-02T10:42:45Z"
     },
     {
@@ -5093,8 +5091,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "8baf19fb2af5f8c0742ba5ef5007f3e4a632be08",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/8baf19fb2af5f8c0742ba5ef5007f3e4a632be08",
       "created_at": "2024-07-31T13:25:25Z"
     },
     {
@@ -5363,8 +5361,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "97ae670dc4713c38b23e44e955f66c1ae11e344f",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/97ae670dc4713c38b23e44e955f66c1ae11e344f",
       "created_at": "2024-08-01T08:18:01Z"
     },
     {
@@ -5449,8 +5447,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "created_at": "2024-08-01T09:35:42Z"
     },
     {
@@ -5606,8 +5604,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "2b478bf332eeeec8ee7fba1439660b4e591409bc",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/2b478bf332eeeec8ee7fba1439660b4e591409bc",
       "created_at": "2024-08-02T09:13:26Z"
     },
     {
@@ -5894,8 +5892,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "11364e2e58807cce2ab936cc5098a28e76063b48",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/11364e2e58807cce2ab936cc5098a28e76063b48",
       "created_at": "2024-08-13T09:17:12Z"
     },
     {
@@ -6160,8 +6158,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "df3a22f87af02bbe9659f0abad2141e0333a0e4a",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/df3a22f87af02bbe9659f0abad2141e0333a0e4a",
       "created_at": "2024-08-13T14:04:31Z"
     },
     {
@@ -6282,8 +6280,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "31d841ddb8f0dd4d893611415f382b58f1da38a4",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/31d841ddb8f0dd4d893611415f382b58f1da38a4",
       "created_at": "2024-08-14T12:29:00Z"
     },
     {
@@ -6732,8 +6730,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "08c9a8254ad5e5476454d154aeae439df6b9eafc",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/08c9a8254ad5e5476454d154aeae439df6b9eafc",
       "created_at": "2024-09-02T16:40:58Z"
     },
     {
@@ -6886,8 +6884,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "ed7040a9da420b7166b99ffcc0a5aa029116509e",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/ed7040a9da420b7166b99ffcc0a5aa029116509e",
       "created_at": "2024-09-04T08:00:06Z"
     },
     {
@@ -7108,8 +7106,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "abec00bb80aab764677cb5dfb9f77cd7e9d7d85b",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/abec00bb80aab764677cb5dfb9f77cd7e9d7d85b",
       "created_at": "2024-09-11T13:47:21Z"
     },
     {
@@ -7386,8 +7384,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "4101c7ac8d94261515d87a0501f5489151634210",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/4101c7ac8d94261515d87a0501f5489151634210",
       "created_at": "2024-09-30T10:51:37Z"
     },
     {
@@ -7472,8 +7470,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "b98320ceff4c8bc5de4031ca4e9d9c8f317cd5a7",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/b98320ceff4c8bc5de4031ca4e9d9c8f317cd5a7",
       "created_at": "2024-09-30T12:21:17Z"
     },
     {
@@ -7538,8 +7536,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "54f4f3b05e26351e67251815ff9d98fdd26bdcda",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/54f4f3b05e26351e67251815ff9d98fdd26bdcda",
       "created_at": "2024-10-03T09:03:44Z"
     },
     {
@@ -7658,8 +7656,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "f9b2eaf96cf32dae53a0c00a30fe32f38dc9def6",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/f9b2eaf96cf32dae53a0c00a30fe32f38dc9def6",
       "created_at": "2024-10-07T13:42:02Z"
     },
     {
@@ -7814,8 +7812,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "a51c2cdda52b28d875247e4e47ac613f38a03417",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/a51c2cdda52b28d875247e4e47ac613f38a03417",
       "created_at": "2024-10-08T11:18:20Z"
     },
     {
@@ -7934,8 +7932,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "09a7394759173043ccc1eadbed0160b845f538fd",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/09a7394759173043ccc1eadbed0160b845f538fd",
       "created_at": "2024-10-09T09:32:14Z"
     },
     {
@@ -8020,8 +8018,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "6b10008441e47cc59113195fde76b0b55ffc2236",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/6b10008441e47cc59113195fde76b0b55ffc2236",
       "created_at": "2024-10-09T09:36:20Z"
     },
     {
@@ -8264,8 +8262,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "ec7693a9aac7a78e30cd134537218eefba6cbdaf",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/ec7693a9aac7a78e30cd134537218eefba6cbdaf",
       "created_at": "2024-10-22T11:15:44Z"
     },
     {
@@ -9020,8 +9018,8 @@
         "site_admin": false,
         "patch_url": null
       },
-      "commit_id": null,
-      "commit_url": null,
+      "commit_id": "f5fc9451aab0d9fb987e6f091d1febcf40c337a4",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/f5fc9451aab0d9fb987e6f091d1febcf40c337a4",
       "created_at": "2024-11-08T09:21:04Z"
     },
     {
