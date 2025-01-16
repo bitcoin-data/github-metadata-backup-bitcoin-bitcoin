@@ -60,10 +60,10 @@
       }
     ],
     "created_at": "2024-10-02T20:52:40Z",
-    "updated_at": "2025-01-15T21:30:21Z",
+    "updated_at": "2025-01-16T13:56:35Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "cf4fa617ef895e386526b56aeafe710fb76662db",
+    "merge_commit_sha": "e72c492add7fc5695481e6efa7561008332591b2",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -328,12 +328,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36538,
-        "stargazers_count": 81424,
-        "watchers_count": 81424,
-        "size": 274290,
+        "forks_count": 36543,
+        "stargazers_count": 81407,
+        "watchers_count": 81407,
+        "size": 274260,
         "default_branch": "master",
-        "open_issues_count": 697,
+        "open_issues_count": 701,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -350,9 +350,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-01-15T15:47:13Z",
+        "pushed_at": "2025-01-16T13:42:36Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-01-15T21:53:47Z",
+        "updated_at": "2025-01-16T13:50:08Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -382,7 +382,7 @@
     "deletions": 15,
     "changed_files": 9,
     "commits": 5,
-    "review_comments": 26,
+    "review_comments": 31,
     "comments": 5
   },
   "events": [
@@ -3400,6 +3400,271 @@
       "start_side": null,
       "line": 96,
       "original_line": 96,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918532671",
+      "pull_request_review_id": 2556100197,
+      "id": 1918532671,
+      "node_id": "PRRC_kwDOABII585yWnw_",
+      "diff_hunk": "@@ -0,0 +1,701 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <common/pcp.h>\n+#include <netbase.h>\n+#include <test/util/logging.h>\n+#include <test/util/setup_common.h>\n+#include <util/time.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+#include <algorithm>\n+#include <deque>\n+\n+using namespace std::literals;\n+\n+/// UDP test server operation.\n+struct TestOp {\n+    std::chrono::milliseconds delay;\n+    enum Op {\n+        SEND, // Expect send (with optional data)\n+        RECV, // Expect receive (with data)\n+        NOP,  // Just delay\n+    } op;\n+    std::vector<uint8_t> data;\n+\n+    //! Injected error.\n+    //! Set this field to a non-zero value to return the errno code from send or receive operation.\n+    int error;\n+\n+    TestOp(std::chrono::milliseconds delay_in, Op op_in, const std::vector<uint8_t> &data_in, int error_in):\n+        delay(delay_in), op(op_in), data(data_in), error(error_in) {}\n+};\n+\n+/// Save the value of CreateSock and restore when the test ends.\n+class PCPTestingSetup : public BasicTestingSetup\n+{\n+public:\n+    explicit PCPTestingSetup(const ChainType chainType = ChainType::MAIN,\n+                             TestOpts opts = {})\n+        : BasicTestingSetup{chainType, opts},\n+          m_create_sock_orig{CreateSock}\n+    {\n+        const std::optional<CService> local_ipv4{Lookup(\"192.168.0.6\", 1, false)};\n+        const std::optional<CService> local_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:1234:5678:9abc\", 1, false)};\n+        const std::optional<CService> gateway_ipv4{Lookup(\"192.168.0.1\", 1, false)};\n+        const std::optional<CService> gateway_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:0000:0000:0000\", 1, false)};\n+        BOOST_REQUIRE(local_ipv4 && local_ipv6 && gateway_ipv4 && gateway_ipv6);\n+        default_local_ipv4 = *local_ipv4;\n+        default_local_ipv6 = *local_ipv6;\n+        default_gateway_ipv4 = *gateway_ipv4;\n+        default_gateway_ipv6 = *gateway_ipv6;\n+\n+        struct in_addr inaddr_any;\n+        inaddr_any.s_addr = htonl(INADDR_ANY);\n+        bind_any_ipv4 = CNetAddr(inaddr_any);\n+    }\n+\n+    ~PCPTestingSetup()\n+    {\n+        CreateSock = m_create_sock_orig;\n+        MockableSteadyClock::ClearMockTime();\n+    }\n+\n+    // Default testing nonce.\n+    static constexpr PCPMappingNonce TEST_NONCE{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};\n+    // Default network addresses.\n+    CNetAddr default_local_ipv4;\n+    CNetAddr default_local_ipv6;\n+    CNetAddr default_gateway_ipv4;\n+    CNetAddr default_gateway_ipv6;\n+    // IPv4 bind\n+    CNetAddr bind_any_ipv4;\n+private:\n+    const decltype(CreateSock) m_create_sock_orig;\n+};\n+\n+/** Simple scripted UDP server emulation for testing.\n+ */\n+class PCPTestSock final : public Sock\n+{\n+public:\n+    // Note: we awkwardly mark all methods as const, and properties as mutable,\n+    // because Sock expects all networking calls to be const.\n+    explicit PCPTestSock(const CNetAddr &local_ip, const CNetAddr &gateway_ip, const std::vector<TestOp> &script)\n+        : Sock{INVALID_SOCKET},\n+          m_script(script),\n+          m_local_ip(local_ip),\n+          m_gateway_ip(gateway_ip)\n+    {\n+        ElapseTime(std::chrono::seconds(0)); // start mocking steady time\n+        PrepareOp();\n+    }\n+\n+    ~PCPTestSock() override { m_socket = INVALID_SOCKET; }\n+\n+    PCPTestSock& operator=(Sock&& other) override\n+    {\n+        assert(false && \"Move of Sock into MockSock not allowed.\");\n+        return *this;\n+    }\n+\n+    ssize_t Send(const void* data, size_t len, int) const override {\n+        if (!m_connected) return -1;\n+        Span in_pkt = Span(static_cast<const uint8_t*>(data), len);\n+        if (AtEndOfScript() || CurOp().op != TestOp::SEND) {\n+            // Ignore sends after end of script, or sends when we expect a receive.\n+            FailScript();\n+            return len;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        if (CurOp().data.empty() || std::ranges::equal(CurOp().data, in_pkt)) {\n+            AdvanceOp();\n+        } else {\n+            // Wrong send, fail script\n+            FailScript();\n+        }\n+        return len;\n+    }\n+\n+    ssize_t Recv(void* buf, size_t len, int flags) const override\n+    {\n+        if (!m_connected || AtEndOfScript() || CurOp().op != TestOp::RECV || m_time_left != 0s) {\n+            return -1;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        const auto &recv_pkt = CurOp().data;\n+        const size_t consume_bytes{std::min(len, recv_pkt.size())};\n+        std::memcpy(buf, recv_pkt.data(), consume_bytes);\n+        if ((flags & MSG_PEEK) == 0) {\n+            AdvanceOp();\n+        }\n+        return consume_bytes;\n+    }\n+\n+    int Connect(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len) && service == CService(m_gateway_ip, 5351)) {\n+            if (m_bound.IsBindAny()) { // If bind-any, bind to local ip.\n+                m_bound = CService(m_local_ip, 0);\n+            }\n+            if (m_bound.GetPort() == 0) { // If no port assigned, assign port 1.\n+                m_bound = CService(m_bound, 1);\n+            }\n+            m_connected = true;\n+            return 0;\n+        }\n+        return -1;\n+    }\n+\n+    int Bind(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len)) {\n+            // Can only bind to one of our local ips\n+            if (!service.IsBindAny() && service != m_local_ip) {\n+                return -1;\n+            }\n+            m_bound = service;\n+        }\n+        return 0;",
+      "path": "src/test/pcp_tests.cpp",
+      "position": 161,
+      "original_position": 161,
+      "commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "original_commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "in_reply_to_id": 1917096066,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Yes, failing `Bind` when the network address fails to set makes more sense.",
+      "created_at": "2025-01-16T13:20:28Z",
+      "updated_at": "2025-01-16T13:20:29Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31022#discussion_r1918532671",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918532671"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31022"
+        }
+      },
+      "start_line": 154,
+      "original_start_line": 154,
+      "start_side": "RIGHT",
+      "line": 161,
+      "original_line": 161,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918533974",
+      "pull_request_review_id": 2556103117,
+      "id": 1918533974,
+      "node_id": "PRRC_kwDOABII585yWoFW",
+      "diff_hunk": "@@ -0,0 +1,701 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <common/pcp.h>\n+#include <netbase.h>\n+#include <test/util/logging.h>\n+#include <test/util/setup_common.h>\n+#include <util/time.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+#include <algorithm>\n+#include <deque>\n+\n+using namespace std::literals;\n+\n+/// UDP test server operation.\n+struct TestOp {\n+    std::chrono::milliseconds delay;\n+    enum Op {\n+        SEND, // Expect send (with optional data)\n+        RECV, // Expect receive (with data)\n+        NOP,  // Just delay\n+    } op;\n+    std::vector<uint8_t> data;\n+\n+    //! Injected error.\n+    //! Set this field to a non-zero value to return the errno code from send or receive operation.\n+    int error;\n+\n+    TestOp(std::chrono::milliseconds delay_in, Op op_in, const std::vector<uint8_t> &data_in, int error_in):\n+        delay(delay_in), op(op_in), data(data_in), error(error_in) {}\n+};\n+\n+/// Save the value of CreateSock and restore when the test ends.\n+class PCPTestingSetup : public BasicTestingSetup\n+{\n+public:\n+    explicit PCPTestingSetup(const ChainType chainType = ChainType::MAIN,\n+                             TestOpts opts = {})\n+        : BasicTestingSetup{chainType, opts},\n+          m_create_sock_orig{CreateSock}\n+    {\n+        const std::optional<CService> local_ipv4{Lookup(\"192.168.0.6\", 1, false)};\n+        const std::optional<CService> local_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:1234:5678:9abc\", 1, false)};\n+        const std::optional<CService> gateway_ipv4{Lookup(\"192.168.0.1\", 1, false)};\n+        const std::optional<CService> gateway_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:0000:0000:0000\", 1, false)};\n+        BOOST_REQUIRE(local_ipv4 && local_ipv6 && gateway_ipv4 && gateway_ipv6);\n+        default_local_ipv4 = *local_ipv4;\n+        default_local_ipv6 = *local_ipv6;\n+        default_gateway_ipv4 = *gateway_ipv4;\n+        default_gateway_ipv6 = *gateway_ipv6;\n+\n+        struct in_addr inaddr_any;\n+        inaddr_any.s_addr = htonl(INADDR_ANY);\n+        bind_any_ipv4 = CNetAddr(inaddr_any);\n+    }\n+\n+    ~PCPTestingSetup()\n+    {\n+        CreateSock = m_create_sock_orig;\n+        MockableSteadyClock::ClearMockTime();\n+    }\n+\n+    // Default testing nonce.\n+    static constexpr PCPMappingNonce TEST_NONCE{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};\n+    // Default network addresses.\n+    CNetAddr default_local_ipv4;\n+    CNetAddr default_local_ipv6;\n+    CNetAddr default_gateway_ipv4;\n+    CNetAddr default_gateway_ipv6;\n+    // IPv4 bind\n+    CNetAddr bind_any_ipv4;\n+private:\n+    const decltype(CreateSock) m_create_sock_orig;\n+};\n+\n+/** Simple scripted UDP server emulation for testing.\n+ */\n+class PCPTestSock final : public Sock\n+{\n+public:\n+    // Note: we awkwardly mark all methods as const, and properties as mutable,\n+    // because Sock expects all networking calls to be const.\n+    explicit PCPTestSock(const CNetAddr &local_ip, const CNetAddr &gateway_ip, const std::vector<TestOp> &script)\n+        : Sock{INVALID_SOCKET},\n+          m_script(script),\n+          m_local_ip(local_ip),\n+          m_gateway_ip(gateway_ip)\n+    {\n+        ElapseTime(std::chrono::seconds(0)); // start mocking steady time\n+        PrepareOp();\n+    }\n+\n+    ~PCPTestSock() override { m_socket = INVALID_SOCKET; }\n+\n+    PCPTestSock& operator=(Sock&& other) override\n+    {\n+        assert(false && \"Move of Sock into MockSock not allowed.\");",
+      "path": "src/test/pcp_tests.cpp",
+      "position": 100,
+      "original_position": 100,
+      "commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "original_commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "in_reply_to_id": 1917096949,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Whoops, so clear where i copied the code from now 😄 ",
+      "created_at": "2025-01-16T13:21:06Z",
+      "updated_at": "2025-01-16T13:21:06Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31022#discussion_r1918533974",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918533974"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31022"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 100,
+      "original_line": 100,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918551760",
+      "pull_request_review_id": 2556140944,
+      "id": 1918551760,
+      "node_id": "PRRC_kwDOABII585yWsbQ",
+      "diff_hunk": "@@ -0,0 +1,701 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <common/pcp.h>\n+#include <netbase.h>\n+#include <test/util/logging.h>\n+#include <test/util/setup_common.h>\n+#include <util/time.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+#include <algorithm>\n+#include <deque>\n+\n+using namespace std::literals;\n+\n+/// UDP test server operation.\n+struct TestOp {\n+    std::chrono::milliseconds delay;\n+    enum Op {\n+        SEND, // Expect send (with optional data)\n+        RECV, // Expect receive (with data)\n+        NOP,  // Just delay\n+    } op;\n+    std::vector<uint8_t> data;\n+\n+    //! Injected error.\n+    //! Set this field to a non-zero value to return the errno code from send or receive operation.\n+    int error;\n+\n+    TestOp(std::chrono::milliseconds delay_in, Op op_in, const std::vector<uint8_t> &data_in, int error_in):\n+        delay(delay_in), op(op_in), data(data_in), error(error_in) {}\n+};\n+\n+/// Save the value of CreateSock and restore when the test ends.\n+class PCPTestingSetup : public BasicTestingSetup\n+{\n+public:\n+    explicit PCPTestingSetup(const ChainType chainType = ChainType::MAIN,\n+                             TestOpts opts = {})\n+        : BasicTestingSetup{chainType, opts},\n+          m_create_sock_orig{CreateSock}\n+    {\n+        const std::optional<CService> local_ipv4{Lookup(\"192.168.0.6\", 1, false)};\n+        const std::optional<CService> local_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:1234:5678:9abc\", 1, false)};\n+        const std::optional<CService> gateway_ipv4{Lookup(\"192.168.0.1\", 1, false)};\n+        const std::optional<CService> gateway_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:0000:0000:0000\", 1, false)};\n+        BOOST_REQUIRE(local_ipv4 && local_ipv6 && gateway_ipv4 && gateway_ipv6);\n+        default_local_ipv4 = *local_ipv4;\n+        default_local_ipv6 = *local_ipv6;\n+        default_gateway_ipv4 = *gateway_ipv4;\n+        default_gateway_ipv6 = *gateway_ipv6;\n+\n+        struct in_addr inaddr_any;\n+        inaddr_any.s_addr = htonl(INADDR_ANY);\n+        bind_any_ipv4 = CNetAddr(inaddr_any);\n+    }\n+\n+    ~PCPTestingSetup()\n+    {\n+        CreateSock = m_create_sock_orig;\n+        MockableSteadyClock::ClearMockTime();\n+    }\n+\n+    // Default testing nonce.\n+    static constexpr PCPMappingNonce TEST_NONCE{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};\n+    // Default network addresses.\n+    CNetAddr default_local_ipv4;\n+    CNetAddr default_local_ipv6;\n+    CNetAddr default_gateway_ipv4;\n+    CNetAddr default_gateway_ipv6;\n+    // IPv4 bind\n+    CNetAddr bind_any_ipv4;\n+private:\n+    const decltype(CreateSock) m_create_sock_orig;\n+};\n+\n+/** Simple scripted UDP server emulation for testing.\n+ */\n+class PCPTestSock final : public Sock\n+{\n+public:\n+    // Note: we awkwardly mark all methods as const, and properties as mutable,\n+    // because Sock expects all networking calls to be const.\n+    explicit PCPTestSock(const CNetAddr &local_ip, const CNetAddr &gateway_ip, const std::vector<TestOp> &script)\n+        : Sock{INVALID_SOCKET},\n+          m_script(script),\n+          m_local_ip(local_ip),\n+          m_gateway_ip(gateway_ip)\n+    {\n+        ElapseTime(std::chrono::seconds(0)); // start mocking steady time\n+        PrepareOp();\n+    }\n+\n+    ~PCPTestSock() override { m_socket = INVALID_SOCKET; }\n+\n+    PCPTestSock& operator=(Sock&& other) override\n+    {\n+        assert(false && \"Move of Sock into MockSock not allowed.\");\n+        return *this;\n+    }\n+\n+    ssize_t Send(const void* data, size_t len, int) const override {\n+        if (!m_connected) return -1;\n+        Span in_pkt = Span(static_cast<const uint8_t*>(data), len);\n+        if (AtEndOfScript() || CurOp().op != TestOp::SEND) {\n+            // Ignore sends after end of script, or sends when we expect a receive.\n+            FailScript();\n+            return len;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        if (CurOp().data.empty() || std::ranges::equal(CurOp().data, in_pkt)) {\n+            AdvanceOp();\n+        } else {\n+            // Wrong send, fail script\n+            FailScript();\n+        }\n+        return len;\n+    }\n+\n+    ssize_t Recv(void* buf, size_t len, int flags) const override\n+    {\n+        if (!m_connected || AtEndOfScript() || CurOp().op != TestOp::RECV || m_time_left != 0s) {\n+            return -1;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        const auto &recv_pkt = CurOp().data;\n+        const size_t consume_bytes{std::min(len, recv_pkt.size())};\n+        std::memcpy(buf, recv_pkt.data(), consume_bytes);\n+        if ((flags & MSG_PEEK) == 0) {\n+            AdvanceOp();\n+        }\n+        return consume_bytes;\n+    }\n+\n+    int Connect(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len) && service == CService(m_gateway_ip, 5351)) {\n+            if (m_bound.IsBindAny()) { // If bind-any, bind to local ip.\n+                m_bound = CService(m_local_ip, 0);\n+            }\n+            if (m_bound.GetPort() == 0) { // If no port assigned, assign port 1.\n+                m_bound = CService(m_bound, 1);\n+            }\n+            m_connected = true;\n+            return 0;\n+        }\n+        return -1;\n+    }\n+\n+    int Bind(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len)) {\n+            // Can only bind to one of our local ips\n+            if (!service.IsBindAny() && service != m_local_ip) {\n+                return -1;\n+            }\n+            m_bound = service;\n+        }\n+        return 0;\n+    }\n+\n+    int Listen(int) const override { return -1; }\n+\n+    std::unique_ptr<Sock> Accept(sockaddr* addr, socklen_t* addr_len) const override\n+    {\n+        return nullptr;\n+    };\n+\n+    int GetSockOpt(int level, int opt_name, void* opt_val, socklen_t* opt_len) const override\n+    {\n+        std::memset(opt_val, 0x0, *opt_len);",
+      "path": "src/test/pcp_tests.cpp",
+      "position": 173,
+      "original_position": 173,
+      "commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "original_commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "in_reply_to_id": 1917105856,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "For sake of completeness. i think it's uglier to fall through to the parent class, which would do an actual `getsockopt` call on an invalid socket if in the future the called code would use `GetSockOpt`.\r\n\r\ni kind of wish there was a purely virtual `BaseSock` and `PosixSock` and `TestSock` etc were a subclass of this, so every subclass would be forced to implement everything.\r\n\r\nCould replace with an `assert(not implemented)` stub. But it's just one line...",
+      "created_at": "2025-01-16T13:28:25Z",
+      "updated_at": "2025-01-16T13:35:29Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31022#discussion_r1918551760",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918551760"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31022"
+        }
+      },
+      "start_line": 171,
+      "original_start_line": 171,
+      "start_side": "RIGHT",
+      "line": 173,
+      "original_line": 173,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918567089",
+      "pull_request_review_id": 2556169787,
+      "id": 1918567089,
+      "node_id": "PRRC_kwDOABII585yWwKx",
+      "diff_hunk": "@@ -0,0 +1,701 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <common/pcp.h>\n+#include <netbase.h>\n+#include <test/util/logging.h>\n+#include <test/util/setup_common.h>\n+#include <util/time.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+#include <algorithm>\n+#include <deque>\n+\n+using namespace std::literals;\n+\n+/// UDP test server operation.\n+struct TestOp {\n+    std::chrono::milliseconds delay;\n+    enum Op {\n+        SEND, // Expect send (with optional data)\n+        RECV, // Expect receive (with data)\n+        NOP,  // Just delay\n+    } op;\n+    std::vector<uint8_t> data;\n+\n+    //! Injected error.\n+    //! Set this field to a non-zero value to return the errno code from send or receive operation.\n+    int error;\n+\n+    TestOp(std::chrono::milliseconds delay_in, Op op_in, const std::vector<uint8_t> &data_in, int error_in):\n+        delay(delay_in), op(op_in), data(data_in), error(error_in) {}\n+};\n+\n+/// Save the value of CreateSock and restore when the test ends.\n+class PCPTestingSetup : public BasicTestingSetup\n+{\n+public:\n+    explicit PCPTestingSetup(const ChainType chainType = ChainType::MAIN,\n+                             TestOpts opts = {})\n+        : BasicTestingSetup{chainType, opts},\n+          m_create_sock_orig{CreateSock}\n+    {\n+        const std::optional<CService> local_ipv4{Lookup(\"192.168.0.6\", 1, false)};\n+        const std::optional<CService> local_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:1234:5678:9abc\", 1, false)};\n+        const std::optional<CService> gateway_ipv4{Lookup(\"192.168.0.1\", 1, false)};\n+        const std::optional<CService> gateway_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:0000:0000:0000\", 1, false)};\n+        BOOST_REQUIRE(local_ipv4 && local_ipv6 && gateway_ipv4 && gateway_ipv6);\n+        default_local_ipv4 = *local_ipv4;\n+        default_local_ipv6 = *local_ipv6;\n+        default_gateway_ipv4 = *gateway_ipv4;\n+        default_gateway_ipv6 = *gateway_ipv6;\n+\n+        struct in_addr inaddr_any;\n+        inaddr_any.s_addr = htonl(INADDR_ANY);\n+        bind_any_ipv4 = CNetAddr(inaddr_any);\n+    }\n+\n+    ~PCPTestingSetup()\n+    {\n+        CreateSock = m_create_sock_orig;\n+        MockableSteadyClock::ClearMockTime();\n+    }\n+\n+    // Default testing nonce.\n+    static constexpr PCPMappingNonce TEST_NONCE{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};\n+    // Default network addresses.\n+    CNetAddr default_local_ipv4;\n+    CNetAddr default_local_ipv6;\n+    CNetAddr default_gateway_ipv4;\n+    CNetAddr default_gateway_ipv6;\n+    // IPv4 bind\n+    CNetAddr bind_any_ipv4;\n+private:\n+    const decltype(CreateSock) m_create_sock_orig;\n+};\n+\n+/** Simple scripted UDP server emulation for testing.\n+ */\n+class PCPTestSock final : public Sock\n+{\n+public:\n+    // Note: we awkwardly mark all methods as const, and properties as mutable,\n+    // because Sock expects all networking calls to be const.\n+    explicit PCPTestSock(const CNetAddr &local_ip, const CNetAddr &gateway_ip, const std::vector<TestOp> &script)\n+        : Sock{INVALID_SOCKET},\n+          m_script(script),\n+          m_local_ip(local_ip),\n+          m_gateway_ip(gateway_ip)\n+    {\n+        ElapseTime(std::chrono::seconds(0)); // start mocking steady time\n+        PrepareOp();\n+    }\n+\n+    ~PCPTestSock() override { m_socket = INVALID_SOCKET; }",
+      "path": "src/test/pcp_tests.cpp",
+      "position": 96,
+      "original_position": 96,
+      "commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "original_commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "in_reply_to_id": 1917273199,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Yes. It makes no sense, it doesn't even use `m_socket`.\r\ni copied this destructor from `StaticContentsSock`, which i think also does it redundantly.",
+      "created_at": "2025-01-16T13:34:23Z",
+      "updated_at": "2025-01-16T13:34:23Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31022#discussion_r1918567089",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918567089"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31022"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 96,
+      "original_line": 96,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918601053",
+      "pull_request_review_id": 2556230374,
+      "id": 1918601053,
+      "node_id": "PRRC_kwDOABII585yW4dd",
+      "diff_hunk": "@@ -0,0 +1,701 @@\n+// Copyright (c) 2024 The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <common/pcp.h>\n+#include <netbase.h>\n+#include <test/util/logging.h>\n+#include <test/util/setup_common.h>\n+#include <util/time.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+#include <algorithm>\n+#include <deque>\n+\n+using namespace std::literals;\n+\n+/// UDP test server operation.\n+struct TestOp {\n+    std::chrono::milliseconds delay;\n+    enum Op {\n+        SEND, // Expect send (with optional data)\n+        RECV, // Expect receive (with data)\n+        NOP,  // Just delay\n+    } op;\n+    std::vector<uint8_t> data;\n+\n+    //! Injected error.\n+    //! Set this field to a non-zero value to return the errno code from send or receive operation.\n+    int error;\n+\n+    TestOp(std::chrono::milliseconds delay_in, Op op_in, const std::vector<uint8_t> &data_in, int error_in):\n+        delay(delay_in), op(op_in), data(data_in), error(error_in) {}\n+};\n+\n+/// Save the value of CreateSock and restore when the test ends.\n+class PCPTestingSetup : public BasicTestingSetup\n+{\n+public:\n+    explicit PCPTestingSetup(const ChainType chainType = ChainType::MAIN,\n+                             TestOpts opts = {})\n+        : BasicTestingSetup{chainType, opts},\n+          m_create_sock_orig{CreateSock}\n+    {\n+        const std::optional<CService> local_ipv4{Lookup(\"192.168.0.6\", 1, false)};\n+        const std::optional<CService> local_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:1234:5678:9abc\", 1, false)};\n+        const std::optional<CService> gateway_ipv4{Lookup(\"192.168.0.1\", 1, false)};\n+        const std::optional<CService> gateway_ipv6{Lookup(\"2a10:1234:5678:9abc:def0:0000:0000:0000\", 1, false)};\n+        BOOST_REQUIRE(local_ipv4 && local_ipv6 && gateway_ipv4 && gateway_ipv6);\n+        default_local_ipv4 = *local_ipv4;\n+        default_local_ipv6 = *local_ipv6;\n+        default_gateway_ipv4 = *gateway_ipv4;\n+        default_gateway_ipv6 = *gateway_ipv6;\n+\n+        struct in_addr inaddr_any;\n+        inaddr_any.s_addr = htonl(INADDR_ANY);\n+        bind_any_ipv4 = CNetAddr(inaddr_any);\n+    }\n+\n+    ~PCPTestingSetup()\n+    {\n+        CreateSock = m_create_sock_orig;\n+        MockableSteadyClock::ClearMockTime();\n+    }\n+\n+    // Default testing nonce.\n+    static constexpr PCPMappingNonce TEST_NONCE{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc};\n+    // Default network addresses.\n+    CNetAddr default_local_ipv4;\n+    CNetAddr default_local_ipv6;\n+    CNetAddr default_gateway_ipv4;\n+    CNetAddr default_gateway_ipv6;\n+    // IPv4 bind\n+    CNetAddr bind_any_ipv4;\n+private:\n+    const decltype(CreateSock) m_create_sock_orig;\n+};\n+\n+/** Simple scripted UDP server emulation for testing.\n+ */\n+class PCPTestSock final : public Sock\n+{\n+public:\n+    // Note: we awkwardly mark all methods as const, and properties as mutable,\n+    // because Sock expects all networking calls to be const.\n+    explicit PCPTestSock(const CNetAddr &local_ip, const CNetAddr &gateway_ip, const std::vector<TestOp> &script)\n+        : Sock{INVALID_SOCKET},\n+          m_script(script),\n+          m_local_ip(local_ip),\n+          m_gateway_ip(gateway_ip)\n+    {\n+        ElapseTime(std::chrono::seconds(0)); // start mocking steady time\n+        PrepareOp();\n+    }\n+\n+    ~PCPTestSock() override { m_socket = INVALID_SOCKET; }\n+\n+    PCPTestSock& operator=(Sock&& other) override\n+    {\n+        assert(false && \"Move of Sock into MockSock not allowed.\");\n+        return *this;\n+    }\n+\n+    ssize_t Send(const void* data, size_t len, int) const override {\n+        if (!m_connected) return -1;\n+        Span in_pkt = Span(static_cast<const uint8_t*>(data), len);\n+        if (AtEndOfScript() || CurOp().op != TestOp::SEND) {\n+            // Ignore sends after end of script, or sends when we expect a receive.\n+            FailScript();\n+            return len;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        if (CurOp().data.empty() || std::ranges::equal(CurOp().data, in_pkt)) {\n+            AdvanceOp();\n+        } else {\n+            // Wrong send, fail script\n+            FailScript();\n+        }\n+        return len;\n+    }\n+\n+    ssize_t Recv(void* buf, size_t len, int flags) const override\n+    {\n+        if (!m_connected || AtEndOfScript() || CurOp().op != TestOp::RECV || m_time_left != 0s) {\n+            return -1;\n+        }\n+        if (CurOp().error) return -1; // Inject failure\n+        const auto &recv_pkt = CurOp().data;\n+        const size_t consume_bytes{std::min(len, recv_pkt.size())};\n+        std::memcpy(buf, recv_pkt.data(), consume_bytes);\n+        if ((flags & MSG_PEEK) == 0) {\n+            AdvanceOp();\n+        }\n+        return consume_bytes;\n+    }\n+\n+    int Connect(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len) && service == CService(m_gateway_ip, 5351)) {\n+            if (m_bound.IsBindAny()) { // If bind-any, bind to local ip.\n+                m_bound = CService(m_local_ip, 0);\n+            }\n+            if (m_bound.GetPort() == 0) { // If no port assigned, assign port 1.\n+                m_bound = CService(m_bound, 1);\n+            }\n+            m_connected = true;\n+            return 0;\n+        }\n+        return -1;\n+    }\n+\n+    int Bind(const sockaddr* sa, socklen_t sa_len) const override {\n+        CService service;\n+        if (service.SetSockAddr(sa, sa_len)) {\n+            // Can only bind to one of our local ips\n+            if (!service.IsBindAny() && service != m_local_ip) {\n+                return -1;\n+            }\n+            m_bound = service;\n+        }\n+        return 0;\n+    }\n+\n+    int Listen(int) const override { return -1; }\n+\n+    std::unique_ptr<Sock> Accept(sockaddr* addr, socklen_t* addr_len) const override\n+    {\n+        return nullptr;\n+    };\n+\n+    int GetSockOpt(int level, int opt_name, void* opt_val, socklen_t* opt_len) const override\n+    {\n+        std::memset(opt_val, 0x0, *opt_len);",
+      "path": "src/test/pcp_tests.cpp",
+      "position": 173,
+      "original_position": 173,
+      "commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "original_commit_id": "9cd85281c6cc8d3fb01930e53109fae97a108dd8",
+      "in_reply_to_id": 1917105856,
+      "user": {
+        "login": "laanwj",
+        "id": 126646,
+        "node_id": "MDQ6VXNlcjEyNjY0Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/126646?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/laanwj",
+        "html_url": "https://github.com/laanwj",
+        "followers_url": "https://api.github.com/users/laanwj/followers",
+        "following_url": "https://api.github.com/users/laanwj/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/laanwj/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/laanwj/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/laanwj/subscriptions",
+        "organizations_url": "https://api.github.com/users/laanwj/orgs",
+        "repos_url": "https://api.github.com/users/laanwj/repos",
+        "events_url": "https://api.github.com/users/laanwj/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/laanwj/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Ok, will just make it do nothing and return -1. That's just as valid, no need fo the memset.",
+      "created_at": "2025-01-16T13:56:35Z",
+      "updated_at": "2025-01-16T13:56:35Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31022#discussion_r1918601053",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1918601053"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31022"
+        }
+      },
+      "start_line": 171,
+      "original_start_line": 171,
+      "start_side": "RIGHT",
+      "line": 173,
+      "original_line": 173,
       "side": "RIGHT"
     }
   ]
