@@ -42,7 +42,7 @@
     "body": "Currently `CConnman` is a mixture of:\r\n* low level socket handling, e.g. send, recv, poll, bind, listen, connect, and\r\n* higher level logic that is specific to the Bitcoin P2P protocol, e.g. V1/V2 transport, choosing which address to connect to, if we manage to connect mark the address good in `AddrMan`, maintaining the number of inbound and outbound connections, banning of peers, interacting with `PeerManager`.\r\n\r\n---\r\n\r\nThis PR splits the socket handling into a new class which makes the code more modular and reusable. Having more modular and reusable code is a good thing on its own, even if the code is not reused. Stratum V2 and libevent-less RPC/HTTP server could benefit from this, but it makes sense on its own, even without those projects.\r\n\r\n---\r\n\r\nThe socket operations are driven by the new class `SockMan` which informs the higher level via provided methods when e.g. new data arrives on the socket or a new connection is accepted. For this, `SockMan` provides some non-virtual methods to start it rolling and then it calls pure virtual methods which are implemented by the higher level (e.g. `CConnman`) on certain events, for example \"got this new data on this node's socket\".\r\n\r\nThe public interface of `SockMan` is:\r\n\r\n```cpp\r\n/**\r\n * A socket manager class which handles socket operations.\r\n * To use this class, inherit from it and implement the pure virtual methods.\r\n * Handled operations:\r\n * - binding and listening on sockets\r\n * - starting of necessary threads to process socket operations\r\n * - accepting incoming connections\r\n * - making outbound connections\r\n * - closing connections\r\n * - waiting for IO readiness on sockets and doing send/recv accordingly\r\n */\r\nclass SockMan\r\n{\r\npublic:\r\n\r\n    //\r\n    // Non-virtual functions, to be reused by children classes.\r\n    //\r\n\r\n    /**\r\n     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\r\n     * Should be called before `StartSocketsThreads()`.\r\n     * @param[in] to Where to bind.\r\n     * @param[out] errmsg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `strError` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& errmsg);\r\n\r\n    /**\r\n     * Start the necessary threads for sockets IO.\r\n     */\r\n    void StartSocketsThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\r\n     */\r\n    void JoinSocketsThreads();\r\n\r\n    /**\r\n     * Make an outbound connection, save the socket internally and return a newly generated node id.\r\n     * @param[in] to The address to connect to, either as CService or a host as string and port as\r\n     * an integer, if the later is used, then `proxy` must be valid.\r\n     * @param[in] is_important If true, then log failures with higher severity.\r\n     * @param[in] proxy Proxy to connect through if `proxy.IsValid()` is true.\r\n     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\r\n     * proxy, then it will be set to true.\r\n     * @param[out] me If the connection was successful then this is set to the address on the\r\n     * local side of the socket.\r\n     * @return Newly generated node id, or std::nullopt if the operation fails.\r\n     */\r\n    std::optional<NodeId> ConnectAndMakeNodeId(const std::variant<CService, StringHostIntPort>& to,\r\n                                               bool is_important,\r\n                                               const Proxy& proxy,\r\n                                               bool& proxy_failed,\r\n                                               CService& me);\r\n\r\n    /**\r\n     * Disconnect a given peer by closing its socket and release resources occupied by it.\r\n     * @return Whether the peer existed and its socket was closed by this call.\r\n     */\r\n    bool CloseConnection(NodeId node_id);\r\n\r\n    /**\r\n     * Try to send some data to the given node.\r\n     * @param[in] node_id Identifier of the node to send to.\r\n     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\r\n     * @param[in] will_send_more Used as an optimization if the caller knows that they will\r\n     * be sending more data soon after this call.\r\n     * @param[out] errmsg If <0 is returned then this will contain a human readable message\r\n     * explaining the error.\r\n     * @retval >=0 The number of bytes actually sent.\r\n     * @retval <0 A permanent error has occurred.\r\n     */\r\n    ssize_t SendBytes(NodeId node_id,\r\n                      Span<const unsigned char> data,\r\n                      bool will_send_more,\r\n                      std::string& errmsg) const;\r\n\r\n    /**\r\n     * Close all sockets.\r\n     */\r\n    void CloseSockets();\r\n\r\n    //\r\n    // Pure virtual functions must be implemented by children classes.\r\n    //\r\n\r\n    /**\r\n     * Be notified when a new connection has been accepted.\r\n     * @param[in] node_id Id of the newly accepted connection.\r\n     * @param[in] me The address and port at our side of the connection.\r\n     * @param[in] them The address and port at the peer's side of the connection.\r\n     * @retval true The new connection was accepted at the higher level.\r\n     * @retval false The connection was refused at the higher level, so the\r\n     * associated socket and node_id should be discarded by `SockMan`.\r\n     */\r\n    virtual bool EventNewConnectionAccepted(NodeId node_id,\r\n                                            const CService& me,\r\n                                            const CService& them) = 0;\r\n\r\n    /**\r\n     * Called when the socket is ready to send data and `ShouldTryToSend()` has\r\n     * returned true. This is where the higher level code serializes its messages\r\n     * and calls `SockMan::SendBytes()`.\r\n     * @param[in] node_id Id of the node whose socket is ready to send.\r\n     * @param[out] cancel_recv Should always be set upon return and if it is true,\r\n     * then the next attempt to receive data from that node will be omitted.\r\n     */\r\n    virtual void EventReadyToSend(NodeId node_id, bool& cancel_recv) = 0;\r\n\r\n    /**\r\n     * Called when new data has been received.\r\n     * @param[in] node_id Node for which the data arrived.\r\n     * @param[in] data Data buffer.\r\n     * @param[in] n Number of bytes in `data`.\r\n     */\r\n    virtual void EventGotData(NodeId node_id, const uint8_t* data, size_t n) = 0;\r\n\r\n    /**\r\n     * Called when the remote peer has sent an EOF on the socket. This is a graceful\r\n     * close of their writing side, we can still send and they will receive, if it\r\n     * makes sense at the application level.\r\n     * @param[in] node_id Node whose socket got EOF.\r\n     */\r\n    virtual void EventGotEOF(NodeId node_id) = 0;\r\n\r\n    /**\r\n     * Called when we get an irrecoverable error trying to read from a socket.\r\n     * @param[in] node_id Node whose socket got an error.\r\n     * @param[in] errmsg Message describing the error.\r\n     */\r\n    virtual void EventGotPermanentReadError(NodeId node_id, const std::string& errmsg) = 0;\r\n\r\n    //\r\n    // Non-pure virtual functions can be overridden by children classes or left\r\n    // alone to use the default implementation from SockMan.\r\n    //\r\n\r\n    /**\r\n     * SockMan would only call EventReadyToSend() if this returns true.\r\n     * Can be used to temporary pause sends for a node.\r\n     * The implementation in SockMan always returns true.\r\n     * @param[in] node_id Node for which to confirm or cancel a call to EventReadyToSend().\r\n     */\r\n    virtual bool ShouldTryToSend(NodeId node_id) const;\r\n\r\n    /**\r\n     * SockMan would only call Recv() on a node's socket if this returns true.\r\n     * Can be used to temporary pause receives for a node.\r\n     * The implementation in SockMan always returns true.\r\n     * @param[in] node_id Node for which to confirm or cancel a receive.\r\n     */\r\n    virtual bool ShouldTryToRecv(NodeId node_id) const;\r\n\r\n    /**\r\n     * SockMan has completed the current send+recv iteration for a node.\r\n     * It will do another send+recv for this node after processing all other nodes.\r\n     * Can be used to execute periodic tasks for a given node.\r\n     * The implementation in SockMan does nothing.\r\n     * @param[in] node_id Node for which send+recv has been done.\r\n     */\r\n    virtual void EventIOLoopCompletedForNode(NodeId node_id);\r\n\r\n    /**\r\n     * SockMan has completed send+recv for all nodes.\r\n     * Can be used to execute periodic tasks for all nodes.\r\n     * The implementation in SockMan does nothing.\r\n     */\r\n    virtual void EventIOLoopCompletedForAllPeers();\r\n\r\n    /**\r\n     * Be notified of a change in the state of listening for incoming I2P connections.\r\n     * The default behavior, implemented by `SockMan`, is to ignore this event.\r\n     * @param[in] addr Our listening address.\r\n     * @param[in] success If true then the listen succeeded and we are now\r\n     * listening for incoming I2P connections at `addr`. If false then the\r\n     * call failed and now we are not listening (even if this was invoked\r\n     * before with `true`).\r\n     */\r\n    virtual void EventI2PListen(const CService& addr, bool success);\r\n};\r\n```\r\n\r\nResolves: https://github.com/bitcoin/bitcoin/issues/30694\r\n\r\n---\r\n\r\nReview hint: this PR moves some code around, so reviewers may find this helpful: `git show --color-moved --color-moved-ws=allow-indentation-change`.",
     "labels": [],
     "created_at": "2024-09-27T07:57:10Z",
-    "updated_at": "2025-01-17T16:06:45Z",
+    "updated_at": "2025-01-17T17:48:05Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merge_commit_sha": "d87c47f77677e83843a6a738878822a081b99ee9",
@@ -310,7 +310,7 @@
         "watchers_count": 81445,
         "size": 274383,
         "default_branch": "master",
-        "open_issues_count": 697,
+        "open_issues_count": 698,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -359,7 +359,7 @@
     "deletions": 729,
     "changed_files": 19,
     "commits": 17,
-    "review_comments": 46,
+    "review_comments": 47,
     "comments": 19
   },
   "events": [
@@ -3626,6 +3626,42 @@
       "submitted_at": "2025-01-15T14:25:01Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+    },
+    {
+      "event": "reviewed",
+      "id": 2559620130,
+      "node_id": "PRR_kwDOABII586YkLQi",
+      "url": null,
+      "actor": null,
+      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_url": null,
+      "created_at": null,
+      "author_association": "MEMBER",
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2559620130",
+      "submitted_at": "2025-01-17T17:48:05Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
     }
   ],
   "comments": [
@@ -6065,6 +6101,59 @@
       "start_side": null,
       "line": null,
       "original_line": 2060,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1920546152",
+      "pull_request_review_id": 2559620130,
+      "id": 1920546152,
+      "node_id": "PRRC_kwDOABII585yeTVo",
+      "diff_hunk": "@@ -0,0 +1,532 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://opensource.org/license/mit/.\n+\n+#include <bitcoin-build-config.h> // IWYU pragma: keep\n+\n+#include <common/sockman.h>\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/sock.h>\n+#include <util/thread.h>\n+\n+#include <cassert>\n+\n+// The set of sockets cannot be modified while waiting\n+// The sleep time needs to be small to avoid new sockets stalling\n+static constexpr auto SELECT_TIMEOUT{50ms};\n+\n+static CService GetBindAddress(const Sock& sock)\n+{\n+    CService addr_bind;\n+    struct sockaddr_storage sockaddr_bind;\n+    socklen_t sockaddr_bind_len = sizeof(sockaddr_bind);\n+    if (!sock.GetSockName((struct sockaddr*)&sockaddr_bind, &sockaddr_bind_len)) {\n+        addr_bind.SetSockAddr((const struct sockaddr*)&sockaddr_bind);\n+    } else {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"getsockname failed\\n\");\n+    }\n+    return addr_bind;\n+}\n+\n+bool SockMan::BindAndStartListening(const CService& to, bilingual_str& errmsg)\n+{\n+    // Create socket for listening for incoming connections\n+    struct sockaddr_storage storage;\n+    socklen_t len{sizeof(storage)};\n+    if (!to.GetSockAddr(reinterpret_cast<sockaddr*>(&storage), &len)) {\n+        errmsg = Untranslated(strprintf(\"Bind address family for %s not supported\", to.ToStringAddrPort()));\n+        return false;\n+    }\n+\n+    std::unique_ptr<Sock> sock{CreateSock(to.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};\n+    if (!sock) {\n+        errmsg = Untranslated(strprintf(\"Cannot create %s listen socket: %s\",\n+                                        to.ToStringAddrPort(),\n+                                        NetworkErrorString(WSAGetLastError())));\n+        return false;\n+    }\n+\n+    int one{1};\n+\n+    // Allow binding if the port is still in TIME_WAIT state after\n+    // the program was closed and restarted.\n+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+        LogPrintLevel(BCLog::NET,\n+                      BCLog::Level::Info,\n+                      \"Cannot set SO_REUSEADDR on %s listen socket: %s, continuing anyway\\n\",\n+                      to.ToStringAddrPort(),\n+                      NetworkErrorString(WSAGetLastError()));\n+    }\n+\n+    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option\n+    // and enable it by default or not. Try to enable it, if possible.\n+    if (to.IsIPv6()) {\n+#ifdef IPV6_V6ONLY\n+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_V6ONLY on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+#ifdef WIN32\n+        int prot_level{PROTECTION_LEVEL_UNRESTRICTED};\n+        if (sock->SetSockOpt(IPPROTO_IPV6,\n+                             IPV6_PROTECTION_LEVEL,\n+                             reinterpret_cast<const char*>(&prot_level),\n+                             sizeof(prot_level)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_PROTECTION_LEVEL on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+    }\n+\n+    if (sock->Bind(reinterpret_cast<sockaddr*>(&storage), len) == SOCKET_ERROR) {\n+        const int err{WSAGetLastError()};\n+        errmsg = strprintf(_(\"Cannot bind to %s: %s%s\"),\n+                           to.ToStringAddrPort(),\n+                           NetworkErrorString(err),\n+                           err == WSAEADDRINUSE\n+                               ? std::string{\" (\"} + CLIENT_NAME + \" already running?)\"\n+                               : \"\");\n+        return false;\n+    }\n+\n+    // Listen for incoming connections\n+    if (sock->Listen(SOMAXCONN) == SOCKET_ERROR) {\n+        errmsg = strprintf(_(\"Cannot listen to %s: %s\"), to.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));\n+        return false;\n+    }\n+\n+    m_listen.emplace_back(std::move(sock));\n+\n+    return true;\n+}\n+\n+void SockMan::StartSocketsThreads(const Options& options)\n+{\n+    m_thread_socket_handler = std::thread(&util::TraceThread, \"net\", [this] { ThreadSocketHandler(); });",
+      "path": "src/common/sockman.cpp",
+      "position": 113,
+      "original_position": 113,
+      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "original_commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Does this hard-coded thread name cause any issues if sockman is used more than once?",
+      "created_at": "2025-01-17T17:47:59Z",
+      "updated_at": "2025-01-17T17:48:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#discussion_r1920546152",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1920546152"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 113,
+      "original_line": 113,
       "side": "RIGHT"
     }
   ]
