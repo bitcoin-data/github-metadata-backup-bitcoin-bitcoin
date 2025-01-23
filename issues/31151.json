@@ -58,9 +58,9 @@
     "assignees": [],
     "author_association": "MEMBER",
     "locked": false,
-    "comments": 4,
+    "comments": 5,
     "created_at": "2024-10-24T15:27:34Z",
-    "updated_at": "2025-01-22T21:38:52Z"
+    "updated_at": "2025-01-23T12:28:32Z"
   },
   "events": [
     {
@@ -443,6 +443,62 @@
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/31151#issuecomment-2608324576",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31151"
+    },
+    {
+      "event": "commented",
+      "id": 2609686156,
+      "node_id": "IC_kwDOABII586bjKaM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2609686156",
+      "actor": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-01-23T12:28:30Z",
+      "updated_at": "2025-01-23T12:28:30Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "I think I figured out how the [` wait_stream = nullptr;`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L211) statement in `EventLoop::loop` is happening before the [`write(m_post_fd, ...)`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L242) call in `EventLoop::removeClient` called by the thread in `EventLoop::startAsyncThread`, which is causing the error about trying to write to a closed pipe.\n\nThe issue is that the event loop can exit early, after it has detected the loop ending condition [`m_num_clients == 0 && m_async_fns.empty()`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L204), but before the `write(m_post_fd, ...)` call is made to notify the loop that the ending condition has been reached.\n\nSpecifically, this can happen in the `~Connection` destructor when it calls [`startAsyncThread && removeClient`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L109-L110). Depending on what order the destructor thread and the async thread run, it is possible that the [`removeClient`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L234-L245) call in the destructor runs first and detects `m_num_clients == 0` and calls `write(m_post_fd, ...)`, but (importantly) the event loop does not read from the other end of the pipe right away. Then the async thread calls `addClient` and `removeClient` as it is executing the `m_async_fns` queue, and (also importantly) the final `removeClient` call it makes is interrupted after it runs  `m_num_clients -= 1` but before it runs `write(m_post_fd, ...)`. When this happens, `EventLoop::loop` thread can wake up, read from the other end of the pipe because of the `write(m_post_fd, ...)` call that happened earlier, and exit the loop before the second `write(m_post_fd, ...)` has a chance to run, resulting in a write error.\n\nThat's the sequence of events that I think is happening in this case, but there are other sequences possible that could have the same effect. For example, if the `m_async_fns` list has multiple entries (this could happen with multiple connections) and the async thread makes multiple `removeClient` and `write(m_post_fd, ...)` calls, and earlier writes are not read right away, and the thread is interrupted before the final `write(m_post_fd, ...)` call, the loop can exit, causing the final write to fail trying to write to a closed pipe.\n\nFundamentally the problem here is that are multiple `write(m_post_fd, ...)` calls being made at all. If the `removeClient` [`if (m_num_clients == 0)`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L238) check were changed to `if (m_num_clients == 0 && m_async_fns.empty())` I think this problem would not happen.\n\nA second issue with this code is that [`if (m_num_clients == 0 && m_async_fns.empty())`](https://github.com/chaincodelabs/libmultiprocess/blob/3b2617b3e59f55ae3501c82a62c87f393077779f/src/mp/proxy.cpp#L204) loop exit check in `EventLoop::loop` is unsafe because it is made without holding an `m_mutex` lock, which could cause a race resulting in the same error reported here, if loop exit happens early because it is based on stale values.\n\nUsing `-fsanitize=thread` helped uncover both these issues. It uncovered the second issue right away, but after I fixed the second issue, it only reported the first issue if I ran a test calling `node.echoipc` and `self.stop_node` in a loop thousands of times that had to run around ~30 minutes before a race would be triggered and TSAN would report something. TSAN output was also a bit confusing because it referred to the `write()` call as a read and the `close()` call as a write, but that does makes sense given TSAN's [file descriptor](https://github.com/google/sanitizers/wiki/ThreadSanitizerPopularDataRaces#race-on-a-file-descriptor) race [detection](https://github.com/google/sanitizers/wiki/ThreadSanitizerDetectableBugs), since conceptually a `write()` call does not mutate a file descriptor but a `close()` does. I also wasted a lot of time trying to suppress that error report with `AnnotateHappensBefore` and `AnnotateHappensAfter` by trying to add a HappensBefore call after the pipe write call, and a HappensAfter call after the pipe read call, but this did not suppress it. Eventually I moved the HappensAfter call right before the `close()` call and this did suppress the error. Then at some point after that I realized that multiple writes could trigger a real race condition and the TSAN error maybe should not be suppressed.\n\nI think next step will be to make a multiprocess PR adding an EventLoop::done method to check for the `m_num_clients == 0 && m_async_fns.empty()` condition consistently so there should only ever be a single write triggering a shutdown and no way for the event loop to exit before the write happens. This should also fix the missed `m_mutex` problem. Separately another PR might add TSAN HappensBefore/HappensAfter annotations if TSAN detects errors, since TSAN doesn't actually have a way of knowing the pipe write must happen before the code that runs after the pipe read.\n\nMaybe there are CI improvements that could be made too. After #30975 it would make sense to build libmultiprocess with  `-fsanitize=thread` in the tsan build. And it would be nice if core dumps could be enabled on CI and GDB were run on any core dumps that were produced to output a backtrace.",
+      "user": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/issues/31151#issuecomment-2609686156",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31151"
     }
   ]
