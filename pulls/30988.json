@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30988/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/266ac3267390270e6794d478aa1fbe40e88ffb0f",
     "number": 30988,
     "state": "open",
     "locked": false,
@@ -42,10 +42,10 @@
     "body": "Currently `CConnman` is a mixture of:\r\n* low level socket handling, e.g. send, recv, poll, bind, listen, connect, and\r\n* higher level logic that is specific to the Bitcoin P2P protocol, e.g. V1/V2 transport, choosing which address to connect to, if we manage to connect mark the address good in `AddrMan`, maintaining the number of inbound and outbound connections, banning of peers, interacting with `PeerManager`.\r\n\r\n---\r\n\r\nThis PR splits the socket handling into a new class which makes the code more modular and reusable. Having more modular and reusable code is a good thing on its own, even if the code is not reused. Stratum V2 and libevent-less RPC/HTTP server could benefit from this, but it makes sense on its own, even without those projects.\r\n\r\n---\r\n\r\nThe socket operations are driven by the new class `SockMan` which informs the higher level via provided methods when e.g. new data arrives on the socket or a new connection is accepted. For this, `SockMan` provides some non-virtual methods to start it rolling and then it calls pure virtual methods which are implemented by the higher level (e.g. `CConnman`) on certain events, for example \"got this new data on this node's socket\".\r\n\r\nThe public interface of `SockMan` is:\r\n\r\n```cpp\r\n/**\r\n * A socket manager class which handles socket operations.\r\n * To use this class, inherit from it and implement the pure virtual methods.\r\n * Handled operations:\r\n * - binding and listening on sockets\r\n * - starting of necessary threads to process socket operations\r\n * - accepting incoming connections\r\n * - making outbound connections\r\n * - closing connections\r\n * - waiting for IO readiness on sockets and doing send/recv accordingly\r\n */\r\nclass SockMan\r\n{\r\npublic:\r\n\r\n    //\r\n    // Non-virtual functions, to be reused by children classes.\r\n    //\r\n\r\n    /**\r\n     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\r\n     * Should be called before `StartSocketsThreads()`.\r\n     * @param[in] to Where to bind.\r\n     * @param[out] errmsg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `strError` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& errmsg);\r\n\r\n    /**\r\n     * Start the necessary threads for sockets IO.\r\n     */\r\n    void StartSocketsThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\r\n     */\r\n    void JoinSocketsThreads();\r\n\r\n    /**\r\n     * Make an outbound connection, save the socket internally and return a newly generated node id.\r\n     * @param[in] to The address to connect to, either as CService or a host as string and port as\r\n     * an integer, if the later is used, then `proxy` must be valid.\r\n     * @param[in] is_important If true, then log failures with higher severity.\r\n     * @param[in] proxy Proxy to connect through if `proxy.IsValid()` is true.\r\n     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\r\n     * proxy, then it will be set to true.\r\n     * @param[out] me If the connection was successful then this is set to the address on the\r\n     * local side of the socket.\r\n     * @return Newly generated node id, or std::nullopt if the operation fails.\r\n     */\r\n    std::optional<NodeId> ConnectAndMakeNodeId(const std::variant<CService, StringHostIntPort>& to,\r\n                                               bool is_important,\r\n                                               const Proxy& proxy,\r\n                                               bool& proxy_failed,\r\n                                               CService& me);\r\n\r\n    /**\r\n     * Disconnect a given peer by closing its socket and release resources occupied by it.\r\n     * @return Whether the peer existed and its socket was closed by this call.\r\n     */\r\n    bool CloseConnection(NodeId node_id);\r\n\r\n    /**\r\n     * Try to send some data to the given node.\r\n     * @param[in] node_id Identifier of the node to send to.\r\n     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\r\n     * @param[in] will_send_more Used as an optimization if the caller knows that they will\r\n     * be sending more data soon after this call.\r\n     * @param[out] errmsg If <0 is returned then this will contain a human readable message\r\n     * explaining the error.\r\n     * @retval >=0 The number of bytes actually sent.\r\n     * @retval <0 A permanent error has occurred.\r\n     */\r\n    ssize_t SendBytes(NodeId node_id,\r\n                      Span<const unsigned char> data,\r\n                      bool will_send_more,\r\n                      std::string& errmsg) const;\r\n\r\n    /**\r\n     * Close all sockets.\r\n     */\r\n    void CloseSockets();\r\n\r\n    //\r\n    // Pure virtual functions must be implemented by children classes.\r\n    //\r\n\r\n    /**\r\n     * Be notified when a new connection has been accepted.\r\n     * @param[in] node_id Id of the newly accepted connection.\r\n     * @param[in] me The address and port at our side of the connection.\r\n     * @param[in] them The address and port at the peer's side of the connection.\r\n     * @retval true The new connection was accepted at the higher level.\r\n     * @retval false The connection was refused at the higher level, so the\r\n     * associated socket and node_id should be discarded by `SockMan`.\r\n     */\r\n    virtual bool EventNewConnectionAccepted(NodeId node_id,\r\n                                            const CService& me,\r\n                                            const CService& them) = 0;\r\n\r\n    /**\r\n     * Called when the socket is ready to send data and `ShouldTryToSend()` has\r\n     * returned true. This is where the higher level code serializes its messages\r\n     * and calls `SockMan::SendBytes()`.\r\n     * @param[in] node_id Id of the node whose socket is ready to send.\r\n     * @param[out] cancel_recv Should always be set upon return and if it is true,\r\n     * then the next attempt to receive data from that node will be omitted.\r\n     */\r\n    virtual void EventReadyToSend(NodeId node_id, bool& cancel_recv) = 0;\r\n\r\n    /**\r\n     * Called when new data has been received.\r\n     * @param[in] node_id Node for which the data arrived.\r\n     * @param[in] data Data buffer.\r\n     * @param[in] n Number of bytes in `data`.\r\n     */\r\n    virtual void EventGotData(NodeId node_id, const uint8_t* data, size_t n) = 0;\r\n\r\n    /**\r\n     * Called when the remote peer has sent an EOF on the socket. This is a graceful\r\n     * close of their writing side, we can still send and they will receive, if it\r\n     * makes sense at the application level.\r\n     * @param[in] node_id Node whose socket got EOF.\r\n     */\r\n    virtual void EventGotEOF(NodeId node_id) = 0;\r\n\r\n    /**\r\n     * Called when we get an irrecoverable error trying to read from a socket.\r\n     * @param[in] node_id Node whose socket got an error.\r\n     * @param[in] errmsg Message describing the error.\r\n     */\r\n    virtual void EventGotPermanentReadError(NodeId node_id, const std::string& errmsg) = 0;\r\n\r\n    //\r\n    // Non-pure virtual functions can be overridden by children classes or left\r\n    // alone to use the default implementation from SockMan.\r\n    //\r\n\r\n    /**\r\n     * SockMan would only call EventReadyToSend() if this returns true.\r\n     * Can be used to temporary pause sends for a node.\r\n     * The implementation in SockMan always returns true.\r\n     * @param[in] node_id Node for which to confirm or cancel a call to EventReadyToSend().\r\n     */\r\n    virtual bool ShouldTryToSend(NodeId node_id) const;\r\n\r\n    /**\r\n     * SockMan would only call Recv() on a node's socket if this returns true.\r\n     * Can be used to temporary pause receives for a node.\r\n     * The implementation in SockMan always returns true.\r\n     * @param[in] node_id Node for which to confirm or cancel a receive.\r\n     */\r\n    virtual bool ShouldTryToRecv(NodeId node_id) const;\r\n\r\n    /**\r\n     * SockMan has completed the current send+recv iteration for a node.\r\n     * It will do another send+recv for this node after processing all other nodes.\r\n     * Can be used to execute periodic tasks for a given node.\r\n     * The implementation in SockMan does nothing.\r\n     * @param[in] node_id Node for which send+recv has been done.\r\n     */\r\n    virtual void EventIOLoopCompletedForNode(NodeId node_id);\r\n\r\n    /**\r\n     * SockMan has completed send+recv for all nodes.\r\n     * Can be used to execute periodic tasks for all nodes.\r\n     * The implementation in SockMan does nothing.\r\n     */\r\n    virtual void EventIOLoopCompletedForAllPeers();\r\n\r\n    /**\r\n     * Be notified of a change in the state of listening for incoming I2P connections.\r\n     * The default behavior, implemented by `SockMan`, is to ignore this event.\r\n     * @param[in] addr Our listening address.\r\n     * @param[in] success If true then the listen succeeded and we are now\r\n     * listening for incoming I2P connections at `addr`. If false then the\r\n     * call failed and now we are not listening (even if this was invoked\r\n     * before with `true`).\r\n     */\r\n    virtual void EventI2PListen(const CService& addr, bool success);\r\n};\r\n```\r\n\r\nResolves: https://github.com/bitcoin/bitcoin/issues/30694\r\n\r\n---\r\n\r\nReview hint: this PR moves some code around, so reviewers may find this helpful: `git show --color-moved --color-moved-ws=allow-indentation-change`.",
     "labels": [],
     "created_at": "2024-09-27T07:57:10Z",
-    "updated_at": "2025-01-28T16:47:52Z",
+    "updated_at": "2025-01-28T17:20:16Z",
     "mergeable": true,
     "mergeable_state": "blocked",
-    "merge_commit_sha": "7b25e9006e2ec6e89387242dd15169d19312ae21",
+    "merge_commit_sha": "8a31623a99b662198df8b4473555197c0b4c1f65",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -75,7 +75,7 @@
     "head": {
       "label": "vasild:sockman",
       "ref": "sockman",
-      "sha": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "sha": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "user": {
         "login": "vasild",
         "id": 266751,
@@ -186,7 +186,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-01-27T14:43:41Z",
+        "pushed_at": "2025-01-28T17:18:54Z",
         "created_at": "2018-02-07T11:52:47Z",
         "updated_at": "2025-01-27T15:18:18Z",
         "allow_forking": true,
@@ -210,7 +210,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "35bf426e02210c1bbb04926f4ca2e0285fbfcd11",
+      "sha": "b432e367427f1f9fe0f0a5800e31e496f00cd38d",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -355,12 +355,12 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": false,
-    "additions": 1364,
+    "additions": 1374,
     "deletions": 729,
     "changed_files": 19,
-    "commits": 17,
-    "review_comments": 56,
-    "comments": 19
+    "commits": 18,
+    "review_comments": 57,
+    "comments": 20
   },
   "events": [
     {
@@ -2641,46 +2641,6 @@
       "sha": "fd81820214e695ba228a954506397c3d781fe3fe"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGU1ZDM2ZWVhMDE1ZWZjMzFhYTM4ZDU0MGFmNGNmMzljOWUyZTQ2YjA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5d36eea015efc31aa38d540af4cf39c9e2e46b0",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/e5d36eea015efc31aa38d540af4cf39c9e2e46b0",
-      "tree": {
-        "sha": "38fb519691c6516ef3bc75781ce562de9bd54930",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/38fb519691c6516ef3bc75781ce562de9bd54930"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 38fb519691c6516ef3bc75781ce562de9bd54930\nparent fd81820214e695ba228a954506397c3d781fe3fe\nauthor Vasil Dimov <vd@FreeBSD.org> 1724420200 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736872350 +0100\n\nnet: split CConnman::BindListenPort() off CConnman\n\nIntroduce a new low-level socket managing class `SockMan`\nand move the `CConnman::BindListenPort()` method to it.\n\nAlso, separate the listening socket from the permissions -\nthey were coupled in `struct ListenSocket`, but the socket\nis protocol agnostic, whereas the permissions are specific\nto the application of the Bitcoin P2P protocol.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGkaAACgkQVN8G9ktV\ny7/9Hh/9GptiK3cALOkZhVKrEA3iCrrBUt63TWFlMx/8DPWJyXM5O/SsD5FE7Zw6\nUcvVD44bw3otplhku1CygL+9BlI+VdGiNHXA5WB7jAPW73OrNZpza6i/0e1GIP6d\n5oS3PMnsNocWN3KFlDPeuHkUxLDlQYYWiZJPEjMBXKikJnDoUPXjKxwOaqwmfPHp\nKAjsJlkV5T9ZyfcYsFwKRIr7j/CNnafgmJDaMYiGshZAhxzlkIGt6Qf9vJQlFzLW\nZ97mhPUWOl5twq70fJAIl3i1z26RgKlwdxXeYWdbyzR1Ob0a2GfAhsRJKO5SdLfQ\nJni3g/i1IYlMFnCQu3Yw11cMdo90bMhBFTjil7d0Mwb9DKTU/fz9Y/4i3JuTblMX\nHjh9hWicfmnHrl3myBC9yt8zN/jliPJDyGYSL2L4rFJbBTVGSUhpwA3qb4nESJIe\nYZSa/vLFa/e6VSxzk2KnvrciFqJwmB2/lleTXfSgMFZiZsy97YJ4yjLtsnooPXTT\nrwjlmx4bDjEqCxJa1ySDixJ/xRR8xJmiMX5NONvgS/XpfwRch9DTov9sgnPuTThG\nrI3c713dF2N6Y6kLsDxFKsCr2fsyWfDk+voQzzw5BeqBvd4dGa9fLc6w0FjlNXkz\n99omMD7Zh53BXN/7TJKDdFHlmHGatPy793tIHIJrG8kWurt63N5oFzCLhZ5m0abh\n0UIObycGAfyV8i4fW4Rr3UR7M+md6mGauUoWaZd5b9g1MmtOsyiUNZb/+0eBKMCZ\no1yDixIsJfTZsaUvi/F8aCkEW0loARxj+J3NnkILtgS7RUCYpb/sV6Fe+p2u/d+4\nA/bdQWXYmFFSN+QHBVJp7zP9jO3hoGvBGujB2Xq6v+VCbFRTaFBVwJwiMhVmoqp7\n/iH9v+nKC3ic/feMncrqafQNfyYDDAvfMWcOaf4x3k2rcU3ZoHafV5rqzeVUQ83m\ngvqLuvx1/BmI9Pzflk7wN+tGjvLzpZctcKPgHbEAUIE8dxq3mwgujDv44q0QMAdC\nAqYowjb2Bv8t34wAyvCRzfzH8ltIeh9XCqN+SDDptWgEcMeWyAPcpLVoeG1n5F9Y\nz66M0fWWrwHMM4iwV3FXNhJM9MCx02BMLaAX/9PZ5p26Bj1BrgG60z92GMF+BbYu\n4YEEkx5Cdgt4MsXQju78ousCkvpURk8TTuKkIvzR4PvB31qRTB4IcA+Q4i4sgelt\nlTKNH6ZzC5Hom9CZc+RFQ4ses/AVCbErQA8BqI8vDOMRYahvGhyGFCNKBtnTk/FG\nkwdQvcXUi5mhLZ0np1BBEocoeO0bXTxx1LfIWUQxdjIY5n3EAK4XeYqbDSF0u1Ie\nhKYbiarDHyAT+2QINrVYcnIIMLeIdQ==\n=HX3Y\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fd81820214e695ba228a954506397c3d781fe3fe",
-          "sha": "fd81820214e695ba228a954506397c3d781fe3fe",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/fd81820214e695ba228a954506397c3d781fe3fe"
-        }
-      ],
-      "message": "net: split CConnman::BindListenPort() off CConnman\n\nIntroduce a new low-level socket managing class `SockMan`\nand move the `CConnman::BindListenPort()` method to it.\n\nAlso, separate the listening socket from the permissions -\nthey were coupled in `struct ListenSocket`, but the socket\nis protocol agnostic, whereas the permissions are specific\nto the application of the Bitcoin P2P protocol.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T16:32:30Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-08-23T13:36:40Z"
-      },
-      "sha": "e5d36eea015efc31aa38d540af4cf39c9e2e46b0"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 15926435616,
       "node_id": "HRFPE_lADOABII586YIJemzwAAAAO1Sh8g",
@@ -2799,566 +2759,6 @@
         "name": "CI failed",
         "color": "cccccc"
       }
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGI3MTc1NTBiNThmNzc5MDY4MjM2MmJjOTVmNjAwNDdjOGE5OTQ3Nzk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b717550b58f7790682362bc95f60047c8a994779",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/b717550b58f7790682362bc95f60047c8a994779",
-      "tree": {
-        "sha": "1a0e811830f75451a696728f13281163f8fffa5d",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1a0e811830f75451a696728f13281163f8fffa5d"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 1a0e811830f75451a696728f13281163f8fffa5d\nparent e5d36eea015efc31aa38d540af4cf39c9e2e46b0\nauthor Vasil Dimov <vd@FreeBSD.org> 1726578346 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876213 +0100\n\nstyle: modernize the style of SockMan::BindListenPort()\n\nIt was copied verbatim from `CConnman::BindListenPort()` in the previous\ncommit. Modernize its variables and style and log the error messages\nfrom the caller.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLYACgkQVN8G9ktV\ny7/Jox/9EDP635UVUGbJsX07mCtzML4mG5PQsvDIPVWIX/PrGxNjWaX6hXvv27HK\n7vLgCjN38DBSaOMyYXPr8xB8LsUHt5RZbU3q653cIPDQMy19QlClKYks+Z24xri8\nBMt3/M3pat9ad18AISkHyKFmbw2cLfk4GJDfWtM4o/D0kuGBP9aAbWAZ8pw08TQ4\nChog4ILgSx2BNAbWbhPt6ymg3+JKEpa5deP3JUhBF0BdGx4k34t+aLwnt4Ommh9d\nTLviiWcN99OjJUz6Z9N0vodIGmlkUf8ev3a8eVJEhVx4aJwiw2PZYxvGrR81JYj7\nvpMMkr04CtPqivCOklSZJFpUH3x5l0N13k1W5h9qYQTQikrQW/+ocM/UL9D/zULo\nEcfJiA9GeNk5cDgWL5026U42d9pXQyOGiNVQPp/uD7SzLAbwVbLxi1U5P2UccMTt\n5g1CZy7mG0rzImW1n09Env8jEMiwnbz840uFxX0/KuMTLwgaSByC6H6GvraSXM3s\nzseTg0QzOoBbIdIT203iKKLYx6pSTpybV27B+BBmxFnYyLu42ZYYZlAj9cF1eMxo\nWQaaVzUQDM4+O2m2XOGAI0DUjVKKvs5evzXajxk5tYC4kXlavrjKyjhaNitFe0Vd\ndgLoBxNeKULmPdJnxnoyozEC/7zqVKoDWkgCpNulbVW8SnXsvSBFjcs7G71AdVhl\nFJe6tlXN9wo7xyXOxVIbEboxRxynnn45KPvM4Y+d/QqDBxTGbR7eU/QzQZGQAXk+\ngczT9sGMi0FJ2yn1uz2PQrMxpKRlUtdKXLYq3Vah1AUZPMdTZtiARbqusi4UPCGE\nF1ioCz6yks05vUgY6x+mWbeoy6eDtvwye1/P15MzPqdujzXmH3pv3MC5OVFffHXe\nMrzCmRfLDsmgkVYgaNXSBtOn8fi+T5se3lTAsWicsPcfdJdrwDMd0E0+bblYmSgm\nHn8eTruspKpIYaPnrbFojFDRYs59+XFFitcYuONeF4nrnKdYQQ4IhDeViBSkKiAi\n2xPWf758b0iBG9nBhQyuwYj2vrgWdxuUgBmtk32yIyyz7c2PrvWxGIy8MWES9Y/w\n6Z9lyO/pkK5c4b2EG0jUREcp1/i98UCilCgFKEvPaPG91S/3UKb/bU3H0ZZ2H5xl\nOUW35RI3WdRXZ531A40/CZmSFjnM2YB0NdAlxEpYITG7phFIvt2rJnoCrYV/j40X\n5BVDQb/sVyggXMOgqtb0pHox9r1Z9qttD2WQKOZz6BzC/dMV0De2mz3l9KqUYNtT\n1a3MHmCGsAwvvwUSZRg/dUVH4u0R/5iFiIvmJIhkOav/fIdCM4oZf+o1tBwOpVQJ\nGDVrBJ6pVdpNIcJR9ASY9dXDFa7eUg==\n=WhoK\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5d36eea015efc31aa38d540af4cf39c9e2e46b0",
-          "sha": "e5d36eea015efc31aa38d540af4cf39c9e2e46b0",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/e5d36eea015efc31aa38d540af4cf39c9e2e46b0"
-        }
-      ],
-      "message": "style: modernize the style of SockMan::BindListenPort()\n\nIt was copied verbatim from `CConnman::BindListenPort()` in the previous\ncommit. Modernize its variables and style and log the error messages\nfrom the caller.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:53Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-17T13:05:46Z"
-      },
-      "sha": "b717550b58f7790682362bc95f60047c8a994779"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDAyNDFiMDRjZjQwNmQ0ODJhYmZhYzNmZGRmYWQ5YTljMjg3MjVmMzI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0241b04cf406d482abfac3fddfad9a9c28725f32",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/0241b04cf406d482abfac3fddfad9a9c28725f32",
-      "tree": {
-        "sha": "6974ecac8fc0be60a994eb4104b7a37f6f55d334",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6974ecac8fc0be60a994eb4104b7a37f6f55d334"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 6974ecac8fc0be60a994eb4104b7a37f6f55d334\nparent b717550b58f7790682362bc95f60047c8a994779\nauthor Vasil Dimov <vd@FreeBSD.org> 1724670893 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876214 +0100\n\nnet: split CConnman::AcceptConnection() off CConnman\n\nMove the `CConnman::AcceptConnection()` method to `SockMan` and split\nparts of it:\n* the flip-to-CJDNS part: to just after the `AcceptConnection()` call\n* the permissions part: at the start of `CreateNodeFromAcceptedSocket()`\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLYACgkQVN8G9ktV\ny7/ACx//ZY2uP4hiMqAwZGajmWCQnflMxC+fKAmXNRP0yMQWf06v8GplPTDACWy/\ncQ0YpdoVAunPZTW2UchbUTKXnOaeOr26aE5Boi6LbjB9dSp6EjjNz3VNuVmRq3Nk\nOqUwg04p3DYJlU5IrnpKL+/RDMFhx1CQr3N5+dZa5HZohBXh47HXODOQNOVm5fSl\nftLeOdbcrHM8zLBw/LfSx6aWWGE2lH29DQfIqujaTDTtV3LXSzKUcUY6Jou/IbXE\nsnt8wxuAf4ovty3oifUgRtx17fJjsLmfzg6g5q6NNzp0qUsXN5EbSFdic+ylQQxM\niqHpbI5qQUQAjgt1QEsk+6U5Q79XyoU7+NCcxmVGuc9iDeMzeFzhoxvFJ8f0YihS\n8OWK8+Vzzgq6OZ/5+QOnjekeF0xmRp1JbjsRLrv0eHOKDby+sH3H+7BF95PxeI9N\nvVIso4CVjUSe/XCoPUtPwdJyhayBi05igKdI1cvbaZRbQzzMsIAgLVqSamfiKBR9\nzLZ7fN/XYaIwISB/0iWSurPduhNBhvtGcKtkuNJHPZ/ZKLxGN/jtuudi/ozsM+Cw\nGxF89QlOoWTCN/naJIpW+MJ1jdBRj/etCAkO5jmEw1zY/2w15qPbAGsBepqf4GJ0\nusOpQNESLKdBBZRdCMcgvO67pIGDwzM9oY/9QqBNO3Ch8aClQ2g8Jt/9Rkj+GJic\n8uDyyZTzU8GTWUqB4imVcme51/BdeQH+lh3fyrSakNHCfKgNdraeto6ru2WkpRKg\nS5ZkI81FDf863LMgHYHiOCrSa6OVRsicK2LlMipevJXPmXszTFCUD5d2PCiUVNYE\nan2bJ21cT+Fs2c8p3IUm4Ajmj7Jt7Lnb7aBBuNyajOj7W73cmg1v1fC7HDMTYWEX\nDUVhHo/SRrHDzSn2pX1+Tf0y0NDWMyKmZJakndPeQfzpkJkSuVJQScdyRnqokMG8\ny/BtCqDpUm1bJ25YQLJLxoVy4IJTTReM3aE7Xx8nuxF65xk2uwU+SfQk4yrUdLyr\nPvZDJOjf/EqM8G/HAr62SFbyiXIKEUFMMXbFbySApl+Zx4hSbrCXVpDRUzHO60j2\n01qinkqWqNgsrEM6p4qd+E8hLwS/HXXziDiKDRfz42qHQuvOcLhyMxDzcVFYb7Oa\nm60NvdE80FOKnA38TD97hIzSzty0AOvf4YOTaYG+p+p0MD3SW1NijW4HSWTW6bxW\n60fQGyx9mz24zcpAYHQCvvdOvv0eN5LOdUkXd++I8VRLHVuS+Awh1bWHA9fsWeNJ\nnXpKOldkDcY/XGeCDwAfCJwoJRG4xFwU/x3SZKYa43sBCYFLLabIP1UNKX2E/mbE\n9Hxs4tNUhl1wEAjzoGKQFKjE9hxMrA==\n=y1Uv\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b717550b58f7790682362bc95f60047c8a994779",
-          "sha": "b717550b58f7790682362bc95f60047c8a994779",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/b717550b58f7790682362bc95f60047c8a994779"
-        }
-      ],
-      "message": "net: split CConnman::AcceptConnection() off CConnman\n\nMove the `CConnman::AcceptConnection()` method to `SockMan` and split\nparts of it:\n* the flip-to-CJDNS part: to just after the `AcceptConnection()` call\n* the permissions part: at the start of `CreateNodeFromAcceptedSocket()`",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:54Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-08-26T11:14:53Z"
-      },
-      "sha": "0241b04cf406d482abfac3fddfad9a9c28725f32"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDg2NThmODMyYmE1NTAyZTM4NThmNGQ4NjM1ODNiODI3MDQ0OWUwNjM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8658f832ba5502e3858f4d863583b8270449e063",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/8658f832ba5502e3858f4d863583b8270449e063",
-      "tree": {
-        "sha": "93da76d746ca5635c50447d13abaebe5bc428d81",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/93da76d746ca5635c50447d13abaebe5bc428d81"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 93da76d746ca5635c50447d13abaebe5bc428d81\nparent 0241b04cf406d482abfac3fddfad9a9c28725f32\nauthor Vasil Dimov <vd@FreeBSD.org> 1726586947 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876215 +0100\n\nstyle: modernize the style of SockMan::AcceptConnection()\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLcACgkQVN8G9ktV\ny78+TB/+NRYTX+K6j7g1SgDmFxfaE0mtXn3DfyVjxrwybZPa9IneRiNIVsxzd4LX\nbVyu9nbfvh4cmyUsn9pVnMedmQ5Twxim8nKwuCssCm9VRNET3XQQ+XTPUp9VIZeQ\ngRblVLpL5l3rb69mtKBb2adjb01CCi6wjMsVp+ONf2CLjaTp6KdRIBpKtWBQsWmw\nPGyhzXiVHfvQjHa1iY7zUrVg1bQw3XHSYzSU/OMz0RabWiGrkYSr83Rzk3nviQ7m\nOn7tnjoVY0XSiAa9alQ0c1AJa110zlmkAIicLVq+TnmizpD568wGHixe2wOrM16b\niD6y7Msq9AtUTVhyGUzgoV2zdPdsNtAsCj45sZiALPeq9G7eOTv/DoH3l2JyX5LS\nQVlszwghVYIGDiWKC6M90MO133J2PrPg+HZw5onjuo+Y5/VqdnSnwGQGDqSICO72\nTj5mWx9v9gZLBM5FDxe0xsTNcJvbk8FI5n9EsxAadTPFVY3ZxL1GM9tA3lyY+v81\nOeVdzJlv29N72Vk6iilSxK5QWfLIf6A4HS8O4/vulBK8xsqz4xbmjxfyAo0XIR0V\nrldjOuaU7kkS7JrgvF54Oubr9ZzImehpo4k2B37Ba0dQlnt4MJlcsqoFKI2281hk\nxoyX8q9k/NoomFfalypAfdv6JEFMYsJ6CLw1+6aJBtlly/jPmMqpExeYfyx/U2pQ\nfeiLrd0QAVJzY8vfZj28KxbAp7cw393mkmJATwE7f7rrABJqGVXTNPCsrLeYdN8X\nVQS8X6CCU5jZZKA/JtPDM4kaK5VpHa1YyVaoLknyRm4jCKV2IowN3abnrkFuYdbb\ncl0Qii7F1Nq2wnrqnVjtzwP/qh5A9vF15yUvphPA1S0ytFjEcEJDH62fH9qkkNDz\n2twfAdPJ9MBkp9ciLMT3c1VV9TXudyKFpjPfJa66+SdO0PKUXJhPdCwYD4HDLrUT\nc2NJHzeCvlGyIM+CdDGYMYzP5f+T1hhE2vuaHUUoKRXAXQ++gA7iz+dFdnGtjfZw\nX2RCtfmRlJbqwFZz5ibHCSXo3qJ+QV/L7Dyc0pWfOJ6UWknN7/+MHLS7YK06AcYI\nTjag3Ua9pK4/0tMsN1Uc7jhgiXvMME9iGhIft6C2iY7kG9mxA9wYdjJxfj+Ty/Kh\nKMzn5qJ40eseiYlok9U9eo4w5wxc7iJLLOplwTDXSHYCiX3JyHTQxcL+kACCGpUr\nW9aAAmTxpmg60T7N8H/zM+14wnuCuk2GYNZDStA7xzske1PHkCp5fY7WjIZmVivS\npBahzMq+eWmDfeIPH3pgohfsbyC0FsJRGDzAweHhDFD4QOlCNJBwSHsJZNy4zXRH\nH+/uXRhmlvzanartby/sxsQY6YmXSA==\n=BhK5\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0241b04cf406d482abfac3fddfad9a9c28725f32",
-          "sha": "0241b04cf406d482abfac3fddfad9a9c28725f32",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/0241b04cf406d482abfac3fddfad9a9c28725f32"
-        }
-      ],
-      "message": "style: modernize the style of SockMan::AcceptConnection()",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:55Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-17T15:29:07Z"
-      },
-      "sha": "8658f832ba5502e3858f4d863583b8270449e063"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDFiMDVlMWQ0YmE1NWE0MmJhNzQwMjZiNjhmYTRlNjE2Yjk3M2UwNmQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1b05e1d4ba55a42ba74026b68fa4e616b973e06d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/1b05e1d4ba55a42ba74026b68fa4e616b973e06d",
-      "tree": {
-        "sha": "31d30f95e99ba8cba4dcd3b80c916228d76fad59",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/31d30f95e99ba8cba4dcd3b80c916228d76fad59"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 31d30f95e99ba8cba4dcd3b80c916228d76fad59\nparent 8658f832ba5502e3858f4d863583b8270449e063\nauthor Vasil Dimov <vd@FreeBSD.org> 1724750724 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876215 +0100\n\nnet: move the generation of ids for new nodes from CConnman to SockMan\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLgACgkQVN8G9ktV\ny78doyAAjPZ+jqqaqkhGId9/zNTi1iFotel/Gh014F8Ue3XEgyZ1P9dAE0kekiqN\n7ODmCw0W50MgJ4b95Mz3EinVebvPfFhInZcqvD3BA2YnuVzT8DW7dh+E6HwTYQZm\njxCtcWFjQossuWD5Jrii9EIhjCHy3rD5kaa1xyMynP0OicwLPBAk5b58m9iCyp8A\nxwalZxT3iw/MuJiV5mCaoGJ8wRFpxctTDEU3dX5qT/KnwtnSwL+OZBps+DC6aX0a\n/0M8a08pWmQXTfQ/lBc9YSrSu9DrQ0h8QtA+845Gcheb1rO+mWC1TtNuP7V+YmW8\nL7F37kEqOZTliMaAQaWiuZZqQw0yiUqZAhdVSXRDlBTC9OUhHHt5x/VyoJpoIf5G\nya26YT439AyW2jzlSpBSwpIzylcHmdP10s8jfLDOirGO6AreKqzM3wSlV+GQ91SO\nCszoVAvuiJzKvnsgGeMCiL2t1QHAWv8Sc1x6cdfH55yJQEuWH16bTd6TFJjhII8+\n8R0SDXcGuKURBHDjnY7MnFi9zyt/DXRxp/UNMmh8Xfm1XMZlng85HCpwJsR7DClF\nN2pHMu6umzfAbihY7j+vkvrFuwZ1w7qIYUxuLS9+jaHUfoTF+gDb8PJTfmBfioFl\n408AHK+9EtEmDs77K16wXUow0fC+YfgaSwaAYuOLK7Fu+chzBTPrvdJzNH1xmVDF\nVUCEw/9KhjKbL8MjjWm6h+EabCWOLn6uL/qVG6S1EnvCxspnHbZeIm3LLEAse3Xn\ny/NXcvp6pOUjdNYQMGfWlLEzVm6PGJQlIOKXH1G8Cv8FWorvrkCo5QixzfRak60Q\nWsLpqUZ1xDvqpC6oC+dANAN+hgHWe5b+Nvv4C5Mznc0ZKiAj84TqlpV/reNtNafo\niaEUTxR9IJIPF2WgqXN/kjzOKZ7z5NfRjkrELb3nrXeDqQOMoCBlbRHQlXZN0F/c\nfN6eNuoQtehNnniel39SDG6mtxuStNknLuTmtycPN0Ag+qg7FryuUkKOhD5jB2ZV\nYJZyZbaCYhnffI8EFwVKDCy7zDBpZQMF0srHfOdxQDUjdvWI0SwKjBsIoooGSdVQ\nBjSik7evd0ubXGEIqL3wRAx+NMzUouV3FqNqkOQ34l3+jfjQAFH7Oa2IppIUD/zn\nFN+5mp2w0GEVc8Et8XKlIuZaQr9JqRA0ObY/4eF+k/dyqWU1ggc3je5H5DRGAV3p\nhKFAo5YlY/Aa9mTbS9iSMHGSel0OS3yTt3Ln3irBaK2fDcEaHTatvFb+S/Mp9VEy\n+G54VVPLjqqvdhMxc7lpWTq+pEueOHNC+IgUgIgGWmq893InSaaUzut0F0sy2Wh2\nKL1QcvPBXyrvouHo1X+YdMxNvur1mw==\n=wwLb\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8658f832ba5502e3858f4d863583b8270449e063",
-          "sha": "8658f832ba5502e3858f4d863583b8270449e063",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8658f832ba5502e3858f4d863583b8270449e063"
-        }
-      ],
-      "message": "net: move the generation of ids for new nodes from CConnman to SockMan",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:55Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-08-27T09:25:24Z"
-      },
-      "sha": "1b05e1d4ba55a42ba74026b68fa4e616b973e06d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDE0ZmNlZjZiMGQxZDFmYTkzOTVmOWFmMmJhZmJmM2RlNjNkMTRhYzI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
-      "tree": {
-        "sha": "abb1d428b496fbf8fc397da29688b770f723ba89",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/abb1d428b496fbf8fc397da29688b770f723ba89"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree abb1d428b496fbf8fc397da29688b770f723ba89\nparent 1b05e1d4ba55a42ba74026b68fa4e616b973e06d\nauthor Vasil Dimov <vd@FreeBSD.org> 1724767895 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876216 +0100\n\nnet: move CConnman-specific parts away from ThreadI2PAcceptIncoming()\n\nCConnman-specific or in other words, Bitcoin P2P specific. Now\nthe `ThreadI2PAcceptIncoming()` method is protocol agnostic and\ncan be moved to `SockMan`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLgACgkQVN8G9ktV\ny7/B8h/9E6FuRBnSYNF6r2AYHbH4hEsmdgT6AKMsHMC4+8/5rNbtiGoDsuPPg+6k\nzdjdF1K/tbce7AIps0dAISZA7LEXlgtTkp7ojLY4GpP98U/t0zc6w0v5HbJLzjI9\nbsTuNG4sBuq+up30QdXt7UjL2HQEIluDTQ8kO9m6MHrmtt/WwZ8y0P9Ujr+Jr1Oq\n2WksDrKtoaO5Lpmo2Pg9wEA3dfV9wCTx7HKJK52RMBv05mQg2OCwWImMmmEqMfGi\ndK/UR+24sk0C9uH1NVh1lmBLgLG3kNqF1c/UyDm6exhi9LFMf5glQ4Fn4wmR0USJ\nTW8Kg7T0WpBUjMOko7wzwCQegYVyhEEFREa0ICi3fVrdF5bbC2JXXxhzBfKq6X82\nddbC4Yd1Ihet5xSV1AZVF+yjn5ZVk0z+qMKS0msBM9XXqLFK86j9x0m+G08+h/00\nZUDK2g6orCEgv5Wd2jN/nSdDT4/6OBCYnb86PiL7ga5KvDU+keYWkHt+UI7iwXgD\nobOxqMjKOZYveXxpPwF/qDGRuA4ZDSNFD5M1cy3DfbMMg2y/LxX2TjmiSME+UKad\ne1zEzwVO95vhvgmTMq3BcG8dfHqHRVYdT/gPPsR6dUiGrm9bTT8eMNamNgBwCcCe\nj9Q0E4uPqG24OZq4iLMQNOnlta7KbvzOMXm8fxgI0O1j2wWUvKSUGrltK/1KY3ve\n343ToK4qjs6hraWzLms0cnFFGezS9DCrz6Mppxk4SBWhh2poCjKK+L2LvUaL5kv3\n6GEgUO5aiRjOD8PlaPETJZVoLhgDs4Oj9BIu69H/mfwtsZk9aMsKNea7tmVO7jBQ\n41Q8JuzDNd4Wi+UqFIk3j1FOYXRAx+2uCM/C0omzeZVroVufN/G2zP+rua059x5v\nELIIeUO7rpjCWYNBGEhUiS+/9+U6itk2bFtSV+SjnfBX4zTZq1AfLz+moNgh4w+U\nCqbDkVOyygGk7rk/6ZDvUKZLBVrnXVN3PMleDb4gq60prxYKr5s3SkdfPp5c0AlG\nP5qGb2VAO8dw5NOhiGFREsoiPmblb9vs+tNsy59b51Lmo0Re5cY/3F1vPxQBj/Up\nyPeiK57j2Kl5Ie/4SQCkfj7T1uB4bGi1lkQ40QUM+yb6mz/ddzU1zPpy9vWSsjWW\nqGzkQ4TsgT4IuMOb2mHo6sqK1XJYzs3hkI7FhHHfMjvolvLe9LZjywFikPkkhxVM\nzJwAy4xu4VMfes5yzYCjoRBhYyKqJo7saKNoY3oAxqOk2eaKEm9SvmVksDed7X8m\nn/60b6x6N+z3f/89GxP4iQxV4GUq92a2+agw/KPZ6Jh8zsxdFvYftb63VVvLPjEO\nYg7/PRC96epAaoSGm6iQCyFPSjMmqg==\n=shEs\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1b05e1d4ba55a42ba74026b68fa4e616b973e06d",
-          "sha": "1b05e1d4ba55a42ba74026b68fa4e616b973e06d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/1b05e1d4ba55a42ba74026b68fa4e616b973e06d"
-        }
-      ],
-      "message": "net: move CConnman-specific parts away from ThreadI2PAcceptIncoming()\n\nCConnman-specific or in other words, Bitcoin P2P specific. Now\nthe `ThreadI2PAcceptIncoming()` method is protocol agnostic and\ncan be moved to `SockMan`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:56Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-08-27T14:11:35Z"
-      },
-      "sha": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIxM2VjMDdlN2ZhMjYxZmExMzk0OTkyYzJiZWNjOGY3ZjZkN2FiNGU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/213ec07e7fa261fa1394992c2becc8f7f6d7ab4e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/213ec07e7fa261fa1394992c2becc8f7f6d7ab4e",
-      "tree": {
-        "sha": "43fd0b7d9c39e2162816ffb68e221e4d111dda98",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/43fd0b7d9c39e2162816ffb68e221e4d111dda98"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 43fd0b7d9c39e2162816ffb68e221e4d111dda98\nparent 14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2\nauthor Vasil Dimov <vd@FreeBSD.org> 1724768611 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876216 +0100\n\nnet: move I2P-accept-incoming code from CConnman to SockMan\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLkACgkQVN8G9ktV\ny7+Zeh//X1eIXP2Dqz5Dxumq+Fk5flxLhF5x4bbje5f5Y8SZy2D8Z0SDrVzI9nJb\nVpQd8/mS4x8yYFI+BdVoeVAQQ5RlresS4qmE3uvErmRjFiC7UPbeB3mOBskrUIgi\nIoiNiK+3btjxe9cqKyMA7E6Pga25NNizisE7paFirCA4DngipScnmqfOetQEIIXM\nPHqqmb4+j9eul43kvr1kvDKzHvZBybq+mKV+Cn7acAQdvmuCZuCfWFlSE5923fH8\nMEElrmwI6ebWQ6vt8t8pA5lhXcAN8tmZXg+a/QKwx/j3fZSSoyXv954V18rnJyqC\nseT1KKtgmFHspQZS19gUq2NTBpLIkA648d0jyKjjq+caQ9aMWIOaTR0z7FE78rXZ\nvymQ8gNP6wEgF3gQrZsEbrQDYcM4whNHWShd+TZVvopKYD8D0maLeW78KARVKger\nUs8xxrw0VZIoOKvFImf6Z0BhaDdcfSUaHLn6nnOwl8xOYsgskBgOhOABtNZhRhbM\n7+njJ894aKNNi73Kh37nKj5WjYiTv6rizQ1ropaHGfFZ12O5RIeFHepiK9uoVR42\nHjxIYB3t7JXlVKAk2H9kp5nB6aqrZS71rJ64A40Io7uS6WxtJwuYg+6d/J71bgf0\nynega4l1xjt7vT9A+TJeWa6FWdT/+4Zw6aU72XwezZ6UBFQQPq8uAPoVMpZmF6FL\nmEfJlpU+kIVguEgR0IvjEG2v97/OSAuSXLVjrzkX4hO7oVkDBVW2r6L5H+5agBI1\npOSh4E5plqQE8ukHX3Tvb2pTQfeR3jYuyHkJZRZr7+dVwcvhal2dp2ViVvxrAFs3\nqgPUC2CT0wuCClYz1RRvxmiZn9wSAuTyt71duP+YCxkhM9uWIxQQml4Iy1CpoiX6\nZVs+30fSuzwDV+cIHQDhqkSMESP3/95AoNPkOLS44Mb9csrMyA2sQqpkVPMSsVNP\nmHnVBjxQPA6Mq4YzUQcHEnSxzz+AP3Ml/2iacWQEMZMMeqvjKcnV6/21igHJ+T+r\nwyvnvDCnOSql5xIEhTe3Z+GUSdJPPt1kFHPHK483vVEsvXpbOF5FY8o8yPTun1y2\nF+ng4W3LVl9hetXaEUU/DwwPeRctbrvL4R4x/YGksLF5XFtnRuYOyNkn2s82Xa62\nkql3PaPPJ6YWaGN/rjdp80pX8+MCWqaci5CQtOeey/lkfldgqfhoEtA0Ep2335dQ\n3gEO2u7QYD5ZMtobBZ6XCTpbRrZSBoj2En1xVHb3uYnfixUo12qhjtXHrPzPKd+X\nQMYJchwLU1uiigkVgX+U51C+5x/28m7iZibji/r2Eqg/yuWDpmTBifZsOtdNoeL+\nYoYSZ29JU7TbayI4mqqAUD4S2oQABA==\n=DFNB\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
-          "sha": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2"
-        }
-      ],
-      "message": "net: move I2P-accept-incoming code from CConnman to SockMan",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:56Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-08-27T14:23:31Z"
-      },
-      "sha": "213ec07e7fa261fa1394992c2becc8f7f6d7ab4e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIxYzVlMDU2MTljOGE2ZWI3MzZiYjFjNjE3MjVmNGI1ZjY2OWZmYjQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
-      "tree": {
-        "sha": "dfbdc447aad3bc8c4cdd1b28636508d175a6e5cd",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/dfbdc447aad3bc8c4cdd1b28636508d175a6e5cd"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree dfbdc447aad3bc8c4cdd1b28636508d175a6e5cd\nparent 213ec07e7fa261fa1394992c2becc8f7f6d7ab4e\nauthor Vasil Dimov <vd@FreeBSD.org> 1726831648 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876217 +0100\n\nnet: index nodes in CConnman by id\n\nChange `CConnman::m_nodes` from `std::vector<CNode*>` to\n`std::unordered_map<NodeId, CNode*>` because interaction\nbetween `CConnman` and `SockMan` is going to be based on\n`NodeId` and finding a node by its id would better be fast.\n\nAs a nice side effect the existent search-by-id operations in\n`CConnman::AttemptToEvictConnection()`,\n`CConnman::DisconnectNode()` and\n`CConnman::ForNode()` now become `O(1)` (were `O(number of nodes)`),\nas well as the erase in `CConnman::DisconnectNodes()`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLkACgkQVN8G9ktV\ny78Z2R//UUIrNRyzuCtGJnpRDf7vj3dZj8hUiqAHH9/ekwNyKiOz1j2h3wO/bvBe\nDPEIqq2409DbwyNWkICB4J8qipOUcg3BpWSej6ce8MPJKoJmjaszxTj8mNeS4Cn/\n04ubld6pf53R307wkwj+P7Jx/KwwyhyYOH8Srajy4omWLGQcvl/UGzIGjbniuK7p\n48ajfXEemibJFvmW7pMRAdIPZfusRMviUqBwG/ToPNNDnQCHMoJXxx26otr2SPHI\nTYXLGc2ARJCT/y90IjLxuTgVq0apn3kC+CTiSHiZ/1fQkBdPqmWtTsyCGVg2lSvH\nuQyJg/uMcCXzeGUSRgmnoSgK6WlNRnde27CwsSNBSGmpkTMweLrZLJkWIJ0R0esT\n/GggGA2l6Thgfb4ofVEFgtJTStLwlPRi8HT3OGaGpWuT3hPbY/b11vLvqP7tIPzz\nJul9SFQdJMd2HESkkI6hfaTL5pQy0EGi5TkUDIWImAW856a6OoDRjukiucjqWIIZ\nkJG+hjpopNezcdFEx7m1BqivnhZwpVkufIU7WMPmM8jRYr42lOeQ34scYcKOwExL\nGmCexQekvkQxjWHvozZUTigLk5vTWxPTHUp8z6W6BhOG7M5cCWRrUaKQwDKkR/4h\nFW5Y/ouufZGA9CffsZJ47IRWwtQlWSQE6qVf9Z8rmcwj+a1GmoDizI2OVcdKXWDD\n2D6p9sbgC7Lo/hSsR45JIpGh2ghMYGs/8sjmqpWMc8BOmoT2fpnuEmE9nrO7SmY4\nlAtqjko0ZcJj1/Q8No6CqJn6NENSlRNyzV2gSY91sOj6Fg+49vrw04lGvWavseF+\nJ6RGjUySH3B+7UHwvkOKm8Km3bxXLymc4S1MchQBLJJ3Ho9VeOxdMsDrfU3zVkVz\n8MQ3dzikfYtP2gW4LjioFqEl4AX43pIavF9WnFmoEq+e+bw8/NXbQjBUj2a9bc8T\nQwoc77nY5HNwWdfeT/91rOgYq03YgHpBg76GIEsgnM0liPm+OYjKmlX3ScmdENSr\nt7HiC8bZhWNi3LjXKpGw1nDCz8cS7nWD1MTSLH6aWusBBC+QT4fxTJUpgyc/wc3j\nTwUd/ZQk+BdEgkGL0nneabH+Mdggq41QPAe4KXEqJsmmkeYtL24jKpgjG2SCbc7N\nC4HQPQ2N5Vtlawjn40Ilo1sWprjYJKmAcoaIXp/Ej0RKXh09G+diqea+8WFJtoJA\n5s2MPn0u/5G/PcSSrTQaEkFoFqUL/MqAp43RmJGKei0MJhuw1uqIGEbuDoF82+9V\nwNFMFDI6Fm41JpbzN4z0neN+fifgElnxVmEQU4ChIAigmGfWzYXD2NdW6UFYCNdb\nPrFOuQAZOCIYtaIqQnXGPOwi/Gza9g==\n=QOeV\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/213ec07e7fa261fa1394992c2becc8f7f6d7ab4e",
-          "sha": "213ec07e7fa261fa1394992c2becc8f7f6d7ab4e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/213ec07e7fa261fa1394992c2becc8f7f6d7ab4e"
-        }
-      ],
-      "message": "net: index nodes in CConnman by id\n\nChange `CConnman::m_nodes` from `std::vector<CNode*>` to\n`std::unordered_map<NodeId, CNode*>` because interaction\nbetween `CConnman` and `SockMan` is going to be based on\n`NodeId` and finding a node by its id would better be fast.\n\nAs a nice side effect the existent search-by-id operations in\n`CConnman::AttemptToEvictConnection()`,\n`CConnman::DisconnectNode()` and\n`CConnman::ForNode()` now become `O(1)` (were `O(number of nodes)`),\nas well as the erase in `CConnman::DisconnectNodes()`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:57Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-20T11:27:28Z"
-      },
-      "sha": "21c5e05619c8a6eb736bb1c61725f4b5f669ffb4"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGRjNjM5M2NiOTNjNDg1MWEzNjNiNjlmZDQ3NDY1NmNhYzFhZTNiM2I",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/dc6393cb93c4851a363b69fd474656cac1ae3b3b",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/dc6393cb93c4851a363b69fd474656cac1ae3b3b",
-      "tree": {
-        "sha": "ab92289ee9a376807d95fffa526e99254aeefbc8",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/ab92289ee9a376807d95fffa526e99254aeefbc8"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree ab92289ee9a376807d95fffa526e99254aeefbc8\nparent 21c5e05619c8a6eb736bb1c61725f4b5f669ffb4\nauthor Vasil Dimov <vd@FreeBSD.org> 1726905934 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876217 +0100\n\nnet: isolate P2P specifics from GenerateWaitSockets()\n\nMove the parts of `CConnman::GenerateWaitSockets()` that are specific to\nthe Bitcoin-P2P protocol to dedicated methods:\n`ShouldTryToSend()` and `ShouldTryToRecv()`.\n\nThis brings us one step closer to moving `GenerateWaitSockets()` to the\nprotocol agnostic `SockMan` (which would call `ShouldTry...()` from\n`CConnman`).\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLoACgkQVN8G9ktV\ny7+EBiAAi3EBs2tzstz3V9g/POD7uUXKPOrCoaHHczkRtuJD++wlLarFK8NphrZe\n9Kw5L4mXNpAYy+jVuybma8ByynNYcRqaE3oe/tLo8yAm6+iglUuL421ZyxoZCVkw\n9R9OI2knJ0NnOkk/kM7IsL9eMmwM/eCVJUx7F7Hbv9HMadTsg2EjAI7peoyWTUXv\nqAVS3N6keEInpYEuGDyL6bqVZwMTfg2hIm32cqYEYzmHRu+RG0Fx5L/afE6oTM9E\nmYkeU55xccyj1auwuvcOrPUvwsGKV9vku0WOKdItwHeRueW1W3hHXPuBBDzJPCSZ\nIUOlxc8i/bEGcmEW/kbtxRfZJi3/lsWvRnaLOaqKim+1GmvPwegiinDkYAedXUax\nMRVSMBoqV7hp1fcxsgmvI9U7s2Yk2PEQXi+XyTBrJJcHQA17sfrvCg/4y997Ryfr\nQkK7khiYKRKrFJAyRa7Ia8vWydtl1+RU+qUDxCwSvtXcgTTpB2nivuzeh1UFOXtz\n+KaoOn0GF3uMzFt2ThKVFXCh5Uv5+UYknmHvA8l0kHQrmfWfwr9cQ5UUBuX8H+l2\n+3G7TtPXhakxnmBqC1QEbLt0xcCCbrYKS79g1/LI+5Y3AHH2ivfQV5O65JIf2vYL\nr2N2MXJfrh8tpGoBZ4DV8hFkyipp8Yvk2iirhTAz1PIc5+4FmP7+8HoadqQN/tDy\nn8W18fx4a1cEgCJt1SVGCPo4LbOem322wfNnhEhSStT2Qp2Igrq4sj7rlXsUi7j3\nYQ3jKv8R3lc7ZYdc8IEfHSq5fvLxtt9Gqqiqf3/tm4dilf3WsbGvuibSbHdjrR+j\nUZiBqUepUrbcnbDd9vz96VaIi6rHlTb55IQkI1F8n+zbDllZkmsj7zaUGj/uwrXk\n1MbROYscLlWPjRtRIr3418NndLMtfShIf/fYmn4VbvrpolNvGmfwh4hAJCoImzrH\nycXSk03JWa03BBcgk8CLy+3rThFVscTr8OkxEdwxiQPkKRCZyqh0OOTmIaJR41cm\nBDHADO//v92XItSQPwRuP37Cm2XxBcUmlI8eD3Yu3yxWPYDQiFV8OcU/eMGFC878\nfJtl+Qwf/aPokHQWMO0qqpX0jJNVP9mXpj/Y0tSYmaTx7A1/OmL39yqm9bAqyyzq\nM+enixDSnW37GpvhtGv3z2VxZuqH9Q2PgloSo7Uy5z7Ie91+9svzHZ/XbJcDkHoi\nDKZl+D2Ry2vmw1XY9L2cnjfhRKI58GpmSboQD+1yHOlR/7OpNXzbHxVgqhY8sehf\ntQG6uBYjnXfdsxr30V+jVc1Josg2zP2TUSN22xZGnAgUWjiS+l+aKQIoGAbNMeQf\nCJwHS1u8g4chJe0UY7165WvpXUn1GQ==\n=J5oV\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
-          "sha": "21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/21c5e05619c8a6eb736bb1c61725f4b5f669ffb4"
-        }
-      ],
-      "message": "net: isolate P2P specifics from GenerateWaitSockets()\n\nMove the parts of `CConnman::GenerateWaitSockets()` that are specific to\nthe Bitcoin-P2P protocol to dedicated methods:\n`ShouldTryToSend()` and `ShouldTryToRecv()`.\n\nThis brings us one step closer to moving `GenerateWaitSockets()` to the\nprotocol agnostic `SockMan` (which would call `ShouldTry...()` from\n`CConnman`).",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:57Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-21T08:05:34Z"
-      },
-      "sha": "dc6393cb93c4851a363b69fd474656cac1ae3b3b"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDdhNGE5MzA3NjMyYWQ5NWEzMmE1YjIzNmJhNTc1YzY4YTQ0Y2ZhNTc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7a4a9307632ad95a32a5b236ba575c68a44cfa57",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7a4a9307632ad95a32a5b236ba575c68a44cfa57",
-      "tree": {
-        "sha": "02918ffcf822e35e759e29293db281b82565eb63",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/02918ffcf822e35e759e29293db281b82565eb63"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 02918ffcf822e35e759e29293db281b82565eb63\nparent dc6393cb93c4851a363b69fd474656cac1ae3b3b\nauthor Vasil Dimov <vd@FreeBSD.org> 1726907513 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876218 +0100\n\nnet: isolate P2P specifics from SocketHandlerConnected() and ThreadSocketHandler()\n\nMove some parts of `CConnman::SocketHandlerConnected()` and\n`CConnman::ThreadSocketHandler()` that are specific to the Bitcoin-P2P\nprotocol to dedicated methods:\n`EventIOLoopCompletedForNode()` and `EventIOLoopCompletedForAllPeers()`.\n\nThis brings us one step closer to moving `SocketHandlerConnected()` and\n`ThreadSocketHandler()` to the protocol agnostic `SockMan` (which would\ncall `EventIOLoopCompleted...()` from `CConnman`).\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLsACgkQVN8G9ktV\ny78RPSAAkXMNP8MZufC1TEBLU/PaWWwiI7TarYrOn6FdLVM6WeolioOWkxdWOaAN\nKOH85WtZm4tXWcOCOL9vJmcOadSQ3MjH01/rBCWihiQ13VvKwqCzW+vU/ioY7wXK\nqq77LLajWlV4LuRdH4NKJtCBf8bfJNYkDrrHlmr62Ka3j+P2lm2INY/zoz8bDbk4\nK49q4Ki54DKY0qlLnyBUFy5Md20u5hDn39Ox93dYIT7RUjY/A5D6wQuZm/Q9ydji\n4IWybRpBuQ604cn1CX/kU3EN51mDyKTAFjZbD2wXGu5NZKqRqu2Rw2K0cJYb86en\nwhhW7LN42FDsgtuqrPS4tAyVdxzcNf+wA0CBc1p/XGhJijrf8khbTrgM3r+DkqTT\nZkFuiPezwFnLXZ97hxy/+gaKjelrXpzH03JY6iwc64tBWIerGQ0OBK3twIG+rs+h\nLII5P23jaODy20sb2c89gokPY8zvZBF6B4+lwSEhR1cPRI9oWbPWMtkNkybJMjTb\nYexzJzsQYidhkmG1jDEk1JIOY+miNP8R1fHKGWklmxgem3lYM8l0o2+tVftSquP0\nbmwQ470aHdSQaoLZuNXPaKLBdCBlfSMvDgFKxZL0oEJBfGj/BQV+QD6cPYuWRqQw\nSV1wULPVf1E4qCz983vZqFPeBc1O1aZ6+tHOinldxWr8mixQyBSaFFMXANOele5/\nZbs5gB3ZFblhZvGddnDgJXQGKY0wmg9x4Mr/Hd8KYbQ73Ivkr/76EqaOq7Z+AAR4\n9lHqSviUq1fFbaZRHMRH1w/GEJJSff1qTar4bs8IJ/xSImcVAW+ZU8kW86rTvFxX\nzLFA4dNBsBbzCfy9T2uTFB9darYkgOr3iWcssz0jbVv3dkVoCxTg5YWP5Bx3QI7o\nWBLpFFAf2GNTPF/zOaaZthIrWbGFHt8OiDfuZSONyFDXYcWwbEPknc1mBZUFdblx\nGSBLYz6rd1VQdPF8ljcx4Mdr81WoELOn1jYp0i60nm20EUcDfm/Hr4r+t3Qii21w\nbs3+oqpNnQ7UEdJ7xKt2qEfftU9Elhbm7jAmwrRtMI0bSzAFAe/x4sj+t+1rhEDr\nHtZfjn3AUsDZvQVnsYO4pvGsCbmgtFSA5n+iDi5wenIaHP8FItJNxCCIfSTswnpE\nfXo+cj4yq9GMgMyxhpY3wOOl3Qrk13uK0JzFQc3H1W50NQHAC+NG0WUlxoNS2KLl\n+HAxM0rV3AjXQKH6E3qXELmeNA5SyBZAJw1on9HaUNgpAZpKvqO9Oof4zP5lWABC\nmKLRzFOfgKQ+x7+bU3oE0NrLsTEFkf/L2t8sUf/rmtPnTHS1pX79G8CIpULhRL5/\nje8JW7OFW5Ly4hMkUoToiNmgwk76aA==\n=MlPK\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/dc6393cb93c4851a363b69fd474656cac1ae3b3b",
-          "sha": "dc6393cb93c4851a363b69fd474656cac1ae3b3b",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/dc6393cb93c4851a363b69fd474656cac1ae3b3b"
-        }
-      ],
-      "message": "net: isolate P2P specifics from SocketHandlerConnected() and ThreadSocketHandler()\n\nMove some parts of `CConnman::SocketHandlerConnected()` and\n`CConnman::ThreadSocketHandler()` that are specific to the Bitcoin-P2P\nprotocol to dedicated methods:\n`EventIOLoopCompletedForNode()` and `EventIOLoopCompletedForAllPeers()`.\n\nThis brings us one step closer to moving `SocketHandlerConnected()` and\n`ThreadSocketHandler()` to the protocol agnostic `SockMan` (which would\ncall `EventIOLoopCompleted...()` from `CConnman`).",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:58Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-21T08:31:53Z"
-      },
-      "sha": "7a4a9307632ad95a32a5b236ba575c68a44cfa57"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDVlYWU5OWQxMjI0Zjg5NzJiODk2MWNiZWEzOTdjZTlhMTQ3Y2ZlMWU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5eae99d1224f8972b8961cbea397ce9a147cfe1e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/5eae99d1224f8972b8961cbea397ce9a147cfe1e",
-      "tree": {
-        "sha": "c24b02dc73a096da2bcf688bfa09c1ca9317b9e9",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c24b02dc73a096da2bcf688bfa09c1ca9317b9e9"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree c24b02dc73a096da2bcf688bfa09c1ca9317b9e9\nparent 7a4a9307632ad95a32a5b236ba575c68a44cfa57\nauthor Vasil Dimov <vd@FreeBSD.org> 1726999902 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876219 +0100\n\nnet: isolate all remaining P2P specifics from SocketHandlerConnected()\n\nIntroduce 4 new methods for the interaction between `CConnman` and\n`SockMan`:\n\n* `EventReadyToSend()`:\n  called when there is readiness to send and do the actual sending of data.\n\n* `EventGotData()`, `EventGotEOF()`, `EventGotPermanentReadError()`:\n  called when the corresponing recv events occur.\n\nThese methods contain logic that is specific to the Bitcoin-P2P protocol\nand move it away from `CConnman::SocketHandlerConnected()` which will\nbecome a protocol agnostic method of `SockMan`.\n\nAlso, move the counting of sent bytes to `CConnman::SocketSendData()` -\nboth callers of that method called `RecordBytesSent()` just after the\ncall, so move it from the callers to inside\n`CConnman::SocketSendData()`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLsACgkQVN8G9ktV\ny7/TCx/9H+wVz2p65AMRHESuxjhNCQ7+LgVRuDjBqnOSnEZ3fvRDhTr7Ey/P5kTU\nBAqFOCJdTA0RV2N6FlxC4EO5WmkOeY3eJEUcDL09g4swHWEg9tDohfaxuzSaMKdB\nrox6zupLdGZ8+jQwndUW5B9SXoz6KaYe1v67c6pUzseRzAb67l7PwPudYzGpWW19\n+tOr7qxpN5f6easLZJaaW4hAz7ermCUK9tgNWbmb0ytLRMBJVxJniAr+LSpw3NLj\nMatMGcuMrq3pvfzKL197/8IAG7o765OyHQt3fB2RSGiNnLP1cyB3KPjw7VCObqKz\n+KzFEdhWDwi3yK+FbyflEk2+R8ehDm1m/+n8hb+vj3kOf8ZG1QAkTikzmZdg5pU7\nTykdoW4lDfm7o9CNc/kzruiYsUgUOJDBZdkzhWJuyT61gVeiDpSjG4pCZIT/hrnI\nc/sqnVsRAqVm+uDldiEQj9Hf70wGUUUJeDW/7UdKg8ByZgPBqAuanQpQ5Vthw67Z\nNHue1K+ozywcixmHrz2VnCwkMZackvz5sn8UsQiwbUziho2Nc+N5/K/6MDmJt5bQ\nHJwHOMFBbiuWlZwC42ZW2ycY9T0J1Qz8tPKiGCvEd5+Dy8rZgTRU5kewsFp9Guli\nQTaUXfUpuY0tVR3LDQu/oIqTYrsj8E4eV7SFJCBlsnEHJtAWzCJFEXzce9RZL0f3\nmr6k7lTIdHvIiR+F/XjbIc3L1icS/yu12eGAwIT83OjwQkWhPKwelknSpX1li24R\nkQTacmJit9dD1W0+18pA6tBva4NM9zs4PbsxvEyE+rgMXhlHbY5yVXRUCcZ1qdXL\nJHh35dCri6f5vwPs33Ik3zPqq9Dre0WljUiQUrKBWd4fIuwTyk5zO5rKk/ifZcKs\nGx0EL+GJDpGpa54x6ui60kTRixdMVjXbcYwO7JIPkCMphAFmizUsYi990Z+vxeZc\nr1HMrfn7aR3oiDTD/8KWmia6+x0MBhd8IpAtXaDqz4/TKaZVGTIPDpZ6w1MRq3KA\n91FtRcMTeGjG8sW8FOUyXFxOP8P55EpOK8T1D+ttF3DVkuLURLXPaXK2RzUv2s59\nXser6q4wZFAMUtMpbZAt+UZVK29vlZ6AOJ1PhoXiGVeNuZOyA5aRIVxPKSAEIUgz\n3fnt7huTpyCa80zWUlPQW0xG/ATrkVt0aBpsdiqsQZYkL8JU5bl4bfpREsCYKG8n\nc4eU2YZ6b8T9RXTOrlzWy1i6Xk8Pi542LS0IvCLADdKUrSJn6A3qnjrSdoMYN/xC\neTqr/UY2MDiDt2VvHBFGEU05SFQVeIR34KQ5/B27AU+8tx7PzAs1o2cJFFf2Eg9/\n3svEDADcu+gfJ+RveMZGcziS2l+zhQ==\n=1w78\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7a4a9307632ad95a32a5b236ba575c68a44cfa57",
-          "sha": "7a4a9307632ad95a32a5b236ba575c68a44cfa57",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7a4a9307632ad95a32a5b236ba575c68a44cfa57"
-        }
-      ],
-      "message": "net: isolate all remaining P2P specifics from SocketHandlerConnected()\n\nIntroduce 4 new methods for the interaction between `CConnman` and\n`SockMan`:\n\n* `EventReadyToSend()`:\n  called when there is readiness to send and do the actual sending of data.\n\n* `EventGotData()`, `EventGotEOF()`, `EventGotPermanentReadError()`:\n  called when the corresponing recv events occur.\n\nThese methods contain logic that is specific to the Bitcoin-P2P protocol\nand move it away from `CConnman::SocketHandlerConnected()` which will\nbecome a protocol agnostic method of `SockMan`.\n\nAlso, move the counting of sent bytes to `CConnman::SocketSendData()` -\nboth callers of that method called `RecordBytesSent()` just after the\ncall, so move it from the callers to inside\n`CConnman::SocketSendData()`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:59Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-22T10:11:42Z"
-      },
-      "sha": "5eae99d1224f8972b8961cbea397ce9a147cfe1e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQ0ZGU2Yzk0NmMzOGY0NTljY2E4YjFkOGY2NTBiOTU3OWFlMGFlMWU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d4de6c946c38f459cca8b1d8f650b9579ae0ae1e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d4de6c946c38f459cca8b1d8f650b9579ae0ae1e",
-      "tree": {
-        "sha": "b695f4ec0c2208a1a8c08fb9e31de330af8a0ec0",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/b695f4ec0c2208a1a8c08fb9e31de330af8a0ec0"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree b695f4ec0c2208a1a8c08fb9e31de330af8a0ec0\nparent 5eae99d1224f8972b8961cbea397ce9a147cfe1e\nauthor Vasil Dimov <vd@FreeBSD.org> 1727088625 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876219 +0100\n\nnet: split CConnman::ConnectNode()\n\nMove the protocol agnostic parts of `CConnman::ConnectNode()` into\n`SockMan::ConnectAndMakeNodeId()` and leave the Bitcoin-P2P specific\nstuff in `CConnman::ConnectNode()`.\n\nMove the protocol agnostic `CConnman::m_unused_i2p_sessions`, its mutex\nand `MAX_UNUSED_I2P_SESSIONS_SIZE` to `SockMan`.\n\nMove `GetBindAddress()` from `net.cpp` to `sockman.cpp`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLwACgkQVN8G9ktV\ny7+hAR//R/FOY3gYSwzXf84xzbjlhH0xw00hRYbhr5DYpF/BpBxqJxNjDWyUqGvj\nz8csL2rqBGUvD+/93Z5wqDQlozMQ//EjA0EJQ7c9DKW0cw4x8ltMdEwAdqQB15Rj\n3TTy1ywLFP+IRNAn8W2GShnAZVRVpSpvJig/ZzckmLm8zgxVWL9Pn+PMVXkr33fS\nuMcC0beVKCYkGy46QhpFxX82iw1uZC+66tMtur+8GVjUkCBU3B9vhjO/6w/FQ6c1\nUYZ6k/Pc6oTIAg7lGtfEAfVkr8TTvwt4pFBndU2RRpmlARm+NNU2NlOp+OPTXuye\n3sMRNQbYNppzhybJYhuedFNgO/r/Xf6uc1j331P8RIgKuCbUdJirgoQSpJIiDqnk\n4y/HwRtGKsDZnFL4lQ6UMB6G1X/dVRF8BxS9jZzRKn2Bwxmy/mz5syw6526/Z8EA\nemwj++702QB2SY9sMJ87hw8juz5wWqz2zPOEfkKye9NccWmomuFXxh/R6ad75sxA\ndgS+3sAkdy6b38TJ7qMkp64OT/rld3Duv66IFatdSzbkFvOD3JwCHBS9enrnl7Z+\n4BtNRvPxcS8G0jMfO41eLXXdsWXR2Shhk7rzANuw5Oe+ntcuG5KNlFvZ1hwf22gM\nIoCrhmXxYBdlW++L7FXYrxYzABXVs36TffuDYxD7DnJ8FGLg/o8/9BIaBWVgBwuS\nch8stGfavbKzUzo4ztJLK+EHdFYC/i028XDLMWzzah3Do6e3eYf1iywHrIBXvg05\n+WNqcLAyFpF+4qaCRPKP2DRzqVHuFW5+ABYPThsf1qZzzkPS2lrqUgp6VfxKJVwf\nSW/sr7/ap4REp/eqV8hl3EVkPuUqtX7Kq9qRSVNJoZnRTBkphzTjlq3fuJRMfwNg\n6RpWCRABuUraPdE5n55cvy6fDeuYLRaLZRk2BxspFqjIS1sJFYk0JjWBLN9XBgAv\nyoqkjGkAd1Povt5gsv5KTXcx8vyYk3EwhvD5yI7b3Wf9q3kPjsf8he2xzmEvO+xQ\n6TWu8nXcipc2XgMzqGOOt0xhT4EowsiOwdGiNh2mRyR+JgdBZKXcvcUTVtFscNun\nQbtYfjy/i61Mw8q3edbFVorb3WxFhMJnE4ITxwT4JjN054tDc0cfmWw3Jg7b2Ps3\nEb6VQdvJ2TiAJLjzRv57c8Db3ISeIfiUOPTAu1i7GEa54JW7++5oZF3ossZQM6b+\n2A8YEb+1YO6sHRA79gWhAquVYGozvXtD4g4l4vi1scTvzDQgncC2DYZfmUskHCKo\ns3sy+ht1IKKZL6CZiHaIdbcUA92ftuxEU0HX7XpCi2MVe5Omhm/ldtIwQtiIPnIE\n9oSZrTZnKdN9sQRWF3arvN72QGQUvA==\n=9XtH\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5eae99d1224f8972b8961cbea397ce9a147cfe1e",
-          "sha": "5eae99d1224f8972b8961cbea397ce9a147cfe1e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/5eae99d1224f8972b8961cbea397ce9a147cfe1e"
-        }
-      ],
-      "message": "net: split CConnman::ConnectNode()\n\nMove the protocol agnostic parts of `CConnman::ConnectNode()` into\n`SockMan::ConnectAndMakeNodeId()` and leave the Bitcoin-P2P specific\nstuff in `CConnman::ConnectNode()`.\n\nMove the protocol agnostic `CConnman::m_unused_i2p_sessions`, its mutex\nand `MAX_UNUSED_I2P_SESSIONS_SIZE` to `SockMan`.\n\nMove `GetBindAddress()` from `net.cpp` to `sockman.cpp`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:36:59Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-23T10:50:25Z"
-      },
-      "sha": "d4de6c946c38f459cca8b1d8f650b9579ae0ae1e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDAwNzBhY2Q5Mzc1NWExNzBiYjQ3ZGMzMjUyNGY2OTkyMzU5ODhjMzA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0070acd93755a170bb47dc32524f699235988c30",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/0070acd93755a170bb47dc32524f699235988c30",
-      "tree": {
-        "sha": "fbc8eb44c83cfc63727910cc13f3d0a280cb2ff3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fbc8eb44c83cfc63727910cc13f3d0a280cb2ff3"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree fbc8eb44c83cfc63727910cc13f3d0a280cb2ff3\nparent d4de6c946c38f459cca8b1d8f650b9579ae0ae1e\nauthor Vasil Dimov <vd@FreeBSD.org> 1727163707 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876220 +0100\n\nnet: tweak EventNewConnectionAccepted()\n\nMove `MaybeFlipIPv6toCJDNS()`, which is Bitcoin P2P specific from the\ncallers of `CConnman::EventNewConnectionAccepted()` to inside that\nmethod.\n\nMove the IsSelectable check, the `TCP_NODELAY` option set and the\ngeneration of new node id out of `CConnman::EventNewConnectionAccepted()`\nbecause those are protocol agnostic. Move those to a new method\n`SockMan::NewSockAccepted()` which is called instead of\n`CConnman::EventNewConnectionAccepted()`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoLwACgkQVN8G9ktV\ny7+xpB/8CrFRvNrT70MWKQaZbhQnlgKDtOhLlBSeuaWZYmiVzWcaHAQX9k4bn/qG\nipFe4axVGCWibV7AS/NIDw4RgjiAAOpTHrK02Q34QvJNHQmnNMvtou+YVzJdaACU\nlnd23r6JhEpJ8Q2+v88eZIReM5Qel1PEn586myWkq4BFmQ/R3AaPZM/ucKqpmE6s\n0cXkTOcrORu6euoXliY9YzriEYaqIJswVVqO7wexCYUF5c1/12YOGTg1Ox2dezP7\nkZMayZotmIEL5qOX1RiyF+4dziOUxLtSr37I/KKZG5nB3rmM3Ow8xfOlrUDPOhoL\nna/OBYqFGUxQBOVAFDVHjirpc5hdEZQKblKstdFfUDETv8RsMlR95g0d5awSUNZA\nGWyachvBvvrBvcXZgCqaZ05ZHnTxRcvUWY0BM4OPUZDtNB6Sq3lMFwEome5d/ZJx\noDVsVeDFs4syyFSHkUpHWogebpG/vgUdy1XC6f6apsSi8/pR/TRXHNlWXP9k+AxI\nDUJp9iJErSR6N3H7gzS1+jMmtONo1c/DjpRVgr3cgheRBMB4V3HoEtzUcKZnsU4Q\nYSe3Clas750Uf+epvhSMd9CwecG/fYS4I1w+REz9JxqrvVFYsjzDADRaAZL/oB8t\nLjbmyH2bpRebx6q/2Zx9WWO6wprry6etGCI8pwPfMicTdW0Z3sCyESdvLSZf8qML\negLEtvrr7a/PwxTdwyv5JxsA5uNBm5ZjQZQ+cQ9s73M5/jOcOxpNWU5ZqTS+NOVg\nWDVkMrrC2nJr24nqQjVGZ0NqvdcZfV605kT4vNILvsHDDcug1ElvoRoVqMKEFNbr\neqPV+6/fI/JuoYsMSCi2BfroNZHkcg9/AgdKTEF8G6okDqWDkSfZ1OU18CcRMUsb\nxh/WYh7Z7zSQeZFQiwmU+Ym8Ym2AN7jkxC6KQGDgvROTS0p/zYk4qMKSpJ7zvoE4\n6MgXBrInCbrKj02fejwtu8LugkByJBdL/7ckQ1M7ad6i7UmhzJ4rIVNQFnf1dcFX\nt6phbpsctFSDy7v1RzBrW/17j2c0WykEBpLtwh/R1UGoqTViHxqAltnBrpmGJTnG\nHJLBgdovN9ZBy4KuVQF23b9kiqlsZhpWJZVJXJHCbO+XJkPMDMzuE8YLsPw+8gO0\ncr0QiG4cgbnhCZTYD0zlR/2eQm1UNLlfoTNW57BEHzZKwivvRebmE/x3VaHOp6Jf\nWyrf7ZOxp9BZAy7H4oRrnaAM6enVR2Ib52I4/8qaCayg8iKuSBb5GcjeThbzzayY\nUfY9plHoEWo4gxBw9TITGhj1c5YYWER1Or+LrjqwmBRJ2lrkn5wXzQhINPgaT4Zq\n086ziU3209P2ZHXGPPIE5D96YEbloA==\n=rF0Q\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d4de6c946c38f459cca8b1d8f650b9579ae0ae1e",
-          "sha": "d4de6c946c38f459cca8b1d8f650b9579ae0ae1e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d4de6c946c38f459cca8b1d8f650b9579ae0ae1e"
-        }
-      ],
-      "message": "net: tweak EventNewConnectionAccepted()\n\nMove `MaybeFlipIPv6toCJDNS()`, which is Bitcoin P2P specific from the\ncallers of `CConnman::EventNewConnectionAccepted()` to inside that\nmethod.\n\nMove the IsSelectable check, the `TCP_NODELAY` option set and the\ngeneration of new node id out of `CConnman::EventNewConnectionAccepted()`\nbecause those are protocol agnostic. Move those to a new method\n`SockMan::NewSockAccepted()` which is called instead of\n`CConnman::EventNewConnectionAccepted()`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:37:00Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-24T07:41:47Z"
-      },
-      "sha": "0070acd93755a170bb47dc32524f699235988c30"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDc1NGZlNGEzMzNkNDg5YmU1MGI0ZGNmNjgwZDIyZmI4Y2Q5NWI3Nzc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/754fe4a333d489be50b4dcf680d22fb8cd95b777",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/754fe4a333d489be50b4dcf680d22fb8cd95b777",
-      "tree": {
-        "sha": "52e907e58ac7da02f9fa2d7e3d0082931e8ee510",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/52e907e58ac7da02f9fa2d7e3d0082931e8ee510"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 52e907e58ac7da02f9fa2d7e3d0082931e8ee510\nparent 0070acd93755a170bb47dc32524f699235988c30\nauthor Vasil Dimov <vd@FreeBSD.org> 1727082212 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876220 +0100\n\nnet: move sockets from CNode to SockMan\n\nMove `CNode::m_sock` and `CNode::m_i2p_sam_session` to `SockMan::m_connected`.\nAlso move all the code that handles sockets to `SockMan`.\n\n`CNode::CloseSocketDisconnect()` becomes\n`CConnman::MarkAsDisconnectAndCloseConnection()`.\n\n`CConnman::SocketSendData()` is renamed to\n`CConnman::SendMessagesAsBytes()` and its sockets-touching bits are moved to\n`SockMan::SendBytes()`.\n\n`CConnman::GenerateWaitSockets()` goes to\n`SockMan::GenerateWaitSockets()`.\n\n`CConnman::ThreadSocketHandler()` and\n`CConnman::SocketHandler()` are combined into\n`SockMan::ThreadSocketHandler()`.\n\n`CConnman::SocketHandlerConnected()` goes to\n`SockMan::SocketHandlerConnected()`.\n\n`CConnman::SocketHandlerListening()` goes to\n`SockMan::SocketHandlerListening()`.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoL0ACgkQVN8G9ktV\ny793qCAAqErJbo9a3av7ZV8Jtkz6x8nHqmn8vIiMzlRuuP/IchWfiKvIhtRrM5LS\n3opOhBmxQyYBWKl7FIvHH97zM0dnJ4eTaCiaSpcmtOZyZGgtXan6/UYCtX/7QHX1\noL08WSeMYGTvGZI11sE4v1hNPKXJM9jSqcEARz1is6Itdr2akrKHK9Q5PHaIQCRn\nyjTJDXcvbbIWBnSUlJhUeYuZIOxoNJ5Iep3kJ+QZKtYmy+Id63/qnx7M/DL6QhRz\nauZBZZMD3yjPUXXFe21lk67SW2drLcEjhrn0Tud9u/SoSATxXSn3843mi+8MyhVA\nc6XdPIXpnSql6+PWo87Sxqsqyesh9YMLTI9bSjsO5Eb+fEkQTYwhas4M1weJkNmW\noXSUz4goJq7UkwqO7UPgSyywAOYCiuRfYpvow9qUOtRWW+dlYtFS9COo/RxBZL6T\nQLu5hWiAcKxxxNPNZsK/LpAf5M8x99DhLKma9YmPK2YJxY6zYh25kRe15GiiyuV3\n3NEyR8VKQFYtlRo4o2Mi+XtvkAjnLSfTeN2nqXVxtQkRr770LtMmKkCew49bI6Wf\nbDjKrD7loFTTmYNNB5Z/88WyNzSAPLbb0iCHi4xaQnmlqYZYd+gwk7kcY1jRPIOR\nHe82YBE9OUOwBr5fon2A03sJ4tvoG6pnvhRMXREMSaB2YxRxos/qRKnxdnm3JYTg\nzDhRblaNVsgI7jn1i+jx7W0nlmy7BgW14MwmRDSu/wmxLeotVw/vb/HvG0hUDGJM\n6hL1zDsyrucsk8AdmliC2wHHrqJ7vIYtincrzaHa6Nf2I4vx5eoCrRS5+EmQmSZX\n3SEmPT4YpToITRTiToEZXO8oLOBA+ZuggQ+yu2N+KGxCAwqH84mG7hr0AVmt/s06\npLwfvJ5EseQbRgg5wFzFWNUTI8CV9QYDK5/Fyhe1/zeqYc+eKP1KhyxBQwYFYVM2\n8wJ7joQQ3W4dqQ+htlNJWBBpglqFoC4eK0y/zx0grw1JIrJlVHo/RvBC2aeLHnGl\nh9tUgRvlqNGNj72K5AroCJBJcC3ddimPy4wnb2cLgb040PqLHUlFk6cEiTd0Yr/L\nDDN+lI7CdWZ4h458O2CM6pOGakSoxTLUhDfnONg7D5hdwSPdKThz/hDSK6ehvttn\n1nRuXYp+aaJ1S5VC9eTa1t+0c6fJqFeYQJBM6TqN+bjjoPhuj2TYjQJ3jgWztFNE\n0JomleQyzD1W2UZOahpGO+5yAlDR0TOJh6oRYyT+DZnT7RTUjAHWEogeORL4gEZt\nzo8HqpWfycxJQIkwJAtbEWs4wrrfZv9JhPp2PfivBYpx9DPCdyiK0MyjDAl5mSth\nXKF8dOcdJNu+RizIjw7BW7LMxJbDfg==\n=88fy\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0070acd93755a170bb47dc32524f699235988c30",
-          "sha": "0070acd93755a170bb47dc32524f699235988c30",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/0070acd93755a170bb47dc32524f699235988c30"
-        }
-      ],
-      "message": "net: move sockets from CNode to SockMan\n\nMove `CNode::m_sock` and `CNode::m_i2p_sam_session` to `SockMan::m_connected`.\nAlso move all the code that handles sockets to `SockMan`.\n\n`CNode::CloseSocketDisconnect()` becomes\n`CConnman::MarkAsDisconnectAndCloseConnection()`.\n\n`CConnman::SocketSendData()` is renamed to\n`CConnman::SendMessagesAsBytes()` and its sockets-touching bits are moved to\n`SockMan::SendBytes()`.\n\n`CConnman::GenerateWaitSockets()` goes to\n`SockMan::GenerateWaitSockets()`.\n\n`CConnman::ThreadSocketHandler()` and\n`CConnman::SocketHandler()` are combined into\n`SockMan::ThreadSocketHandler()`.\n\n`CConnman::SocketHandlerConnected()` goes to\n`SockMan::SocketHandlerConnected()`.\n\n`CConnman::SocketHandlerListening()` goes to\n`SockMan::SocketHandlerListening()`.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:37:00Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-23T09:03:32Z"
-      },
-      "sha": "754fe4a333d489be50b4dcf680d22fb8cd95b777"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGJjZjEyNTRlOTE3ODJhMzNiNWExZGI1NDJmMzc1ODgzMWUwYmZlMmU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bcf1254e91782a33b5a1db542f3758831e0bfe2e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/bcf1254e91782a33b5a1db542f3758831e0bfe2e",
-      "tree": {
-        "sha": "93bbaf70bc94d27d36722327cf361123b2360d30",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/93bbaf70bc94d27d36722327cf361123b2360d30"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 93bbaf70bc94d27d36722327cf361123b2360d30\nparent 754fe4a333d489be50b4dcf680d22fb8cd95b777\nauthor Vasil Dimov <vd@FreeBSD.org> 1727082359 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1736876221 +0100\n\nnet: move-only: improve encapsulation of SockMan\n\n`SockMan` members\n\n`AcceptConnection()`\n`NewSockAccepted()`\n`GetNewNodeId()`\n`m_i2p_sam_session`\n`m_listen private`\n\nare now used only by `SockMan`, thus make them private.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeGoL4ACgkQVN8G9ktV\ny79qMx/8DJY3anU8++k289rdBji3gmy+vKJN71GcvW7z9XPmZkufv8lFrp0pLZsY\nKo/UtjpVcuPlCIRA4ULgRQGng1lbvRgyuOV7dQQsUSrjrktEGR14wl0dOGjFwoC5\nDJfHcs/uleeOJ7PsruJ1+a5Wox6WU+jjjyRTSBjobWnOhiLRoMUbQc8SrOJ5ub8K\nYuWmlGom4g5ER3xBmQA1vpk9Q8DVNOtF8PfqEjrH3qGT1l9yanYVKg60iuKL4kOp\n3WfWkKb6XxxihzXYVgYqvgzhXBQa1eV4Cx0RjMhLJn2a083+sh1YwyeFaX6D1D6R\nONCW3Bx6a1pIV1Y+xbyKE4ilcYl9Nly6GzdDPldE7pwsIz5L/uRhcN4pykp3yu+t\nr0V4av9a5HtDz7z6ME8G6PABKFHO8ZpYhyb7PH+dXlbftc/kO/3bonoN77KyX57w\nFSXxEm/rsf/mec6NoQRV30wyk8uabtfHHvn3BQkzUzLPIG+dvrpT5a8Eudv4tY/l\nC5BB/s9lub8JLD4eNunEkYQVsRaW0vwl1dlpuAwXEHU+qYZHhSNNvYiT/uTJJJk3\nEmVJlOgvwiGwzFxdt7Gln9RYG761EpkVYiz994c+rs2mSPr4djb6xpaMumlklm8l\nnao0LSwS1rBkItEowaptCEIuqDsitlgmz5d/YA+aejPqgMSm5/RTt3X+fFb9nsKC\nQoc/OtsYUavMhiKZtCBBlRlRAsufG7iV7kRdah7mPOqxZKdT767Hz+agugtLKAO3\nr5Khl/nWdwIIZxyXpqiqaPSQO/CD3h7XAGdUPnD97ERuZHVrTc9MLctpibWoSuM5\nqL5YlasZ/WCneTH6Wh0H83v2hxYyFbR501gKdzhL+CG0Qwl9biqHmWfGgCS9c2Hg\nMRgh3D8I7VrAX4pc7d2DqLuvh7qukp0OhsDSLbO5Wydze36EuoClUyjR2EzdSpqV\nt2hot3mADsClCy0gR9vwWyJl2UUsTsb7dE9u+yW1KgnEuaw71maa1UwC4IXWybVT\ngVNvTgl+LqrSqVjdAva7sGADUVPm5+KbKhyyHsmsnV0Z3WEqjGU+1d4j1yL15CLq\nPMYWCfbLd92Mk4Q7BcflKBgwNYD0deSZKCOPKEWOxd5HKcitLjKQMZMMIi+RRujZ\nBJzpvSHvaVGZ4wANVr6YUpoEAGGjqFydLo4Z0cJsqs0RBcKnAJIeIkBhizbCue6u\nygqwb3by809D6I1nEUSTos8wvJ11WB9J4JL+W22+IQG85eUDbvN67N4L2j8WVZZ5\nFV5FXnEx41PJJUAv/7m9oDe7edyf7emld0TlcW64fU/R52SO1BYQOf0rAZFDh8CT\n1J66U0PGNehSsBW0hzGEYizuRwZ33w==\n=toRM\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/754fe4a333d489be50b4dcf680d22fb8cd95b777",
-          "sha": "754fe4a333d489be50b4dcf680d22fb8cd95b777",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/754fe4a333d489be50b4dcf680d22fb8cd95b777"
-        }
-      ],
-      "message": "net: move-only: improve encapsulation of SockMan\n\n`SockMan` members\n\n`AcceptConnection()`\n`NewSockAccepted()`\n`GetNewNodeId()`\n`m_i2p_sam_session`\n`m_listen private`\n\nare now used only by `SockMan`, thus make them private.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-01-14T17:37:01Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-09-23T09:05:59Z"
-      },
-      "sha": "bcf1254e91782a33b5a1db542f3758831e0bfe2e"
     },
     {
       "event": "head_ref_force_pushed",
@@ -3698,6 +3098,732 @@
       "submitted_at": "2025-01-23T16:18:36Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDg5ZDdjZGY2NTE4ZjdiNDg4Zjk5MWE4NThiZGY1NGJlNTU0NDdiYzM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/89d7cdf6518f7b488f991a858bdf54be55447bc3",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/89d7cdf6518f7b488f991a858bdf54be55447bc3",
+      "tree": {
+        "sha": "18738438671870c4fabb9abfa3392901d97ceef4",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/18738438671870c4fabb9abfa3392901d97ceef4"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 18738438671870c4fabb9abfa3392901d97ceef4\nparent fd81820214e695ba228a954506397c3d781fe3fe\nauthor Vasil Dimov <vd@FreeBSD.org> 1738071384 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071384 +0100\n\nnet: drop CConnman::ListenSocket\n\nNow that `CConnman::ListenSocket` is a `struct` that contains only one\nmember variable of type `std::shared_ptr<Sock>`, drop `ListenSocket` and\nuse `shared_ptr` directly.\n\nReplace the vector of `ListenSocket` with a vector of `shared_ptr`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3gwACgkQVN8G9ktV\ny78P+CAAqo2hBUCFs0YImyNL4V/xHGQJxi/17m9bfTz0TyI4x1QkUkWaAVop35dl\nuMi8l5DLV3WJi4k0HmfvHkR79pQ/PVHncCVlIqSuswkS3l8vBMIShoBiRQR2TIQe\n96Gwz2gGhiVZjBdi91r3munb08Hd0OMhOPB1Ba0+mET4EDATvcutoK4ICTHPa2iK\nuUw2I8Id8LDtNYZfhZ1PDPNXBIcUH4aNTFHCagJaN8bBBEAxIFrN+i0pJJJyDx6I\nJyeqo5rGU1dHSM4664SioOjSEqXebKolmcK193LdpnhYeAiksGrji+QgCpEqW5od\nGAN5D6PhKz8AXofvvNn+IfiRpxXT3PWPknBXfX/92tqPUFDJfLHCCdO/ZmYhT+69\npVefdHCek/q7Mcq8KXIEBNPwTGEdEMo5pMNgXAx2M5rfPRo4fJyQ8VU3eMo3vHBe\n/KifhgwLmoj+Dpis9iLOjApt/7qeMFr46WcJLPfO776cl1kAjSBKaZ4WuivdC/+6\nX2n8S8PIo4k6vch4soW1b9sblFioJdKFfPjDvcyvSi9chxtYktG7zI8l742zfol+\nV7mBVDPH54To3bRyuhujCs896rDGVd7fvd2ei94CbptMFt3J81kKjGsybZ42J5z8\nRPe1x5M+AakAySW+cceAlNvRY6QYB/EmjnjtQYyxYdiLRtf5dKfImIFyaxlx8646\nd4EASIfEQ0Pi8twQuJhOsqGzw1qSPTDIyIduw3QtF248Pxn+gx3fm0jh37QMbexw\nzh6MIt9VYNyqIs0d9s5Ovqw+HAM/PdxLWSDWIz9kl177a7MCgIeiW2dGd1sCPTZp\nodt+lGai4O++1Li77Mr6YORndlX4z56XglRESiX/oH7+MyTidB74Afvii6sC0mNV\nTNL7uRIxdpbRPXjEOQuBUXWxvuXWhhH/KBY0/VflcPAGEZzabmyjp+NcnAGsn36c\ns+a6HJx2QHRLJAnbhpJPDRHNvoov33GMc6cQzowi3knp9a/AmJM4LgyhVbHPHs/b\nuTTwDzGHPCPuixHh833y8bOl/1jmkup0FHeu7GDCifIuO6GGEVkn/9E8yoVzInjj\n7bsqPx5mjFvMxC5rkNKpPxguVGa3EhcGukavjQIHBVlR5RFApuTC+UW292zDV6de\nmAUgNc0lwb2bX6SxrEn3f8fz7TtLdxUgMV4d/swg/+epoBUo0EYlia+gbjmA7RwN\n8uXNzDkZBfWfGOY4/HSamEbnC+zI8fWaJsy7G3ZGqZlErDFgTXYCqtIIMzvZdrgU\nIJuVsIiNogVnN8C7t2mviBasgIJhHIZfVUUb6K1NJwAsXXYnS3n2f4+Nbwjy+WKc\ndeXnRep5uTYxHVXCSnozE7DjLU8PKQ==\n=zoac\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fd81820214e695ba228a954506397c3d781fe3fe",
+          "sha": "fd81820214e695ba228a954506397c3d781fe3fe",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/fd81820214e695ba228a954506397c3d781fe3fe"
+        }
+      ],
+      "message": "net: drop CConnman::ListenSocket\n\nNow that `CConnman::ListenSocket` is a `struct` that contains only one\nmember variable of type `std::shared_ptr<Sock>`, drop `ListenSocket` and\nuse `shared_ptr` directly.\n\nReplace the vector of `ListenSocket` with a vector of `shared_ptr`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:36:24Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:36:24Z"
+      },
+      "sha": "89d7cdf6518f7b488f991a858bdf54be55447bc3"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDNhZWFiZWUxZDNkNmE0YTk0ZDIyNzNjZTNhYzQ5ZDgxZDFkZDc5NWI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b",
+      "tree": {
+        "sha": "38fb519691c6516ef3bc75781ce562de9bd54930",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/38fb519691c6516ef3bc75781ce562de9bd54930"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 38fb519691c6516ef3bc75781ce562de9bd54930\nparent 89d7cdf6518f7b488f991a858bdf54be55447bc3\nauthor Vasil Dimov <vd@FreeBSD.org> 1724420200 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071650 +0100\n\nnet: split CConnman::BindListenPort() off CConnman\n\nIntroduce a new low-level socket managing class `SockMan`\nand move the `CConnman::BindListenPort()` method to it.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mYACgkQVN8G9ktV\ny7+Phh/5ARHOzAChK94v1Kju4GH9rDe154Q2OgXDlS9h+l17PyhbG7+I2g9DCmjS\nubMD+P+y0I+LwnL4BEgtpP6h64Simo3zZ6HToZz8vZv499IXo9IDTbicR13lPy4v\n2sE1E8yloKZ9KEXIzSpQ8gslPLtQeR40f7v3jWUQHor4QfZyuDUyGeLqtZ4d+giR\nnJSU2lWhkOTodwF+hZhgcBRshDJLZ4xufbvnflvBbsYMadgjg7BZSNLamnA/7IdM\n4IKJKhmCiTCkXSI628y5iExFufAcvjK0AGRPNveZE12TsLjValUckwDfDimLxcX9\ndJhqdwVkqB3Jrz601HzDrbaw3xX8uYzYpd+xwaZvvwRilCuUb5X4bC75XBI7yjGC\nKQ+Fo961Kxw4PvnNxShZI/RD/tZ5+k8uUC5yzv4cW0lDu6xpU9DhnWfRLmuz/PYE\nuFnr3DwJ/PI6MgtdUFFOt3M6Fn1gzeCOwxotF4bC3zbefSUgLOZaCBKzOKeiw5Cv\n04+svRInxNcHqbnLQCIJY8+cBF3Ck4HymHpRQv/W1+tcDENisypnHHXoEioe3dEt\nMwV5rcrOMxUu623ouSEgnzxPLM1XQ792id3CJwJGJ4qcZxeVj3oQKHb99IhgGMmc\nouC4lzzlVRcrZcZrhcgfTle4fEjP9crodD8vl8So7PbYoeWo2Re/Vr4L9EjRcxga\naCIXssZoXFPavXXhpzvZE/jOSaczedEdN6Ib1JigqVpGw1EcILTPIakGbTF1UleH\nc5z3ue2EYU6dLa2dZo4Sbkp26gm3GP8O02i+Gngm8MdLX+5lyWDa0QAb4MIqXes3\n0LFnBblLAFfzH+DFTcPHCoHO32map8RhgCz72b3jf8Nu0p/UkxDoesqjdxCOG58A\nf8b+gV0mxGWnSTLrlSPBpPgm5CYnog9ScZ18jWLmr5xzwOuYoQRj+Fwop3XSaBVd\nMsr3huBsB9KVFqze/841wM5cMn6EijMIt5r0GgAIk2UPEFo93omDMXk8lhKP2yno\nZXMAeyW/csgIXNZmxtorqoc9LjB3lhA6oMhV12m4G5jl3jZXYHR/lXM95nnoZCPR\nVKwHiSR1G+hBomrBIWOai6KjdHx/74fyQQHfvWAprPKW9rV/yqttgCfpZqeXvuiN\n/ENmbmh4C92VBK0EudI2XeuU9WgdQhlP8Wa7i6mXZGL9wH0lbCklq7XhXdBF9roM\n2Zp+NBqRQ3TPNAcXhSCZ0YxDBVQMkJ3CDDEICDTrfkOeYVJVmnTv6oHf8o3aZ3RS\nzNLW97IF1OYqO7q9/BIbQaKVYhK41vJA3pzqMJNl5UF1Lilsn+31u5Jzg1jtlAqc\n3rv6SADaaOqMGC/FJOIZOeW4DV+wyw==\n=fq0T\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/89d7cdf6518f7b488f991a858bdf54be55447bc3",
+          "sha": "89d7cdf6518f7b488f991a858bdf54be55447bc3",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/89d7cdf6518f7b488f991a858bdf54be55447bc3"
+        }
+      ],
+      "message": "net: split CConnman::BindListenPort() off CConnman\n\nIntroduce a new low-level socket managing class `SockMan`\nand move the `CConnman::BindListenPort()` method to it.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:50Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-08-23T13:36:40Z"
+      },
+      "sha": "3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGJkMDhhZGExNzgyN2Y4MGRlOThjNzA1MzM3NjUzNTBmNmEyZjgwYWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd08ada17827f80de98c70533765350f6a2f80ae",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/bd08ada17827f80de98c70533765350f6a2f80ae",
+      "tree": {
+        "sha": "1a0e811830f75451a696728f13281163f8fffa5d",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1a0e811830f75451a696728f13281163f8fffa5d"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 1a0e811830f75451a696728f13281163f8fffa5d\nparent 3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b\nauthor Vasil Dimov <vd@FreeBSD.org> 1726578346 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071654 +0100\n\nstyle: modernize the style of SockMan::BindListenPort()\n\nIt was copied verbatim from `CConnman::BindListenPort()` in the previous\ncommit. Modernize its variables and style and log the error messages\nfrom the caller.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mYACgkQVN8G9ktV\ny78iBh/+LTdTav6H2HZMsIQUJ85zwco4ACQHUSHkZ8jSso9fj3NbO/Y2qGgn5UjO\nQ22VhYcr13UkB+LYyuUVgF+NK7K2w6QMn3A3FD7N0xteFMeqfLNVouAWS9ikz4fi\niDNtiDbW4lx57suB+XrxNTddMIZa3S0872Ze+9jEHmhu6YJ8VBZB+NSUmFTCwzvu\nsDk2F9NjTw3EvJ6ae72QbVUPkCknZaJ4o7fby6aA1c5U/M5WbBV4Tullnr2Q3vUE\nwRwmB/Jfh7F+5lULwJzKrYu3HO7J/nWGX+XX4erYr6Zvni0MSKOIsi9q8oHenqwc\nnhYY1iBt8n3GOIyaqs5j3Iw15hGGkNh87a23d7PndXBxj6vxLL2g21NkojhR6J+V\nWNGcLv4WhQveKE93SnF3dcTOgCreY6hDKWRoSxlLKzFcZUWpfs1V/t+ppnRTluPF\nwwJn8aAOtyDNauO39Qp2oPCVsSbi0YbNYno3q0QsJCgDeUUyzq/vNUvn8dcbwoHD\n/KlMzN4pVOjjmUSJSSI5XApVncb3PBb8s6BSWbH0FUYEW/l66B0y5vaEao1ax6L8\nXcx7y2/cNOx8NF6s0XXIfzFf9HNxbSRN33kR2eSTAU9xyj60rlPJdJlmbQyqwkH8\nPRznX6QicakRozWNWUqGTVdTjxiRfoAbKhru4UaglyFNgAoD7LQsJng7+Jv3a7ZF\nF3MT6m04jj+m3D/s2DV/zdmJktJfBhFJF5RSZ8clg5LQKG2E52722QcO7uAhmgv+\n2OjXCnmfII/EC1qZHKmI9dcuZOHR3pnOQexIFjZMNSbXg7qmBig+Z5/tkynHRF8M\ntRw8zc+EMiWXrmtz1zrcsZJ4Sml8vDLsMIeRBG00wgpiPaTofJql5tHmeTlkjyNh\nrY8uc5/EdVr3WWL+rDR2EgIQZqYJic9b10P7DuxgSanTLDe4El/8AwERpb2CbuGe\nUVVFyLlpgCfqIUv7podRMt7c9WeGz9zgiku3E2M3iCFAONG0ms0zMfo8hnZws0gB\n/C/smY00hi3Zu/u2pBeUYXOCKXqVPyDGKzBooxuo+vZ44G31I1xCjjBCNeoEspAO\nQieFttkYFXruU7Nyqsjk9ul4bU88XLHb1KiR60qeNJNtQ238o98JrrftOk799sKe\nOJecUS+rVjMRtLmZ/NutviaddVf+GSAOtecJsRm6yV85DjiiNtnHtQ6RJIxwcjty\nZXsT0WLbFUhDBVf0alk2ESlAvCsOIJUgJRmVLiSiv8aWO8KwvlOGK1ihwz/IR/AL\ntF86hUj9Uffx73z5Mgj6LzGnjq0R6zJ18aS/k9UPkOicYCkOtI/Q960r58giKGCe\nMyX6myU2uH2KBSyYh/k6qm+HlqCwwQ==\n=6zEr\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b",
+          "sha": "3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/3aeabee1d3d6a4a94d2273ce3ac49d81d1dd795b"
+        }
+      ],
+      "message": "style: modernize the style of SockMan::BindListenPort()\n\nIt was copied verbatim from `CConnman::BindListenPort()` in the previous\ncommit. Modernize its variables and style and log the error messages\nfrom the caller.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:54Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-17T13:05:46Z"
+      },
+      "sha": "bd08ada17827f80de98c70533765350f6a2f80ae"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDI5NTc0YWZhYzQ1OGIwZGU2NGVmMTRlYmNhNzk3ZGJjMjIzODM4ZjE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/29574afac458b0de64ef14ebca797dbc223838f1",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/29574afac458b0de64ef14ebca797dbc223838f1",
+      "tree": {
+        "sha": "6974ecac8fc0be60a994eb4104b7a37f6f55d334",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6974ecac8fc0be60a994eb4104b7a37f6f55d334"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 6974ecac8fc0be60a994eb4104b7a37f6f55d334\nparent bd08ada17827f80de98c70533765350f6a2f80ae\nauthor Vasil Dimov <vd@FreeBSD.org> 1724670893 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071654 +0100\n\nnet: split CConnman::AcceptConnection() off CConnman\n\nMove the `CConnman::AcceptConnection()` method to `SockMan` and split\nparts of it:\n* the flip-to-CJDNS part: to just after the `AcceptConnection()` call\n* the permissions part: at the start of `CreateNodeFromAcceptedSocket()`\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mcACgkQVN8G9ktV\ny79yvB/+NxdpQVGl+4UVKQQBYTaVjK0Fy0t2O2QuiAfFbvsQ4sic1cxqliVUqVnZ\n1DKHMri9euuJnzAfT9Rvrqp8IcClXAogM+X2O0OFFK8hKXCa0LzEvYCSdhw8MoEQ\nGAjlCXYCjNglUPBwju0/t/jWksjviGds2gdsGaXh0nFM60exbwLdjOljx+ColI4f\n0v23E2sSNVdhgt7oVo6mjZQx6PlHLFSjbQJyOfhqXb6Acn9SnwdhskV2CVmMw7VE\nOIdVj9MJAmnK5dU4lxFftxltfmTP/4EzNiwSQic13s3X4z+SjFp8G4/DnHtToi64\nhoXDygPa8S5Q31kWVGhmPF/BjiT+kjJhRn7nQY+p1UT2rd1YalbbfEw8U2kUtvN8\nCRWlPLPP9mOKHsNrbaNI0D9YvpTIeeA3FrEeQLnRPJ5SIGgXNDvt5VSp99t1rlxT\nkpJ9j/w1qwtgaNnp5yKBnSsUsk1VgTx5vAFRW2UIf7EaACXv8sV9SF1Yiv4UifRX\nskxjaHTXisb08LmCZC5g7JuCtdS+v7tyjP3aoKk4vdNEDozeYEOwPU6QNVYhNRjl\n9DiSTQ3NjPcjgcxQm36kVO/O5RTQOTpZPnU1RG3UgUKZ2J0t13If9G4MV6wdSFYD\nF5JPTOX9PDSbsPwqmyhpc+3TAVfEG171PcE94bPKnDAHA9uZDP+Mxe9wtJAlVsy/\n113/3W/uH3ADx0TTcENq/qYkX15OTjiCY37TzrH+4vVD+G9jsNQaTr/xK5wjT6VO\nUy2aLFKHwIJxKVvEAfy79A/a9cCkH4gYapbd7/24KV519q6E2INSAKb8EHjDeKM2\n6JVc09AHQ3tVjWB6reGKCt5RIMwh9Of33Re5gIxzuqNKPWeiUJIgLp1MHZ9QszJi\nN6SA5u6Pk3jRgZ80OELgmAFi6lKHO85ubRAvnFksHClrzxYw0VpW2G3iOPp0PYir\noPGQnL8TNCHHf8fomten3G17niiuGfNNmamj93zu6a7aP8c7NjR43kAXdvZNuhQ0\nfwqWze+U9c31mJc6V9Z1NiU+6f5bo7YTvNPcFmkDyLtfX7ypy6gXVjAIop4M4ypJ\nxddhUYWtnl+68MgqmMC8CK+iEpWjn7AQhh1r602bSeJ/1/Z9o5i8WuUYRorcld6T\n3+12QZGMASIZIrS4/nYtdvWuXru9GpG7v7u3mLMUjXcsowfmJDCJdin2HqoXp9zN\nztoolmZUAYhv9iDsTRKs8zxB1B1xH6EslbCg+wUi2/Ma+ExVUbk6JEb+6TAR3BfN\naZgi22gqv6Df0SGyrX4jeUBT7WXlEsBK8RQet31n58tHvT73b0za9DV3OwFrbS6q\nCPaXT1TCMskZKImtYxPkTiosmSQJ2A==\n=fxdC\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd08ada17827f80de98c70533765350f6a2f80ae",
+          "sha": "bd08ada17827f80de98c70533765350f6a2f80ae",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/bd08ada17827f80de98c70533765350f6a2f80ae"
+        }
+      ],
+      "message": "net: split CConnman::AcceptConnection() off CConnman\n\nMove the `CConnman::AcceptConnection()` method to `SockMan` and split\nparts of it:\n* the flip-to-CJDNS part: to just after the `AcceptConnection()` call\n* the permissions part: at the start of `CreateNodeFromAcceptedSocket()`",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:54Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-08-26T11:14:53Z"
+      },
+      "sha": "29574afac458b0de64ef14ebca797dbc223838f1"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDVjMWU2ZWUzMDYzYjcwYjc1ZDVmZmY1M2ZjYzM3NDk5MjE2MmJmZGU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5c1e6ee3063b70b75d5fff53fcc374992162bfde",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5c1e6ee3063b70b75d5fff53fcc374992162bfde",
+      "tree": {
+        "sha": "93da76d746ca5635c50447d13abaebe5bc428d81",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/93da76d746ca5635c50447d13abaebe5bc428d81"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 93da76d746ca5635c50447d13abaebe5bc428d81\nparent 29574afac458b0de64ef14ebca797dbc223838f1\nauthor Vasil Dimov <vd@FreeBSD.org> 1726586947 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071655 +0100\n\nstyle: modernize the style of SockMan::AcceptConnection()\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mcACgkQVN8G9ktV\ny79uYiAAjm+mxvgXWNmy1CjzEc8ORHZZqV2OzANg1gzHjoi9geJABvdYucRXP70x\nW47tr4la3lrfnW/LNGygWAoB/ECbScPI+yQHmVfp30J5vkA7RxQnf05LMyuttXjk\n+7GZejuyFLvWzuWJpC77M1Sx473w21Emya/Ef7n7Zyt+a3Ie3owgTDXdfL9col5p\ntwTvVEHxYLzFHlF9fpvoGLuX29n1CvkWuxnc4t4dGCS4BzGKbLT3YWGwVq/lFNsG\ntjod6WcxzcGbL1oRtrD3WqCaE81UOQuSuVhe9tOLgwPLJNnoNvKcgXlWWVlILfYX\nudwAimUymuA+AdhXdavfTaGfS6oDAyaYo8CKWjL+sF0dAoFUCfWP7bsXFLaSq+31\nwMw25PqlxxAVI182rPsGqdb7slfqvxmTqnaAKbI/T9UonHLbAG3ldg+BYu/sXjuA\nVT7Xmicm4zuwWMc5HixErS58YTXd5ok1Tu8vgRGYLsbohlNqRWsCgMZQxiW5Cl0K\naEFABtIK2hM2Z7imxIJ+XDFOcVROaTcST6nlBHLB0lzahhNfDAf2uuXl4cgVbxJ9\nlFOYVfkDaaP0LsAJUsPxbtSuAmRd0tSVjG6yFgt2CCo8xt9ug/MsWDTmKu0nza01\nO6F1/AFFvHVIQjw78MNwarSCHnuL1ESQ9RsPjFssjQn4svtBMKh0NAvOo+Euj9Xz\nHlyGxWNuAXceoQlzdSy3HKJRtnhmZcNB2uZDsb82SdvUSaognWnv3mZaFgU5z69D\nslr4XrLTjbLiv87C7VFqddMbHhGvE23deEst0ZuChycMmti/hMIazREOsyXmU4dp\nHKGvA0ShkzL8VWyrULh5X/oNHWbsrPjmkUhNTwpj6uK6RZ/fORn5cz+puPTpKsX6\nD6qHcU1Rb1C6CvZAEsWCdRWX5Db/1cd80y8D6WLN0T22ihfFLwi/B4UADJVK/UYi\nPSguVa1pFvWBa2aEkZqRa0lT4e4Ru3bVD2g62XkTIsSndh2/5WLOIlegtTzjagnl\nNWywMrpZ3e1SNoIW2VD+CvHJSXYVrQ9U1fPxkCsV/cxMKrcVm2LqgNGxcLES+vcI\nnzdq6Fik4YXPx2E2om/fYdq6OGY7FWM51oXUn+yj3sya72xhdVy8riY8pud/TQ17\ngqlyAxXd0fH+jgE7334J0keTZWD+bepMLL9zZGyBIkWjXRn2ttYOd0t2VSri19ys\nZbjWHhKnLEfCCENmN+19ZYIV4c020HExxvZPMavFEjtDLKwL3pw5ZE6BOPUx63xM\nMU5M3a/hGx49Zy1at4lwk1Gl8NFsX7izEtd81mZutBophwEO3OMJtVz3R2Y6F7cq\nQvQxb7dXOZ1x1ePLUZWlRdOGN19FFQ==\n=ywkl\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/29574afac458b0de64ef14ebca797dbc223838f1",
+          "sha": "29574afac458b0de64ef14ebca797dbc223838f1",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/29574afac458b0de64ef14ebca797dbc223838f1"
+        }
+      ],
+      "message": "style: modernize the style of SockMan::AcceptConnection()",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:55Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-17T15:29:07Z"
+      },
+      "sha": "5c1e6ee3063b70b75d5fff53fcc374992162bfde"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDA1MDY1YzAyOGI0MmYzNmZjMDQxNDgxMGU1NGIzODFjY2QwODkwOWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/05065c028b42f36fc0414810e54b381ccd08909e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/05065c028b42f36fc0414810e54b381ccd08909e",
+      "tree": {
+        "sha": "31d30f95e99ba8cba4dcd3b80c916228d76fad59",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/31d30f95e99ba8cba4dcd3b80c916228d76fad59"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 31d30f95e99ba8cba4dcd3b80c916228d76fad59\nparent 5c1e6ee3063b70b75d5fff53fcc374992162bfde\nauthor Vasil Dimov <vd@FreeBSD.org> 1724750724 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071656 +0100\n\nnet: move the generation of ids for new nodes from CConnman to SockMan\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mgACgkQVN8G9ktV\ny78DEh//SniASuyVTKy99L1uzIeRD5pxPLyMQIQi/o2OBaSm08hBUkH9YwUYProh\nhv9joMGNs8Uumi1ciwuax9LmVdeYT587V/P/HkiFbO4GT/Zh7Q1LSjPVDZUVY4oX\nKOL8daeQK3eDALc+Zw6nRKuJdJ8OT26YMAt2GRJGJLyyRqNBAz5C42IHW5gVsAR0\nQAu9ePy0Y0Bhlxo7wOP2AgDsWeq1pSShFMy2dFxrGLgzXqiZ/2/m0PksszTDHVEK\nx37CPVgwxEKSywtkqg1sPYyArwp875hyE1bSIB3gLLvTA+AgpfvvLelv4zKcbwFF\noyKOMK8CP6hKS0rvl1OL2BZu6SDH26wuTMxBtaH/0gWcMp7Vc05kbpiL6OR4dM03\n8PvRC/jBOOI3WmW7hJ26bDV/37aK2KuMUC8fyYaJAtXg9U1FU1Q7xrMy7xvC6ibK\naSmdU0Ppq3RROVwkbACBWJCNtmGZ59R1RP+ObqrtL69FhjBHVpONcIiq6RUwQPFJ\nh9glK/gloiBaP6DCABOVQl5XupY8QMrXLsD8p9huH+H8M6sUV9kw4gvNKXYYMeSl\nNCjUarQPCWErZ9O0+E7DErk6b8D23u7WhM/xSYJImQ/luYUQeqD7JzS7S/h8TNUT\nxob/xeLJagWuZCjqFxLXEpGhVhZebTj13IxG1nH3t2UccnKbixZjdHp5Z17qWxVu\nOsYqcMx7CrSUePrcCKJowS5o+3VaX4lQ1QmAydPtbJhlF277UAFCKNvPRDmsKnHA\nfddqexSPa3pS9DBNrbdlSsbCGrN7M1qtmVI0FDa17lvNHNzPz7z+pUtIqeeY+nY0\ne7Zoz7JeMOSDegjroGRBpEzp50nWq9u0FNKbIPKwj6esRIBBJvLgc0fr+AZwvPeI\n1Z225JFq67AZSLO0yKlVmpOdorV19ZnmAjVemI5eElAzGRkQtu36uokXsl68VgnT\n+BxmHD/Gfwrzyd+5+dAolWUVoL/9/L7OyJBQEOogqPQRVBDrlK4Mu8T2WCiSQ+Gl\nQ6NUqGKQs7+JV8/NtTHE9Iy8m5ykrMAY5pHEFR9TKYepwpTELNhfQCw5ByTLcjQI\nYYermoshTshvLzf8z4ZQiKnWQsibq0GfQfmYzXoyYfZu+bSwPAiwUGCo2lgIr3/8\nLdt0T3PIZ2KAHUWfxiGQhAtGtJIcAKgLlXMHnv7lwAhfOu3r4vbXzDKiuTWCei3Y\n7bQ9PsFyEaUYJjfIwLlka8W94S3qXCniszQazoNUHu06cMZHfpq8DadpMFCtetd0\ni7O43CLMXeyC3bxqJKAz4k12DfKFNz5SxJNdp/i1OBN704PWQur69wY+pywVyeSu\nj5ofod/vwgAXgLee7fSqWG8zVNHSRQ==\n=CoE1\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5c1e6ee3063b70b75d5fff53fcc374992162bfde",
+          "sha": "5c1e6ee3063b70b75d5fff53fcc374992162bfde",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/5c1e6ee3063b70b75d5fff53fcc374992162bfde"
+        }
+      ],
+      "message": "net: move the generation of ids for new nodes from CConnman to SockMan",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:56Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-08-27T09:25:24Z"
+      },
+      "sha": "05065c028b42f36fc0414810e54b381ccd08909e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDk0ODU0MDA2MjQwZmQ1NjYxMTBjMjI2NjRiYWFkZmEzZmU4ZmViNjM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/94854006240fd566110c22664baadfa3fe8feb63",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/94854006240fd566110c22664baadfa3fe8feb63",
+      "tree": {
+        "sha": "abb1d428b496fbf8fc397da29688b770f723ba89",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/abb1d428b496fbf8fc397da29688b770f723ba89"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree abb1d428b496fbf8fc397da29688b770f723ba89\nparent 05065c028b42f36fc0414810e54b381ccd08909e\nauthor Vasil Dimov <vd@FreeBSD.org> 1724767895 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738071656 +0100\n\nnet: move CConnman-specific parts away from ThreadI2PAcceptIncoming()\n\nCConnman-specific or in other words, Bitcoin P2P specific. Now\nthe `ThreadI2PAcceptIncoming()` method is protocol agnostic and\ncan be moved to `SockMan`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeY3mkACgkQVN8G9ktV\ny7/1gCAAou8XoMkO0EniKexKLgoQMbtxjbcTzC48iU11ZamSAK/DOon1lAS+gQA2\nsXpy8l9S2hSp5qFA88bc0rnwo3+D7vujOB8bq1ZyzpuTCL9tDjgjiSnZchgG/+mr\niw87pkTLPqpoFe7rm39TgiEslbe6a5tH2j7mLyIEbgbbkDlDAMHOIqXvJDtObR+0\nK1K+OPuSbuSSY6LhpZNKyQFiaipTmNu+FMDcaaRK/RwLU6qrY+HweOvPCDso3fQv\ne5iUhCOdQX7Xbm4+V4AMwI/ll/K8g3sRGJ4d+x1E+3LmKWUHiYPgVk/DeLjkZtaw\nU8rbBRIAOr7mSn/bDH+xRnjbAazrVfa0Y9uwbXEgBbDgPZpC1O10inCmLXBF/ojZ\nZzpJulG2M+VdW5eaSBhIGFN2rgNZK7ggPFTe6FYa7lVCqDwPEm6AWBJWFTT2rfFX\nUcA4J/vNgIYXkVeQ6MHgCTNghz1S+Zf/iHgCKS0p1ig++U1DEnLj2B2WlxSd57s0\n+7s7rpVJgFPl6XUnc9UpIQK97AKNTARZcwdgGGYL42r6u2gl8lOcvQzmKZVe9O1V\n2BJvnFfL2w0Edx6Rg4NGpteuG3CoxDwxoVOwDz0DA/fFyySKrZ7WwtrP9f4BKT/V\nfZkXcdwYH05MOUmeX5v2MSC0Z2DIBvifYve4QGScM3OaVGtFic83lDW+Emd8sprI\nHpsHpFmszSYUnmyTh9wVWaLsLxAl4p11jRmpYi1PHZr5cZ4XkCF19cbXp4Zv+4b2\n20IBMPhnyv4jv9yieOzs7nOhMXKs46yvTElcf7MEujtqatIA4IOFdKfYxRcyLpto\nEpsnw60CZDMQg4bCloX3rCFJIrsimK831JRVdige4ZtIcOTObvife06ndpY/e8MB\nDtRtjIeOcj+qbMTD+FYnIZ5Tp7VvifxIh5zULfyILcTOqfuHtY0cXJpAG/8fIS24\nJJux+7G0Kq6oUPRmPop93wpd37Bo+Ku0rpCnlwWhzvA943gW/slHJ3TT1xo6cKi5\nHRH8+J4/f8OIctXj8ZbHGU3ilQPKKqoirlr8UecR2wiznI+8anhobg+GvdcJ9UQ1\nk6lqGH0eTc2Ga3g4w/FuB9p/gwl+M2CxH6FNdXEQlRPsG/UdPohBOqgK6IO3m8TU\nbiH3qXqbms1e74nSo86KHWE5yqE6hws2wKDprZ1jmTknOEcGeRRxni90ZVw0IyXi\nco6QEYNjbNtLzOwPH15QM1NRhmLICXQicq0vv7tb1uyKm0eEqgE09CcHX4dJSDCZ\nlT+7UGK30UsUDy6mNv9pXK9Eeh/q60clxaSRqfwf31bWDZX+QEndsw9ju1VQ4MYD\nR0u8GJKFr5gSTiFt1qLmI0zQfCucEg==\n=RPTn\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/05065c028b42f36fc0414810e54b381ccd08909e",
+          "sha": "05065c028b42f36fc0414810e54b381ccd08909e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/05065c028b42f36fc0414810e54b381ccd08909e"
+        }
+      ],
+      "message": "net: move CConnman-specific parts away from ThreadI2PAcceptIncoming()\n\nCConnman-specific or in other words, Bitcoin P2P specific. Now\nthe `ThreadI2PAcceptIncoming()` method is protocol agnostic and\ncan be moved to `SockMan`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T13:40:56Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-08-27T14:11:35Z"
+      },
+      "sha": "94854006240fd566110c22664baadfa3fe8feb63"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDFiOGQ5Yzk1OTA3MDViNzkyOWNjMjVlYTI3OTFjN2E3ZTE2ZDJkNjg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1b8d9c9590705b7929cc25ea2791c7a7e16d2d68",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/1b8d9c9590705b7929cc25ea2791c7a7e16d2d68",
+      "tree": {
+        "sha": "78e72fc85e08173c7a16a37c756002e4f996f975",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/78e72fc85e08173c7a16a37c756002e4f996f975"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 78e72fc85e08173c7a16a37c756002e4f996f975\nparent 94854006240fd566110c22664baadfa3fe8feb63\nauthor Vasil Dimov <vd@FreeBSD.org> 1724768611 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084148 +0100\n\nnet: move I2P-accept-incoming code from CConnman to SockMan\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZDzYACgkQVN8G9ktV\ny7+AliAAglH0Z8M7Y4eIOeBPZukg23i2CdB/ZYMK14emvAo4oaw+qQ20nKvcg1+W\nkGc/z/60+wVl8hKBH07uhbvTjMSJUb+RiivM08KyxhIIJMBFtJCi/qt4RBKa/WRG\nmXG/9xOg+z76LoMB+sZUAvgif037DbsIXduBHZLMdFeuL1+fHDwfhesiw7qyl/WY\nUlARLhtPm1XgphhWyU2lggkzI/99OAz2O5VAg4XTYhO1HG65CMjOtJyJw6o4IHd4\nuycy61rDAYRriuaVkM+I1Dw8sfqx2wLce7ThgHgNQZyOliOiT9TyD9GCQSohAIeO\n4HeyOMuMfXuL4/M//L0R9M73VUF2cV3F8iVQsujSrHxSnoyak60oZak0/HLA3+m3\nIq5CiAzx4xBCge9IaYVEMXChpWH85EDw+C/9L7y2vWFiwElR1my8PniM+4laC3cZ\nGz3LK70ryncrrCJclwQscLLUecobKGQJ39AH54qNKIETnJ2MpJ0cqtuef1cKm4Ik\nRBAMHSD/xA9J6J6onkS3aFvxm8+Ko+HiGAEFQ7CldT29M3rannF+H0jy+xHiosY5\nqdCM1X3n9Aj0TpTSyObDOBbeiFL9JCwaMkwwzHIzmH+7Qa8YA/brAJ2/eOFb6OIn\n6Ohc2yg8dNEEgdYHXmgJ+rTJAtVK0haM/2qny1lemc0k6u743ZEZvanNkHi7rR8s\nMNqocqrGtOgekaY6cjN1I5Ix8gOrAULU6athfopyD39R8lbceKzXCY5QlXNPA6/P\nHbpLErGgCRf5/ZVq2iVyYCBCh7gMQeY5ToE4/RgN3wNyyaF8IQBsjH4xUmK7j0d3\niDFIZlMxIwHfblqZvbh7r2hYt3CQhShHfuU1mc3gxFGk4deZox6UWdNxwE8CWH81\nwEAloKsJvZs/UpDL4MO8Z9wYwQulm+HA9goH6qLXzeQ5GbaW0sI2F4PHIhuHDksT\nCF29g4vBKEYGJkQHImsLkt/RiDIuoFTucCV0FvOTERO0WFHaoUZjQXcxbcEjuTmM\n8QJNQDkTf9sA+F2poEwzlhSsnzLYHE7Mvd0CodmnsXQlzGv6aXUfqh8NSmagfezB\nZZT3rmJs8wBaKQJiGBagPFE7hrlWUh/P7inUZvecccAFVpoLF2U0omycJCtwncID\nhO5X3bPSXBsdb/AVG3OGhvS8VeUghRIeDYnu2DQP7T9MbCtNLnIP8dbR1g3VniK5\nYvr1l7rpAVl9NV/whNYv4K04TxdxP3g/tgYM3i7eG2KLH1/McZuAd3eyIO3ObXSf\nQ/OsCymIUvGv9SFaXWl5dKlYMPkpR9lziZCX9FiQo6ABPycjykmT/Vu1kncfldDs\neEJ4gJkm8Jz9JGbNmyZXHHNOGffeLQ==\n=T5Th\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/94854006240fd566110c22664baadfa3fe8feb63",
+          "sha": "94854006240fd566110c22664baadfa3fe8feb63",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/94854006240fd566110c22664baadfa3fe8feb63"
+        }
+      ],
+      "message": "net: move I2P-accept-incoming code from CConnman to SockMan",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:08Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-08-27T14:23:31Z"
+      },
+      "sha": "1b8d9c9590705b7929cc25ea2791c7a7e16d2d68"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDBkZmQxMzlhOWZmNmNmZTQ1ZmQzMDY3ZWJmMWFjNDRhMjUyNmJmM2U",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e",
+      "tree": {
+        "sha": "b12b540a9b3a25fcb41ebdd3b18f05bc5bb64273",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/b12b540a9b3a25fcb41ebdd3b18f05bc5bb64273"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree b12b540a9b3a25fcb41ebdd3b18f05bc5bb64273\nparent 1b8d9c9590705b7929cc25ea2791c7a7e16d2d68\nauthor Vasil Dimov <vd@FreeBSD.org> 1726831648 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084160 +0100\n\nnet: index nodes in CConnman by id\n\nChange `CConnman::m_nodes` from `std::vector<CNode*>` to\n`std::unordered_map<NodeId, CNode*>` because interaction\nbetween `CConnman` and `SockMan` is going to be based on\n`NodeId` and finding a node by its id would better be fast.\n\nAs a nice side effect the existent search-by-id operations in\n`CConnman::AttemptToEvictConnection()`,\n`CConnman::DisconnectNode()` and\n`CConnman::ForNode()` now become `O(1)` (were `O(number of nodes)`),\nas well as the erase in `CConnman::DisconnectNodes()`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0AACgkQVN8G9ktV\ny7+6NR//SDCiHbDQcmvuphGwogF06DT0XVTety9b9nz1NCIYyQ7hZu+YDnVV9+fV\nfLfrrpCJJm0+W0Qv6W9RDJiBZ2tDDk9l9VJgF9GPl0HS3lsX24Te4ZreOi1QCdCQ\nU0vJIJQuQSx4Gy4b7qDU0y8QW8rxentmU3RUBdxcHpG+IfKVQvtS0ClSqzzbS4Jp\n0Z4dBtn9pQsPyhQlgLjf8hojTe5KDWol7mgCAMWhWvYgqr/6hcUT+lnjCCG1qYa9\nItsKOfHMRcSGn7ledNriQmSlsMShklBPVGgAnTAoCZEPEkarSw3JWDz5HqE/3rdj\nqBrhVKjEgbib5X2N0a1QSuHFF4B7xSePRqI4iWPavvPa1WX8gLA9f2jQk2Uxh5yy\nnVcGkERcaN2ZdO/864tXg3yvMiRUgdgZLYwHQnStjuOZseI5XcYTWWBuAnY9wK39\nzIvZFkW3T4dvDrZGE+DrMH/aUrkqv+DAOr5KrA5SF91xTa9mtqUHhZw0oVUP/d1H\nUhMy6DMj2W9MbGVcrtgBoOFBxix9JK0qLi7D4v4JKug6EkfBEIXamtXNrX+yzvQY\nb9Tjm9b/uhAFjiVuGxckyPsBN1QqHyINcB1Os305Ye+EHmxqbfXFoMxKw5JcOJLU\n4s/fyV1IlGouzjq+PhGn4s2W6otkzHdcymd0gmnVRYNCxuGMxDkaIYsNrg2fEJa8\n3fLmkND4bXCPBCo7PY7vi8EwAhUipsHE0gYLVyHNRlKaUr1c0EmPa/glyKVwvhGl\nNG0SHcIs04KbDCjF1NC5GWjdI6vXBURRF/3i69Ir1wrtyIQtAzc+hqAiTJs5/6Dg\nN7p7075ZR0BO0FQuHf1+a61c3WrSqi77wtDesJ6QrayMo/F8f3Ox5+5Z84iMmgjW\nuvH1EOcHY61wfUYpTDgjLVVLYrCbdZYcGr3Vt8b/OTXCQ0UNIPhNjBsABhG+6SBW\n1ls3t496Ep0GZMY0lQZ50VzBQdfs8vWq3oQ5mDPMMdpVehEGu5ad5L4ZvQKxeO3p\nNGhneLdlFJkC1yT8PTj6neaieY+Zmmncok6UxWJuVe1HY5shqGW01MzpcWnLhv2q\nrVZNdwTIGH382+4WZcP1ntQZoXMI4wXPhi/ObmlbGrKydZcISKxfmRABVqmXch+M\nrLYkRBe2gPaewDCXHW+9gQmRRDe93YlcLteXg4OUmiBX7hS1pAzUNdDqH96uYKYP\njnUDu/dIHjIqKKwB0Cwziz2Rku10rTSB+U2TNx500j2MDM77bxwRfqQBVM091dwj\n8r+JCyHTne5vqf4SFMmcRihu+4X6LXttORsYlN4790LFH3rBDTDccT6fpmP4CCb9\nlOTRS9zrS5mMB7T2wqFEfiJ0fPXVJw==\n=6Ksp\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1b8d9c9590705b7929cc25ea2791c7a7e16d2d68",
+          "sha": "1b8d9c9590705b7929cc25ea2791c7a7e16d2d68",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/1b8d9c9590705b7929cc25ea2791c7a7e16d2d68"
+        }
+      ],
+      "message": "net: index nodes in CConnman by id\n\nChange `CConnman::m_nodes` from `std::vector<CNode*>` to\n`std::unordered_map<NodeId, CNode*>` because interaction\nbetween `CConnman` and `SockMan` is going to be based on\n`NodeId` and finding a node by its id would better be fast.\n\nAs a nice side effect the existent search-by-id operations in\n`CConnman::AttemptToEvictConnection()`,\n`CConnman::DisconnectNode()` and\n`CConnman::ForNode()` now become `O(1)` (were `O(number of nodes)`),\nas well as the erase in `CConnman::DisconnectNodes()`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:20Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-20T11:27:28Z"
+      },
+      "sha": "0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDdhY2EwNDRhOTMyZTE2MzQ0NWYyZmNjZWM3NzM5YWE3NzY4Y2YzNmU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7aca044a932e163445f2fccec7739aa7768cf36e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/7aca044a932e163445f2fccec7739aa7768cf36e",
+      "tree": {
+        "sha": "4e967a41e2240eb182283bd6b0b0f13d62285fc3",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4e967a41e2240eb182283bd6b0b0f13d62285fc3"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 4e967a41e2240eb182283bd6b0b0f13d62285fc3\nparent 0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e\nauthor Vasil Dimov <vd@FreeBSD.org> 1726905934 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084161 +0100\n\nnet: isolate P2P specifics from GenerateWaitSockets()\n\nMove the parts of `CConnman::GenerateWaitSockets()` that are specific to\nthe Bitcoin-P2P protocol to dedicated methods:\n`ShouldTryToSend()` and `ShouldTryToRecv()`.\n\nThis brings us one step closer to moving `GenerateWaitSockets()` to the\nprotocol agnostic `SockMan` (which would call `ShouldTry...()` from\n`CConnman`).\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0EACgkQVN8G9ktV\ny78LUB/+Mk+a8q/TB7UlNYgiN5QWzkYDBgP+ir3V9KmJM2Ts4wnaL0mpCcAQ/70b\nHkHn/xaH3/2xAzCIh0BHf47Yd3Ul7RYn+yCW3YjW+wQl5GHWgNAPDg4655VU6/AQ\nAYNx2z+QzP1W4ae9h0gIZy3Mz00GDSKCaA+6wZ0mW5Upw1B8YhRP69diGiWiRD6F\nQ/rcsvzgimnNMCm20A6KNZx8c/kQo1pQGqmshwjmFWQfd5TvjIyNKoG97gI0SrXR\nJCoziPzKTLuy4/kyXhV3qmj7C+hE2dFpp5k3obItEkppriugXMJMJre80lXTaIF8\nZRaT/YQiizkyU8Mvs2X9HAUsUQ+9+Rfqr025ZYcq3bOPI/oNaPKRdbgX9W76Z+oS\nkvEMNqPEERXLxeKBm4oyimD7L3kdAdykJa7S6/asY+iucwIcUeDEf/Q+rYs0ECj+\nxZpzqToFrkWzzyiOFMlHIID6Vj2NmcGP7wXmN44ZYWr2EZyUMlV54W1UQoPzkDTc\n5YZK7lp72njTpnJHeF9+U54EE/d+JC0H84pfmdc0jQFp1ZAzUPSRqNNIFmLhWGqo\nv9L+4hDDOHD/4PoST4JG1e8eGU4YVmlktXJLOr4NSizrNaIBtZrmaNvLBpjpvMny\nxIL3Nl7wPzDHJbl3lSf71yWSw6HB6NgkU4kXxR/ODYXBsNfLUAlqnuP8klFvk62K\nLZn+/7Vk5k2hrJ7+tQW7lbajHmjZ3ldRD4n2+lDM/98gysMq3SkAe4RIfYcoWVa+\n5YLCv0iAYH1D6u1FcdVsA5lgkUeX0oG1aqFAissbfvcCAGoUntBXcISML20b1rrG\ndmxxd/Wyg3azlIChwQyDEsjzVeGeQhDWh7fmgLz1+uvmfwYgfOzNKNo06juxJkMt\noa6hAnnbgfGeV6+cN3OPAtw8WT+ATSE3YaiyDhoEhcuc3MD8qZmsewOixgoOVxpD\nD4/csW9kdUUoObnG5SJNcRmRLMPpv2NH/gmPRm2xEvxESMS18c/bwTFsOviEjMzy\n/M6NuPP3cbBtU6d8kCZVi8jtgsZdaM1dFMsvyNTWT98w9LfhkhcCmZIcHrMHq98D\n9MaTTEtSH9+diRfkZfqWh6ngWyGd1S1JZM1VuqGVkt+rW/xGHK0E4fMwAKWograD\n/kiHm9BPXe97yEqtoIRDxXe+l+x4rnx19j50Re4q/OZ37tCt4dArVxgYWDVGSjvX\nmvV/PmeSHeBC4DPg6iONh3KA8PAlA2zegWX44FvrEaXiXlAwBH/6rgKNusDXKFfn\nMZDqc6h50J+cimydlPuO0BDpXPx6zIxwRtY6mtE96IoSxZqvzP+nUW6LktGKYMOD\nW5brdPV7J5jKFl+I/VGZ02Z+B/1aHA==\n=szdT\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e",
+          "sha": "0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/0dfd139a9ff6cfe45fd3067ebf1ac44a2526bf3e"
+        }
+      ],
+      "message": "net: isolate P2P specifics from GenerateWaitSockets()\n\nMove the parts of `CConnman::GenerateWaitSockets()` that are specific to\nthe Bitcoin-P2P protocol to dedicated methods:\n`ShouldTryToSend()` and `ShouldTryToRecv()`.\n\nThis brings us one step closer to moving `GenerateWaitSockets()` to the\nprotocol agnostic `SockMan` (which would call `ShouldTry...()` from\n`CConnman`).",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:21Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-21T08:05:34Z"
+      },
+      "sha": "7aca044a932e163445f2fccec7739aa7768cf36e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGNhNWFkOWUzNWIzNmQyYWZlNDVmN2ExMGNlYmYwZDljOWE1OWI4OTQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894",
+      "tree": {
+        "sha": "57f157d4e177a4130e58bd97520f081afe21f311",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/57f157d4e177a4130e58bd97520f081afe21f311"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 57f157d4e177a4130e58bd97520f081afe21f311\nparent 7aca044a932e163445f2fccec7739aa7768cf36e\nauthor Vasil Dimov <vd@FreeBSD.org> 1726907513 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084161 +0100\n\nnet: isolate P2P specifics from SocketHandlerConnected() and ThreadSocketHandler()\n\nMove some parts of `CConnman::SocketHandlerConnected()` and\n`CConnman::ThreadSocketHandler()` that are specific to the Bitcoin-P2P\nprotocol to dedicated methods:\n`EventIOLoopCompletedForNode()` and `EventIOLoopCompletedForAllPeers()`.\n\nThis brings us one step closer to moving `SocketHandlerConnected()` and\n`ThreadSocketHandler()` to the protocol agnostic `SockMan` (which would\ncall `EventIOLoopCompleted...()` from `CConnman`).\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0IACgkQVN8G9ktV\ny7/h4x//XDx5aNTF2TuirmBnxJlKt2oDt8h4PSq/rmhel3B5EpBODG1tgHIfFDRW\ngS9lGS8JLJ2uVRVhEx4JmysrsZZcmhZuNucYhhSkvvTGmO3n7tG/8YZPFhLl2Dgn\nWJF9U7WXJfn79dM/rdulNnk1d+KJZ3vOezvNHtiyeUsY3DM5u/D8UaVzRdC/C81l\n/XRiJoMOSkAFgcbOPFQ1mvaZAp8HJ+iir6is1A9Vfcdprv3yybLjH4D4GHMEvIEI\nNSlbRzSqLlzk8kb710mX1zveawOT61ZsOoPqGCW0WgyK5f/Ii7vvpMRQpcNoirXe\n0Tnk5K/5t5/G339d86Q48NDygUtbn076Tq58gXdeR+KXEI4FONuR50L0kfMqvswX\nv0Q5R/gPLIAZLprAIxJ7NcTHpSZTOlTpIQGNucZO6H4V8ay8JZFFMvislH5Pa4t7\nR4c4JhoCk/XI4SiJ/iP/CHu4arGoosEJ1Oy9eVpK7axl4wvOTjCCQ723prrjz3mN\nvWjWX/9doZULY5l3XVdPw00nU12khw/2fqYDzWPx6psQHx9RGFC07UY42ohiX38h\nOP5WCYvDo8nsQVifC9qTJyevRGmW3PCVh5muUVjq1l2QJl1ul1iUdtYx3/9Nj/sV\nREURr2vjMwJdAHUIdvxpG9btyE6XeOykZ9bUokvQPMsZKewyKvWqqAooMz18YqpZ\nvL93ktHOPGKrEF53OBFTIotQ9nYV0MLfhUtOwAQwD+geJrTpWlkUQ6Dj0k3gEp2D\n7C5pilPeacan5NsGMuR0T0z53ahGWqfVZECFKC9OPOiSDQ/so4LRJp4cRCUYy0qo\nC22hVArHbaxQoT13qeXuvHCOAmE6l3+9wtt6F9aMQE/vf+581fA9JoqGi4zw5ziA\noWU2L+/0CLFNpS+67Nuwl5aReRNC5GmPGtdmnbWShtK+XSDszMIm9MiK0XcDmfDJ\nOvxJ7LdKY1wcJucsAFY23pvv1Z97bcRnG03jLT32mhIOh8iXFMOSeluAbgxDpDww\nj6gK+etEsWA3NAI1bWJnFfVyRX63GJ2dk1HqxMYA+1QOIIUJCoJsPIRYTKh9854V\nU8MufgmJSXzh/UsAL6faQ+DeoOxYMnAQBExqW8yk5UB46bOzGqhSbhslmkUM/wZa\nGxoPcYQwGCKjchBVCV+07TP4bJwWhBoKy0LFlz+tunhF7MFj2u4LkqBXGXjOF27t\nihTYXrhwJqtaP6XwU9f2c5zacT2ur4IvvtDYF4LZUdMTZRR6vYCcKN1maVK4dczx\n6TMo1Ksy3ElMzG7THf8+uNYJNSybxvJTu1rmNFDx+yXa+HkUfa5PXdj6qEpRSLn9\niyUnWtyg0F1uUVrWL4Lv11EtzCa/nQ==\n=ZSy1\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7aca044a932e163445f2fccec7739aa7768cf36e",
+          "sha": "7aca044a932e163445f2fccec7739aa7768cf36e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7aca044a932e163445f2fccec7739aa7768cf36e"
+        }
+      ],
+      "message": "net: isolate P2P specifics from SocketHandlerConnected() and ThreadSocketHandler()\n\nMove some parts of `CConnman::SocketHandlerConnected()` and\n`CConnman::ThreadSocketHandler()` that are specific to the Bitcoin-P2P\nprotocol to dedicated methods:\n`EventIOLoopCompletedForNode()` and `EventIOLoopCompletedForAllPeers()`.\n\nThis brings us one step closer to moving `SocketHandlerConnected()` and\n`ThreadSocketHandler()` to the protocol agnostic `SockMan` (which would\ncall `EventIOLoopCompleted...()` from `CConnman`).",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:21Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-21T08:31:53Z"
+      },
+      "sha": "ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGRhZjgyMWExNjQxZWY4MGE3YzdiZTU5M2JlY2UwYTdkOWNmYmM1MzI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/daf821a1641ef80a7c7be593bece0a7d9cfbc532",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/daf821a1641ef80a7c7be593bece0a7d9cfbc532",
+      "tree": {
+        "sha": "00123c95a15093ab9b91cfd80e99d14723115b23",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/00123c95a15093ab9b91cfd80e99d14723115b23"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 00123c95a15093ab9b91cfd80e99d14723115b23\nparent ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894\nauthor Vasil Dimov <vd@FreeBSD.org> 1726999902 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084162 +0100\n\nnet: isolate all remaining P2P specifics from SocketHandlerConnected()\n\nIntroduce 4 new methods for the interaction between `CConnman` and\n`SockMan`:\n\n* `EventReadyToSend()`:\n  called when there is readiness to send and do the actual sending of data.\n\n* `EventGotData()`, `EventGotEOF()`, `EventGotPermanentReadError()`:\n  called when the corresponing recv events occur.\n\nThese methods contain logic that is specific to the Bitcoin-P2P protocol\nand move it away from `CConnman::SocketHandlerConnected()` which will\nbecome a protocol agnostic method of `SockMan`.\n\nAlso, move the counting of sent bytes to `CConnman::SocketSendData()` -\nboth callers of that method called `RecordBytesSent()` just after the\ncall, so move it from the callers to inside\n`CConnman::SocketSendData()`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0IACgkQVN8G9ktV\ny7++XSAAl+G1tlq+Wb5iSbNJVL2AJviVjKOBWqSWYfiUHnkXec9ih61q6mftl4E6\nPdXJGKcidi6rYp3gwOT9NNBFCnLDXQxu72ehXecLGPmCGOJJzn6AFWaPnh14mrug\nS/bMRCXdE8cVvwCC795nPc3AcU8b9GLkV7fuTXhuSjgJ1JGX9d89hlKZKkx0nAky\n+TmkLT8O6LCbcHot2roKDmKwA6ymwvStffDZeweArMOVo+B7lJPUMdXRHA4I158i\nDnqMEzYJsnmU/PK+BvNzgKyyF/GdEwpXIGCBkDtjNGaRBPmbqUz/Yi5ryD6hRXbm\nuMbs+w/bumOhdOA/OB6QNoNTCiNucfwrH/jyWUkkycFU1TpYAE0dcwP2UYwGYK4U\nE43Nva1tP9b5K7YTmR+2lXqXdjZT9nUPE4rwnBTyejzfeTU/JpxwbMc5nM4fHFXk\nT7qzvLPSzOqrrgbpvjt2IQQXWhfU9rZkO0A3WsTjxUAPMI8m537sW9cC9XMtbJ/7\nsdGV7J4NCVqCu4Lh8tAfL8fITRyaA/XviPMzUasK7ZBR8tlp9pX83m6bFSQ2zciP\nx584Mu9TJCr8lIXO1ZK9CsgWgCseT8p3INcSWDMgjypXaYFfxkoAsb0Y8imkOxY4\nFKM1SPTB/DkOr8Och8f/idKiJ3ih8jhxJ8yxcNf4bd4wpB8oV5thBoWl8ukp1DFF\nrrtIX2IOr+tfKwoeQmooC96VJoUy2XUnC3S8FLkpapuLM4coGnYj/nk7nHCzyKxS\nKo7yDzp+IENEUznZPtutbbpXoLzszZdzYlpktdI/2KH1Sd9Bgpha0TnCH8z4RQ40\nkevyXSV86KIIOeMZDbhl/bIS85149naLrHOwvl32Oxzt6OSeNPi2k4rNoMn63olw\nIv/ZQNvweRiKsxbD0DFZ5CEWDTWGA0TuNUuqdelAC3dTxEM252HGJmz29jrHO9aW\nkAXRdTkD6O9+srwqhPHpGrS1kRkf/ePs+OlyI9MZSYO1Ml1+JEcUs3JYSJKOqB4e\nbWOXxRCpw9aMd7cFKzppqnHaD6ZK16RSY5XMHIvXbmrA/a0kZZfG+tImnfhzTTXI\nLd6h/zSvWp+hhnOKTObbp3WwC5b50uyR7H9sf8GEXMB2xyyxQdut2q+jRfDS8WkG\nwir/pOvAbBnjlLTF22Qd5MoHrec0z2MSf5XbI9pEA61PabuYAGrwO79Qe5zAupqG\nqFZiPJ5r+y+hoKQDqhB+Nl2gr2RXacM7z6PvzyBzt5tvaj1wjEQ9++sIGqXzUD3y\nwj+Qh/ADSjsRLCAzvwLC6u8Cf2kuD7F+4YV+Ip12SqONqusGMWC5FNh1rFMcfpol\niJtGsr//81gAZMqbVqEfOXi7oy5XXA==\n=Yoki\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894",
+          "sha": "ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ca5ad9e35b36d2afe45f7a10cebf0d9c9a59b894"
+        }
+      ],
+      "message": "net: isolate all remaining P2P specifics from SocketHandlerConnected()\n\nIntroduce 4 new methods for the interaction between `CConnman` and\n`SockMan`:\n\n* `EventReadyToSend()`:\n  called when there is readiness to send and do the actual sending of data.\n\n* `EventGotData()`, `EventGotEOF()`, `EventGotPermanentReadError()`:\n  called when the corresponing recv events occur.\n\nThese methods contain logic that is specific to the Bitcoin-P2P protocol\nand move it away from `CConnman::SocketHandlerConnected()` which will\nbecome a protocol agnostic method of `SockMan`.\n\nAlso, move the counting of sent bytes to `CConnman::SocketSendData()` -\nboth callers of that method called `RecordBytesSent()` just after the\ncall, so move it from the callers to inside\n`CConnman::SocketSendData()`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:22Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-22T10:11:42Z"
+      },
+      "sha": "daf821a1641ef80a7c7be593bece0a7d9cfbc532"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGY0ZGEyMGE2NWFiZGQyNzYxOWNhN2Q5YTQwMDc3ZTNhODBiZDRkNmM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f4da20a65abdd27619ca7d9a40077e3a80bd4d6c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/f4da20a65abdd27619ca7d9a40077e3a80bd4d6c",
+      "tree": {
+        "sha": "2348fd42ad4ed02204b06302cb041d9e1aef29cf",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2348fd42ad4ed02204b06302cb041d9e1aef29cf"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 2348fd42ad4ed02204b06302cb041d9e1aef29cf\nparent daf821a1641ef80a7c7be593bece0a7d9cfbc532\nauthor Vasil Dimov <vd@FreeBSD.org> 1727088625 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084162 +0100\n\nnet: split CConnman::ConnectNode()\n\nMove the protocol agnostic parts of `CConnman::ConnectNode()` into\n`SockMan::ConnectAndMakeNodeId()` and leave the Bitcoin-P2P specific\nstuff in `CConnman::ConnectNode()`.\n\nMove the protocol agnostic `CConnman::m_unused_i2p_sessions`, its mutex\nand `MAX_UNUSED_I2P_SESSIONS_SIZE` to `SockMan`.\n\nMove `GetBindAddress()` from `net.cpp` to `sockman.cpp`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0MACgkQVN8G9ktV\ny7//6CAAq8uXsGEOzmvi3+/QByqnV5qjlwm23Sw0CLqeAhMnD0D7XojvqvU8j9Yb\nyVpNnlOWzBXqiG+ovulj7GB6o3tm9g7hgHNpHvAC50/FuXmcz3R27q+EWrB5JcLL\nLNc26W83D3dQ+grOHKJZoZ2CKdHlL2SXjKqeeSUl0doFs8/cGDwFtup2brrScN3j\n2jhBBmK6TUJHaoXclUpkKW+Yf9oL9f4DveRMa5FeSlLT/MthrT+GI8mLbh4PdTk4\nzrM6Hu8sFBOZWYH05f2jEiXsk8BivZ/luHVdvcBMS6wB3ocpfqOVE3n0n0yRmd27\nfagDRkDw8WJGRYJCtOmFwRazu6YIWKNWEjZouv1k9bk6MA1TRJD3CZYSfWp3tLVN\ncb25LVP0G4jsGYHnk/73Y8gwTs9AVJeo9AFDAqW/8YBGxL9eWnd8BQcBBovCm6OM\nPX2XRTDgol/FUI9VG/tAdfwGrvCXrKpKnO988MsOYrQS+4xUCxUe2UmuBCnK7k5r\neGUBXZDvRsp3mQcM8NUM5Q5xnDu/YrzvdqltT/Q3PrcOlUkkU/ktOHPg66pYOsKx\n8KgXQsbh2KrskwOepETBoePZJ66cdWxplyBUmoULTzXJjlZo8Expob0Y0rgqbXTn\nXPUW1z5+F0tsH75sf1pcVwWNyvmjQ/AlMgz+F6LBzuzWo+LlamIBExAx7BrHT6uD\nmXjfwqbZcECJeFfK53oI+N4ozHn2QMChrusJslXF3eJkZ+NfFcHluTbM1AEKjuFh\nJ7qmQoXQyT2SNI6m3tjn857oasNoil6UbADQvMyD+feU++Qsx1YUNYpyqA9tfmDC\nPb5PAX3PQ1DBqbXMkgUjGTb++gePzKPzOAnzuliob3z0w5Gi7lIbNh+QOoF5sPbC\nJykezkthfhdowufPGOWPi4zAoYCv3SBys9QH+lBXJRySVLLZzuynPDlbRtluIRhM\nP4f2iUZ15r/2efq/FuJRysVnbvF3sdLKB+CA8e6GOLSRq83l1JJ3A+zlW2AOA9Cz\nC5BrKOhHGixmEuxBC3geTlcW+zGid1+oMtr/WR1w2xFdIBGPBM7Apnm4efslxexW\nYRDXc0196dHz8qYxu8bboWM/vGuIpkRjEqdAoaBipZYWMVZvBLI7OqqVn73iVuQK\nZAOiMwgr/Rh7H/qtpYCpVjRXq6NNmq2G996Q7F6dZHnbnyegy6fHkudJd3AwJsQd\nJkhdzR/zxqlolXmoKtn5UYtju4h/S/OoCh18DK+vrsZ61jbDUZQOPTiFPhtjEvKB\nBpZr3acrjBncPTBA228WBUi6VvHHwq6NSZLwDuuDlBZLeamvq4RO+hsOFJmmhLKe\nGwV2UvJNeJzlg90qoApNaDP+baAPDQ==\n=Yd/w\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/daf821a1641ef80a7c7be593bece0a7d9cfbc532",
+          "sha": "daf821a1641ef80a7c7be593bece0a7d9cfbc532",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/daf821a1641ef80a7c7be593bece0a7d9cfbc532"
+        }
+      ],
+      "message": "net: split CConnman::ConnectNode()\n\nMove the protocol agnostic parts of `CConnman::ConnectNode()` into\n`SockMan::ConnectAndMakeNodeId()` and leave the Bitcoin-P2P specific\nstuff in `CConnman::ConnectNode()`.\n\nMove the protocol agnostic `CConnman::m_unused_i2p_sessions`, its mutex\nand `MAX_UNUSED_I2P_SESSIONS_SIZE` to `SockMan`.\n\nMove `GetBindAddress()` from `net.cpp` to `sockman.cpp`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:22Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-23T10:50:25Z"
+      },
+      "sha": "f4da20a65abdd27619ca7d9a40077e3a80bd4d6c"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDIyYjU3MzRlYWJmN2ZjNWMxYWNkYTVmZWE2ZjMyZDVjZjY1YWE3MGY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f",
+      "tree": {
+        "sha": "9e47426ca6bb99248272408ab2f757f97f4fa0d5",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9e47426ca6bb99248272408ab2f757f97f4fa0d5"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 9e47426ca6bb99248272408ab2f757f97f4fa0d5\nparent f4da20a65abdd27619ca7d9a40077e3a80bd4d6c\nauthor Vasil Dimov <vd@FreeBSD.org> 1727163707 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084163 +0100\n\nnet: tweak EventNewConnectionAccepted()\n\nMove `MaybeFlipIPv6toCJDNS()`, which is Bitcoin P2P specific from the\ncallers of `CConnman::EventNewConnectionAccepted()` to inside that\nmethod.\n\nMove the IsSelectable check, the `TCP_NODELAY` option set and the\ngeneration of new node id out of `CConnman::EventNewConnectionAccepted()`\nbecause those are protocol agnostic. Move those to a new method\n`SockMan::NewSockAccepted()` which is called instead of\n`CConnman::EventNewConnectionAccepted()`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZD0MACgkQVN8G9ktV\ny78bFR//e75TP+/m0zKiQs2AYsm4u1Y8GGTMg2zWNwGVpLqPNVwp3bVppJZd3Qb3\nYeB5tFX4aq3RB78Cv7npATPfEpnH1W6OXH4I2h9g+unCrGnXtMjE+w6qOwAOyhT5\nwyu90tjr56OvwmAHcfYc1X2DcrDcV9y4JEoUH3qHGI001gHVZyI9GGLw5ffkvXKv\nJEAZAEuZBqOwfsXesBiikowEvqpGOQDopI5sl4Zwz2pj1CS+I9PydVFprfpZoBVq\nJK1cOZvsRYrHPAP8Bx/XOjLE+tNKUwhQhy9L6FkkChzUjgSkL5UrwYd5S9vAcoUv\np6PnioefSl2mnza8KhMcaRuvfO2L2vbQ2Ngi9e3S9Y/w/hURulUT1UBof8M2d7PI\nUNYwU/Zvk+QZw7VMYpByC2eIwEtZ5ANdavWpoUJR4w5MOuxfAYK9ajg8V137GTu9\np1fEJc71y8hl5vxX/NjHo3f05GEr2qWayqkKJECDIaMs3NbHm2IOfH7yTuMMEcxD\n608ILzCklXsCCkzwF2fpVzbTtSeRjZcLRpTQ+FbPongvINLhtovAstm5ehTvvNgn\nUZYb0LMXG/rhpXbWgIJi4v8ohOUibUTiqVoLnic+K1nu/Ke7LHsUSm01H9rdnGj1\nATtDrS0rlfxNFtIrAUcv9W5SydpgOEmbLTL/aCEkKm0vZKVmYDGBdJoLpWqOWZfg\nV7nioitIl/F/TQZ4zW9HHJlnrOobo19APQewySkwgYUKwpVtlRbBwt9Okln7e64f\n+5JFnXm6Zy/W85I0A146XLecf8udfv42NSVPBBF/yKtDATjlnwFE6xTfSwhpsNxY\nkddOHXn89HlevF7gIh6zwUPs27MDkhM1Q9946ccOafVWCd3lI8APQYMz2bHFLwkH\ndxNNrozHuuBURw2dLZWfo9WQR0wey4l9EC3BiWATe6V5nbIeXyHurWY8xhNXLA+X\n5RDLvMsIq8eNyltEbxwhMOyFa14PYN46pV7rMZW9+c43j8DpShNUOulWNCKeRzuX\nodVJj2V6LEhjy7GAycK7nwSATsxC9jFKZvPuefwbTgFxd5wlEQxX23P/18YV7Gbr\nDXK09aDq3czeE9mKSrIhI5Ybcp9rHt8kw4tRgQpzLYFwBElz0vWuMDK25IGv7PIy\ndpjHu7GnASteI3gK7vWkXQ5Tc/rntZbxmDIPAmNwlN5Zj/jmyPB2vGYoW+CCcjSR\nAmZ5m5pFUDFeFHTOm759il3Jqa4ke/i5Sv1i+v4EvmiHgungc2ZJrU4eCqvJiH8H\nrYo6lELSntjWe60Bb7uxKbK7jpAf58+suuhChmuWg/9TfsKmR1QgHqqyi6RB3Md0\ni4fayY5krv5wFYG6m65N54HYuYb3lg==\n=EwxV\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f4da20a65abdd27619ca7d9a40077e3a80bd4d6c",
+          "sha": "f4da20a65abdd27619ca7d9a40077e3a80bd4d6c",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/f4da20a65abdd27619ca7d9a40077e3a80bd4d6c"
+        }
+      ],
+      "message": "net: tweak EventNewConnectionAccepted()\n\nMove `MaybeFlipIPv6toCJDNS()`, which is Bitcoin P2P specific from the\ncallers of `CConnman::EventNewConnectionAccepted()` to inside that\nmethod.\n\nMove the IsSelectable check, the `TCP_NODELAY` option set and the\ngeneration of new node id out of `CConnman::EventNewConnectionAccepted()`\nbecause those are protocol agnostic. Move those to a new method\n`SockMan::NewSockAccepted()` which is called instead of\n`CConnman::EventNewConnectionAccepted()`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:09:23Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-24T07:41:47Z"
+      },
+      "sha": "22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQ2MTMxZDQ0ZmFlYjc5NzkwOWUwZmMzYTIwNDI0OTJhZGVmOWFhMGQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/46131d44faeb797909e0fc3a2042492adef9aa0d",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/46131d44faeb797909e0fc3a2042492adef9aa0d",
+      "tree": {
+        "sha": "6e6a9992a7aa89fd3d3dbdccd58b392b07f4341c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6e6a9992a7aa89fd3d3dbdccd58b392b07f4341c"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 6e6a9992a7aa89fd3d3dbdccd58b392b07f4341c\nparent 22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f\nauthor Vasil Dimov <vd@FreeBSD.org> 1727082212 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084454 +0100\n\nnet: move sockets from CNode to SockMan\n\nMove `CNode::m_sock` and `CNode::m_i2p_sam_session` to `SockMan::m_connected`.\nAlso move all the code that handles sockets to `SockMan`.\n\n`CNode::CloseSocketDisconnect()` becomes\n`CConnman::MarkAsDisconnectAndCloseConnection()`.\n\n`CConnman::SocketSendData()` is renamed to\n`CConnman::SendMessagesAsBytes()` and its sockets-touching bits are moved to\n`SockMan::SendBytes()`.\n\n`CConnman::GenerateWaitSockets()` goes to\n`SockMan::GenerateWaitSockets()`.\n\n`CConnman::ThreadSocketHandler()` and\n`CConnman::SocketHandler()` are combined into\n`SockMan::ThreadSocketHandler()`.\n\n`CConnman::SocketHandlerConnected()` goes to\n`SockMan::SocketHandlerConnected()`.\n\n`CConnman::SocketHandlerListening()` goes to\n`SockMan::SocketHandlerListening()`.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZEGcACgkQVN8G9ktV\ny7+d7SAAqpaL8FlPYaIZjb1axqMJZisLKUFWEHZC9dkOEybEPxCcukwO10a8cbYK\ngayQOTeW6T7uzFrfTxKf8EHyKm056JbcqojRbbB4T33oFxHbX2gEcLlhNwfS7DV/\nWcCfYsmU7hHS3CG7T3TLgVzSZJIokHn8e4x1ns7WTmzQtY0L5j8yJocjRERE0W9x\nhpppUVr1YNJRd9/Ox0ZWfzNXFMnt+Jcc0Prw227KXcQrf7UNghBE4xuFBK5TZnkF\nJpkOYbSvH066xBrA49NylKah82SKjxg8jvMgluJjqu0BIkPEBxdYKTIrsV0OUljo\nLvXQR/PG1smQW9r9P3soRuzXeemdrv4dYt1j8Te49oFRl6DFE3RZSX203GJKNAWJ\nRlXad3brYRwNvL6S55uNZln6BtG1OJbzOK9f+oToIM8iMhyyAKxgBAMTSMx4enz5\nYRThIpPSDF0VLW3wxOZc/Vq1Pa8nHnPJFfTMX3JxmIjwttjQKxTOSCGN9AQJbD3S\nRWw25kRogrID4mdCXdzzWk8tCzmv3/9FG0tQy6qAAPvmUMNLtPE0IELBSkCQ+W0Q\n9FC6jJ0zb3B9f/GtVTbf3nqx9KIES+TtdyygI29rwfcTK2m0CFsB9mngb15W07Uk\nZNr5jhT97h4QuETO9NGaGzeC6UWTQCkVhbs0Qv8TVBDKcBRRjPVrUja0Telv0Qp8\nSa+0LwOaH01YPOtvxUNs241zGEtoZtWMBmhWXLDj7zWwx6pxMfh644MAG1/CDoUm\n8i60qXzmvC97CGv+q2GBGD+A2/Q/469VK1dDFgSKGqkR1edrdGyntPtw+/GE46Af\nhCUY25qP77SL8WwnpOwI4suu6ObCbro9iJMQ3rzwE3tXBNpV8VhF3eRaYTJZ/cPT\nl6gITdwiHkeGc3nd03vJ4UD7QE6scSPJ2z5GrvehC1/maFwb8emjNeRm4lNzXK16\nbkFsK0TC/oTDaY4G60q+B7jhY/GxDhoOFWD/oeliTiQjw3qvnv/BVMJCeKplfc7e\n31asbpv2RxQSn+QiDgXOgpeqKoAlcg2xjyQDm5c6See6XLXXHdEvLAfJ94/DYkhq\nVLyGjIUs2xJS8psd3OZ6TZCu/Md8FnGrug9hC08ajRfggIeuGBE7Aql3fk2/ILFk\nPTaaDevv5rQ+pjBkw7PlRHlm9QFecnlMBu7c9ANfjr+txOsjdu2qBUEZKh6xo4/2\nJLZKsHEakZnnU8F9UPZQVxhLTB6NUCuRfSlxC/EqsbgBbWItUX5+z5y4dpJZ/5h9\nQkaBGih3wbFaOW9iP74eoGSkgjjgy7UkiZomsdmxWmepSvvqKnwuU9I8MaMpT0TU\n2tZ+ze/cD+6TguXhhQRTrIDYzeL3GA==\n=prnl\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f",
+          "sha": "22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/22b5734eabf7fc5c1acda5fea6f32d5cf65aa70f"
+        }
+      ],
+      "message": "net: move sockets from CNode to SockMan\n\nMove `CNode::m_sock` and `CNode::m_i2p_sam_session` to `SockMan::m_connected`.\nAlso move all the code that handles sockets to `SockMan`.\n\n`CNode::CloseSocketDisconnect()` becomes\n`CConnman::MarkAsDisconnectAndCloseConnection()`.\n\n`CConnman::SocketSendData()` is renamed to\n`CConnman::SendMessagesAsBytes()` and its sockets-touching bits are moved to\n`SockMan::SendBytes()`.\n\n`CConnman::GenerateWaitSockets()` goes to\n`SockMan::GenerateWaitSockets()`.\n\n`CConnman::ThreadSocketHandler()` and\n`CConnman::SocketHandler()` are combined into\n`SockMan::ThreadSocketHandler()`.\n\n`CConnman::SocketHandlerConnected()` goes to\n`SockMan::SocketHandlerConnected()`.\n\n`CConnman::SocketHandlerListening()` goes to\n`SockMan::SocketHandlerListening()`.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:14:14Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-23T09:03:32Z"
+      },
+      "sha": "46131d44faeb797909e0fc3a2042492adef9aa0d"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDI2NmFjMzI2NzM5MDI3MGU2Nzk0ZDQ3OGFhMWZiZTQwZTg4ZmZiMGY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "tree": {
+        "sha": "ff012761ac4781435d7fceaf7c67d754fc0a2caa",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/ff012761ac4781435d7fceaf7c67d754fc0a2caa"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree ff012761ac4781435d7fceaf7c67d754fc0a2caa\nparent 46131d44faeb797909e0fc3a2042492adef9aa0d\nauthor Vasil Dimov <vd@FreeBSD.org> 1727082359 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1738084458 +0100\n\nnet: move-only: improve encapsulation of SockMan\n\n`SockMan` members\n\n`AcceptConnection()`\n`NewSockAccepted()`\n`GetNewNodeId()`\n`m_i2p_sam_session`\n`m_listen private`\n\nare now used only by `SockMan`, thus make them private.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmeZEGoACgkQVN8G9ktV\ny7/22iAAq+E2ysRJb59WvNV33vIMk4PqeB0Y0LhF+jcLe4LGCIap3AnTGzbnAD4j\nZxZYVrShPyzQvYHuacon1yeCiXznk7fxjpJwFNOJq9YiwJdu16RquqFE6SBdkdSO\nhg4+6btqKL/KmZROkhbXWqgLtkVzUKEUBybRyTqMjTe0oIew2lnM6Ln2/wy2Hw4B\nhtUDUV0hGDt8jnXuQmIzqwdKZat4zowc5ARpwdcw9PKpMkwHID9P2CoHL+5vP7sc\nqvrrmvkhBvBwH0TcsZ7QwbjeeVunXbeKSn5CNIopMC5eSp3DUWCc16UWDDT9ELqU\nKFCfKjyRYSKxSwi7OqovTpDAFh+sm7k9rwZhIR6c3GPn9/N4irN2BUtr1njqwMOa\naP0+dSZ9qqWeESfiPWusjujb5oQObnzG1sYTbheUV+HjTcF3nwe65WBsG3Vm24nj\nGVgFhQ4lpmN2htAaeUw855tYV5SklvxRQ3Wtkea5cb2kggZNWof53b7HUAhXGZmw\n+BmsICGoGmwOus1dYxAhb3twF1xFeazE/ORI/68O3CqG7eSy7+742+Tf9D8By+jF\nfVauv2hqjr5JooK5nfrSgiJg0EfElUab939rB8/J2erc7nz1w9pPRMBHZqoUWJcc\neoyoaE5Y0NDdlSVKEhVTGuC/Vqq5/Efl19/SDVHSQdV+Jp+wKlyf2crXlwMT/BLx\nA3TH7Uny7MFSqSopLANoikpYMFaCcPsrdVAso1+S/LFpto1lx6OMeXqD7yOuccIM\ncpoYjl6OVfSZUqDyzZHjLGlBxdZmDN2AS4Lcbfb831RMaMsCAdQyRseBX/q8dqdQ\nRIgltVoL70XeASjwvHbVUghL7W402vMLC1mZLKCoTEniYbBRy5Fjv5kFoaGzL7Ms\n4+ZDiTBgoIy4ljjaFp+WWThpxh8UGVRgSnYStVTlemwM/Ke+3ZDUskNlAGi9ztvp\nT8Ti8E2CY5BhdcsB5EpWsRs2PBsq+VXGhqBI3ciqY42v1q6R+e1KhDqq4mrtkzsX\n6P0b7bkBdW9RJCpLU4NYGQkqcgKKraiUhYfcuaWUTge9uI7IkWjJPlzmglEtCpZZ\nBC5hUXR0iOglLEVyBSxTwk8VPZqnb/CW440BuCKncs8NPaUAYsmN4O+InzMsbF2N\n4oZajYRjiXyRvbPgKjtEWBN5UK03J1TNPsl2T9taqI51wWNvwP3xdnNURZuEIu2M\nDk2qpYpR7fqlG7gd4VprVH8bVdA+WhEnKU/ZGkiokjqhPgbUDAoGL9eRwDibwDuf\n2jE1jfd0p+Ms2vGFcDyrrlU1wliHwkw8yb0xVT02+/eNPzfXxhIMJltGo2xWD1j0\neaAyHt+QMw5Z/YKNDC8CCXZF41gJFw==\n=QIoA\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/46131d44faeb797909e0fc3a2042492adef9aa0d",
+          "sha": "46131d44faeb797909e0fc3a2042492adef9aa0d",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/46131d44faeb797909e0fc3a2042492adef9aa0d"
+        }
+      ],
+      "message": "net: move-only: improve encapsulation of SockMan\n\n`SockMan` members\n\n`AcceptConnection()`\n`NewSockAccepted()`\n`GetNewNodeId()`\n`m_i2p_sam_session`\n`m_listen private`\n\nare now used only by `SockMan`, thus make them private.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-01-28T17:14:18Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-09-23T09:05:59Z"
+      },
+      "sha": "266ac3267390270e6794d478aa1fbe40e88ffb0f"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 16096912166,
+      "node_id": "HRFPE_lADOABII586YIJemzwAAAAO_c2Mm",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16096912166",
+      "actor": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "created_at": "2025-01-28T17:18:56Z"
+    },
+    {
+      "event": "commented",
+      "id": 2619619537,
+      "node_id": "IC_kwDOABII586cJDjR",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2619619537",
+      "actor": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-01-28T17:20:15Z",
+      "updated_at": "2025-01-28T17:20:15Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "`bcf1254e91...266ac32673`: address suggestions\r\n\r\n> Don't forget to drop \"Also, separate ...\r\n\r\nDone.\r\n\r\n> Along similar lines, though less important, you could also have a separate commit that drops `ListenSocket` ...\r\n\r\nDone.\r\n\r\nThanks!",
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2619619537",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30988"
     }
   ],
   "comments": [
@@ -3710,7 +3836,7 @@
       "path": "src/rpc/net.cpp",
       "position": null,
       "original_position": 8,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "03f6cc2b4a76cafd278b9ab92bd915d3946212a9",
       "in_reply_to_id": null,
       "user": {
@@ -3763,7 +3889,7 @@
       "path": "src/rpc/net.cpp",
       "position": null,
       "original_position": 8,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "03f6cc2b4a76cafd278b9ab92bd915d3946212a9",
       "in_reply_to_id": 1778257807,
       "user": {
@@ -3816,7 +3942,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "70c2f13f83a5cc740330d0b4af9cbd74515be6b2",
       "in_reply_to_id": null,
       "user": {
@@ -3869,7 +3995,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 45,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "1bfc1ca9b6b68c6356ffc23ecf01e417152ade95",
       "in_reply_to_id": null,
       "user": {
@@ -3922,7 +4048,7 @@
       "path": "src/common/sockman.cpp",
       "position": 88,
       "original_position": 57,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "41c87ddb3d7a18d2c0fa7eccfbde57e9d6e898c2",
       "in_reply_to_id": null,
       "user": {
@@ -3975,7 +4101,7 @@
       "path": "src/common/sockman.h",
       "position": 23,
       "original_position": 8,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "5d4920f630417ceeee1c79304faac6803795cd64",
       "in_reply_to_id": null,
       "user": {
@@ -4026,9 +4152,9 @@
       "node_id": "PRRC_kwDOABII585rlanQ",
       "diff_hunk": "@@ -124,3 +143,39 @@ void SockMan::CloseSockets()\n }\n \n void SockMan::EventI2PListen(const CService&, bool) {}\n+\n+void SockMan::ThreadI2PAccept()\n+{\n+    static constexpr auto err_wait_begin = 1s;\n+    static constexpr auto err_wait_cap = 5min;\n+    auto err_wait = err_wait_begin;\n+\n+    i2p::Connection conn;\n+\n+    auto SleepOnFailure = [&]() {\n+        interruptNet.sleep_for(err_wait);\n+        if (err_wait < err_wait_cap) {\n+            err_wait += 1s;\n+        }\n+    };\n+\n+    while (!interruptNet) {\n+\n+        if (!m_i2p_sam_session->Listen(conn)) {\n+            EventI2PListen(conn.me, /*success=*/false);",
       "path": "src/common/sockman.cpp",
-      "position": 308,
+      "position": 309,
       "original_position": 56,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc",
       "in_reply_to_id": null,
       "user": {
@@ -4068,8 +4194,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 308,
-      "original_line": 308,
+      "line": 309,
+      "original_line": 309,
       "side": "RIGHT"
     },
     {
@@ -4081,7 +4207,7 @@
       "path": "src/common/sockman.cpp",
       "position": 88,
       "original_position": 57,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "41c87ddb3d7a18d2c0fa7eccfbde57e9d6e898c2",
       "in_reply_to_id": 1803692315,
       "user": {
@@ -4134,7 +4260,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 77,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc",
       "in_reply_to_id": null,
       "user": {
@@ -4187,7 +4313,7 @@
       "path": "src/net.h",
       "position": 325,
       "original_position": 31,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b96beb27d2b3d06a45644c537c114a08f0ccd285",
       "in_reply_to_id": null,
       "user": {
@@ -4240,7 +4366,7 @@
       "path": "src/test/fuzz/connman.cpp",
       "position": null,
       "original_position": 6,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b96beb27d2b3d06a45644c537c114a08f0ccd285",
       "in_reply_to_id": null,
       "user": {
@@ -4293,7 +4419,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 14,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "bb5b91d430026c4826a2107c8c1a311518cc97ce",
       "in_reply_to_id": null,
       "user": {
@@ -4344,9 +4470,9 @@
       "node_id": "PRRC_kwDOABII585rmCo3",
       "diff_hunk": "@@ -127,6 +127,22 @@ class SockMan\n      */\n     virtual bool ShouldTryToRecv(NodeId node_id) const;\n \n+    /**\n+     * SockMan has completed the current send+recv iteration for a node.\n+     * It will do another send+recv for this node after processing all other nodes.\n+     * Can be used to execute periodic tasks for a given node.\n+     * The implementation in SockMan does nothing.\n+     * @param[in] node_id Node for which send+recv has been done.\n+     */\n+    virtual void EventIOLoopCompletedForNode(NodeId node_id);\n+\n+    /**\n+     * SockMan has completed send+recv for all nodes.\n+     * Can be used to execute periodic tasks for all nodes.\n+     * The implementation in SockMan does nothing.\n+     */\n+    virtual void EventIOLoopCompletedForAllPeers();",
       "path": "src/common/sockman.h",
-      "position": 250,
+      "position": 257,
       "original_position": 18,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "50cb52470ea6cc4de5a5e5260b8f308353942ec0",
       "in_reply_to_id": null,
       "user": {
@@ -4386,8 +4512,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 250,
-      "original_line": 250,
+      "line": 257,
+      "original_line": 257,
       "side": "RIGHT"
     },
     {
@@ -4399,7 +4525,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 23,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "50cb52470ea6cc4de5a5e5260b8f308353942ec0",
       "in_reply_to_id": null,
       "user": {
@@ -4452,7 +4578,7 @@
       "path": "src/common/sockman.cpp",
       "position": 24,
       "original_position": 9,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "3bb0145514978092ae966e30693cf619e4034837",
       "in_reply_to_id": null,
       "user": {
@@ -4505,7 +4631,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 4,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "3bb0145514978092ae966e30693cf619e4034837",
       "in_reply_to_id": null,
       "user": {
@@ -4556,9 +4682,9 @@
       "node_id": "PRRC_kwDOABII585rmLuS",
       "diff_hunk": "@@ -74,6 +79,37 @@ class SockMan\n      */\n     void JoinSocketsThreads();\n \n+    /**\n+     * A more readable std::tuple<std::string, uint16_t> for host and port.\n+     */\n+    struct StringHostIntPort {\n+        const std::string& host;\n+        uint16_t port;\n+    };\n+\n+    /**\n+     * Make an outbound connection, save the socket internally and return a newly generated node id.\n+     * @param[in] to The address to connect to, either as CService or a host as string and port as\n+     * an integer, if the later is used, then `proxy` must be valid.\n+     * @param[in] is_important If true, then log failures with higher severity.\n+     * @param[in] proxy Proxy to connect through if `proxy.IsValid()` is true.\n+     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\n+     * proxy, then it will be set to true.\n+     * @param[out] me If the connection was successful then this is set to the address on the\n+     * local side of the socket.\n+     * @param[out] sock Connected socket, if the operation is successful.\n+     * @param[out] i2p_transient_session I2P session, if the operation is successful.\n+     * @return Newly generated node id, or std::nullopt if the operation fails.\n+     */\n+    std::optional<NodeId> ConnectAndMakeNodeId(const std::variant<CService, StringHostIntPort>& to,",
       "path": "src/common/sockman.h",
-      "position": 103,
+      "position": 110,
       "original_position": 50,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "3bb0145514978092ae966e30693cf619e4034837",
       "in_reply_to_id": null,
       "user": {
@@ -4598,8 +4724,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 103,
-      "original_line": 103,
+      "line": 110,
+      "original_line": 110,
       "side": "RIGHT"
     },
     {
@@ -4611,7 +4737,7 @@
       "path": "src/common/sockman.cpp",
       "position": 88,
       "original_position": 57,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "41c87ddb3d7a18d2c0fa7eccfbde57e9d6e898c2",
       "in_reply_to_id": 1803692315,
       "user": {
@@ -4664,7 +4790,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 77,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc",
       "in_reply_to_id": 1804998403,
       "user": {
@@ -4717,7 +4843,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 149,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "c133a634d10e172652ebbf05ca114037c8e551b9",
       "in_reply_to_id": null,
       "user": {
@@ -4770,7 +4896,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 177,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "c133a634d10e172652ebbf05ca114037c8e551b9",
       "in_reply_to_id": null,
       "user": {
@@ -4811,7 +4937,7 @@
       "original_start_line": 394,
       "start_side": "RIGHT",
       "line": null,
-      "original_line": 340,
+      "original_line": 341,
       "side": "RIGHT"
     },
     {
@@ -4823,7 +4949,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 45,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "1bfc1ca9b6b68c6356ffc23ecf01e417152ade95",
       "in_reply_to_id": 1803679987,
       "user": {
@@ -4876,7 +5002,7 @@
       "path": "src/common/sockman.h",
       "position": 23,
       "original_position": 8,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "5d4920f630417ceeee1c79304faac6803795cd64",
       "in_reply_to_id": 1804940161,
       "user": {
@@ -4929,7 +5055,7 @@
       "path": "src/test/fuzz/connman.cpp",
       "position": null,
       "original_position": 6,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "b96beb27d2b3d06a45644c537c114a08f0ccd285",
       "in_reply_to_id": 1805115729,
       "user": {
@@ -4982,7 +5108,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 14,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "bb5b91d430026c4826a2107c8c1a311518cc97ce",
       "in_reply_to_id": 1805124507,
       "user": {
@@ -5035,7 +5161,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 23,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "50cb52470ea6cc4de5a5e5260b8f308353942ec0",
       "in_reply_to_id": 1805142536,
       "user": {
@@ -5088,7 +5214,7 @@
       "path": "src/common/sockman.cpp",
       "position": 24,
       "original_position": 9,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "3bb0145514978092ae966e30693cf619e4034837",
       "in_reply_to_id": 1805157675,
       "user": {
@@ -5141,7 +5267,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 4,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "3bb0145514978092ae966e30693cf619e4034837",
       "in_reply_to_id": 1805160999,
       "user": {
@@ -5194,7 +5320,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 149,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "c133a634d10e172652ebbf05ca114037c8e551b9",
       "in_reply_to_id": 1806645938,
       "user": {
@@ -5247,7 +5373,7 @@
       "path": "src/common/sockman.cpp",
       "position": null,
       "original_position": 177,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "c133a634d10e172652ebbf05ca114037c8e551b9",
       "in_reply_to_id": 1806666862,
       "user": {
@@ -5288,7 +5414,7 @@
       "original_start_line": 394,
       "start_side": "RIGHT",
       "line": null,
-      "original_line": 340,
+      "original_line": 341,
       "side": "RIGHT"
     },
     {
@@ -5300,7 +5426,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 128,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "645f625e29b36321bcba8db5758b0428b8ebd80f",
       "in_reply_to_id": null,
       "user": {
@@ -5353,7 +5479,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 128,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "645f625e29b36321bcba8db5758b0428b8ebd80f",
       "in_reply_to_id": 1878764170,
       "user": {
@@ -5406,7 +5532,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 128,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "645f625e29b36321bcba8db5758b0428b8ebd80f",
       "in_reply_to_id": 1878764170,
       "user": {
@@ -5459,7 +5585,7 @@
       "path": "src/common/sockman.h",
       "position": null,
       "original_position": 128,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "645f625e29b36321bcba8db5758b0428b8ebd80f",
       "in_reply_to_id": 1878764170,
       "user": {
@@ -5512,7 +5638,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 13,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "4c23aacc2b82083f96255963f543dc35fff28334",
       "in_reply_to_id": null,
       "user": {
@@ -5565,7 +5691,7 @@
       "path": "src/common/sockman.cpp",
       "position": 32,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "4c23aacc2b82083f96255963f543dc35fff28334",
       "in_reply_to_id": null,
       "user": {
@@ -5618,7 +5744,7 @@
       "path": "src/common/sockman.cpp",
       "position": 32,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "4c23aacc2b82083f96255963f543dc35fff28334",
       "in_reply_to_id": 1915015927,
       "user": {
@@ -5671,7 +5797,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 13,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "4c23aacc2b82083f96255963f543dc35fff28334",
       "in_reply_to_id": 1914992602,
       "user": {
@@ -5724,7 +5850,7 @@
       "path": "src/common/sockman.cpp",
       "position": 32,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "4c23aacc2b82083f96255963f543dc35fff28334",
       "in_reply_to_id": 1915015927,
       "user": {
@@ -5777,7 +5903,7 @@
       "path": "src/net.cpp",
       "position": 386,
       "original_position": 6,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "fd81820214e695ba228a954506397c3d781fe3fe",
       "in_reply_to_id": null,
       "user": {
@@ -5830,7 +5956,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 60,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "0241b04cf406d482abfac3fddfad9a9c28725f32",
       "in_reply_to_id": null,
       "user": {
@@ -5883,7 +6009,7 @@
       "path": "src/common/sockman.h",
       "position": 23,
       "original_position": 8,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "5d4920f630417ceeee1c79304faac6803795cd64",
       "in_reply_to_id": 1804940161,
       "user": {
@@ -5934,9 +6060,9 @@
       "node_id": "PRRC_kwDOABII585yPY2Z",
       "diff_hunk": "@@ -59,6 +66,26 @@ class SockMan\n \n private:\n \n+    //\n+    // Pure virtual functions must be implemented by children classes.\n+    //\n+\n+    //\n+    // Non-pure virtual functions can be overridden by children classes or left\n+    // alone to use the default implementation from SockMan.\n+    //\n+\n+    /**\n+     * Be notified of a change in the state of listening for incoming I2P connections.\n+     * The default behavior, implemented by `SockMan`, is to ignore this event.\n+     * @param[in] addr Our listening address.\n+     * @param[in] success If true then the listen succeeded and we are now",
       "path": "src/common/sockman.h",
-      "position": 256,
+      "position": 263,
       "original_position": 31,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
       "in_reply_to_id": null,
       "user": {
@@ -5976,8 +6102,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 256,
-      "original_line": 82,
+      "line": 263,
+      "original_line": 263,
       "side": "RIGHT"
     },
     {
@@ -5987,9 +6113,9 @@
       "node_id": "PRRC_kwDOABII585yPoLF",
       "diff_hunk": "@@ -1150,7 +1151,7 @@ class CConnman : private SockMan\n     void ForEachNode(const NodeFn& func)\n     {\n         LOCK(m_nodes_mutex);\n-        for (auto&& node : m_nodes) {\n+        for (auto& [id, node] : m_nodes) {",
       "path": "src/net.h",
-      "position": 134,
+      "position": null,
       "original_position": 13,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
       "in_reply_to_id": null,
       "user": {
@@ -6029,7 +6155,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 1127,
+      "line": null,
       "original_line": 1154,
       "side": "RIGHT"
     },
@@ -6040,9 +6166,9 @@
       "node_id": "PRRC_kwDOABII585yPr38",
       "diff_hunk": "@@ -133,6 +133,22 @@ class SockMan\n     // alone to use the default implementation from SockMan.\n     //\n \n+    /**\n+     * SockMan would only call EventReadyToSend() if this returns true.",
       "path": "src/common/sockman.h",
-      "position": 220,
+      "position": null,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "dc6393cb93c4851a363b69fd474656cac1ae3b3b",
       "in_reply_to_id": null,
       "user": {
@@ -6082,7 +6208,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 220,
+      "line": null,
       "original_line": 137,
       "side": "RIGHT"
     },
@@ -6095,7 +6221,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 69,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "dc6393cb93c4851a363b69fd474656cac1ae3b3b",
       "in_reply_to_id": null,
       "user": {
@@ -6146,9 +6272,9 @@
       "node_id": "PRRC_kwDOABII585yeTVo",
       "diff_hunk": "@@ -0,0 +1,532 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://opensource.org/license/mit/.\n+\n+#include <bitcoin-build-config.h> // IWYU pragma: keep\n+\n+#include <common/sockman.h>\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/sock.h>\n+#include <util/thread.h>\n+\n+#include <cassert>\n+\n+// The set of sockets cannot be modified while waiting\n+// The sleep time needs to be small to avoid new sockets stalling\n+static constexpr auto SELECT_TIMEOUT{50ms};\n+\n+static CService GetBindAddress(const Sock& sock)\n+{\n+    CService addr_bind;\n+    struct sockaddr_storage sockaddr_bind;\n+    socklen_t sockaddr_bind_len = sizeof(sockaddr_bind);\n+    if (!sock.GetSockName((struct sockaddr*)&sockaddr_bind, &sockaddr_bind_len)) {\n+        addr_bind.SetSockAddr((const struct sockaddr*)&sockaddr_bind);\n+    } else {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"getsockname failed\\n\");\n+    }\n+    return addr_bind;\n+}\n+\n+bool SockMan::BindAndStartListening(const CService& to, bilingual_str& errmsg)\n+{\n+    // Create socket for listening for incoming connections\n+    struct sockaddr_storage storage;\n+    socklen_t len{sizeof(storage)};\n+    if (!to.GetSockAddr(reinterpret_cast<sockaddr*>(&storage), &len)) {\n+        errmsg = Untranslated(strprintf(\"Bind address family for %s not supported\", to.ToStringAddrPort()));\n+        return false;\n+    }\n+\n+    std::unique_ptr<Sock> sock{CreateSock(to.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};\n+    if (!sock) {\n+        errmsg = Untranslated(strprintf(\"Cannot create %s listen socket: %s\",\n+                                        to.ToStringAddrPort(),\n+                                        NetworkErrorString(WSAGetLastError())));\n+        return false;\n+    }\n+\n+    int one{1};\n+\n+    // Allow binding if the port is still in TIME_WAIT state after\n+    // the program was closed and restarted.\n+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+        LogPrintLevel(BCLog::NET,\n+                      BCLog::Level::Info,\n+                      \"Cannot set SO_REUSEADDR on %s listen socket: %s, continuing anyway\\n\",\n+                      to.ToStringAddrPort(),\n+                      NetworkErrorString(WSAGetLastError()));\n+    }\n+\n+    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option\n+    // and enable it by default or not. Try to enable it, if possible.\n+    if (to.IsIPv6()) {\n+#ifdef IPV6_V6ONLY\n+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_V6ONLY on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+#ifdef WIN32\n+        int prot_level{PROTECTION_LEVEL_UNRESTRICTED};\n+        if (sock->SetSockOpt(IPPROTO_IPV6,\n+                             IPV6_PROTECTION_LEVEL,\n+                             reinterpret_cast<const char*>(&prot_level),\n+                             sizeof(prot_level)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_PROTECTION_LEVEL on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+    }\n+\n+    if (sock->Bind(reinterpret_cast<sockaddr*>(&storage), len) == SOCKET_ERROR) {\n+        const int err{WSAGetLastError()};\n+        errmsg = strprintf(_(\"Cannot bind to %s: %s%s\"),\n+                           to.ToStringAddrPort(),\n+                           NetworkErrorString(err),\n+                           err == WSAEADDRINUSE\n+                               ? std::string{\" (\"} + CLIENT_NAME + \" already running?)\"\n+                               : \"\");\n+        return false;\n+    }\n+\n+    // Listen for incoming connections\n+    if (sock->Listen(SOMAXCONN) == SOCKET_ERROR) {\n+        errmsg = strprintf(_(\"Cannot listen to %s: %s\"), to.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));\n+        return false;\n+    }\n+\n+    m_listen.emplace_back(std::move(sock));\n+\n+    return true;\n+}\n+\n+void SockMan::StartSocketsThreads(const Options& options)\n+{\n+    m_thread_socket_handler = std::thread(&util::TraceThread, \"net\", [this] { ThreadSocketHandler(); });",
       "path": "src/common/sockman.cpp",
-      "position": 113,
+      "position": null,
       "original_position": 113,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
       "in_reply_to_id": null,
       "user": {
@@ -6188,7 +6314,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 113,
+      "line": null,
       "original_line": 113,
       "side": "RIGHT"
     },
@@ -6199,9 +6325,9 @@
       "node_id": "PRRC_kwDOABII585y38T2",
       "diff_hunk": "@@ -0,0 +1,428 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://opensource.org/license/mit/.\n+\n+#ifndef BITCOIN_COMMON_SOCKMAN_H\n+#define BITCOIN_COMMON_SOCKMAN_H\n+\n+#include <i2p.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <util/fs.h>\n+#include <util/sock.h>\n+#include <util/translation.h>\n+\n+#include <atomic>\n+#include <memory>\n+#include <queue>\n+#include <span>\n+#include <thread>\n+#include <variant>\n+#include <vector>\n+\n+typedef int64_t NodeId;\n+\n+/**\n+ * A socket manager class which handles socket operations.\n+ * To use this class, inherit from it and implement the pure virtual methods.\n+ * Handled operations:\n+ * - binding and listening on sockets\n+ * - starting of necessary threads to process socket operations\n+ * - accepting incoming connections\n+ * - making outbound connections\n+ * - closing connections\n+ * - waiting for IO readiness on sockets and doing send/recv accordingly\n+ */\n+class SockMan\n+{\n+public:\n+\n+    virtual ~SockMan() = default;\n+\n+    //\n+    // Non-virtual functions, to be reused by children classes.\n+    //\n+\n+    /**\n+     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\n+     * Should be called before `StartSocketsThreads()`.\n+     * @param[in] to Where to bind.\n+     * @param[out] errmsg Error string if an error occurs.\n+     * @retval true Success.\n+     * @retval false Failure, `strError` will be set.\n+     */\n+    bool BindAndStartListening(const CService& to, bilingual_str& errmsg);\n+\n+    /**\n+     * Options to influence `StartSocketsThreads()`.\n+     */\n+    struct Options {\n+        struct I2P {\n+            explicit I2P(const fs::path& file, const Proxy& proxy) : private_key_file{file}, sam_proxy{proxy} {}\n+\n+            const fs::path private_key_file;\n+            const Proxy sam_proxy;\n+        };\n+\n+        /**\n+         * I2P options. If set then a thread will be started that will accept incoming I2P connections.\n+         */\n+        std::optional<I2P> i2p;\n+    };\n+\n+    /**\n+     * Start the necessary threads for sockets IO.\n+     */\n+    void StartSocketsThreads(const Options& options);\n+\n+    /**\n+     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\n+     */\n+    void JoinSocketsThreads();\n+\n+    /**\n+     * A more readable std::tuple<std::string, uint16_t> for host and port.\n+     */\n+    struct StringHostIntPort {\n+        const std::string& host;\n+        uint16_t port;\n+    };\n+\n+    /**\n+     * Make an outbound connection, save the socket internally and return a newly generated node id.\n+     * @param[in] to The address to connect to, either as CService or a host as string and port as\n+     * an integer, if the later is used, then `proxy` must be valid.\n+     * @param[in] is_important If true, then log failures with higher severity.\n+     * @param[in] proxy Proxy to connect through if `proxy.IsValid()` is true.\n+     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\n+     * proxy, then it will be set to true.\n+     * @param[out] me If the connection was successful then this is set to the address on the\n+     * local side of the socket.\n+     * @return Newly generated node id, or std::nullopt if the operation fails.\n+     */\n+    std::optional<NodeId> ConnectAndMakeNodeId(const std::variant<CService, StringHostIntPort>& to,\n+                                               bool is_important,\n+                                               const Proxy& proxy,\n+                                               bool& proxy_failed,\n+                                               CService& me)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex, !m_unused_i2p_sessions_mutex);\n+\n+    /**\n+     * Disconnect a given peer by closing its socket and release resources occupied by it.\n+     * @return Whether the peer existed and its socket was closed by this call.\n+     */\n+    bool CloseConnection(NodeId node_id)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Try to send some data to the given node.\n+     * @param[in] node_id Identifier of the node to send to.\n+     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\n+     * @param[in] will_send_more Used as an optimization if the caller knows that they will\n+     * be sending more data soon after this call.\n+     * @param[out] errmsg If <0 is returned then this will contain a human readable message\n+     * explaining the error.\n+     * @retval >=0 The number of bytes actually sent.\n+     * @retval <0 A permanent error has occurred.\n+     */\n+    ssize_t SendBytes(NodeId node_id,\n+                      std::span<const unsigned char> data,\n+                      bool will_send_more,\n+                      std::string& errmsg) const\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Close all sockets.\n+     */\n+    void CloseSockets();\n+\n+    /**\n+     * This is signaled when network activity should cease.\n+     * A pointer to it is saved in `m_i2p_sam_session`, so make sure that\n+     * the lifetime of `interruptNet` is not shorter than\n+     * the lifetime of `m_i2p_sam_session`.\n+     */\n+    CThreadInterrupt interruptNet;\n+\n+protected:\n+\n+    /**\n+     * During some tests mocked sockets are created outside of `SockMan`, make it\n+     * possible to add those so that send/recv can be exercised.\n+     */\n+    void TestOnlyAddExistentNode(NodeId node_id, std::unique_ptr<Sock>&& sock)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+private:\n+\n+    /**\n+     * Cap on the size of `m_unused_i2p_sessions`, to ensure it does not\n+     * unexpectedly use too much memory.\n+     */\n+    static constexpr size_t MAX_UNUSED_I2P_SESSIONS_SIZE{10};\n+\n+    //\n+    // Pure virtual functions must be implemented by children classes.\n+    //\n+\n+    /**\n+     * Be notified when a new connection has been accepted.\n+     * @param[in] node_id Id of the newly accepted connection.\n+     * @param[in] me The address and port at our side of the connection.\n+     * @param[in] them The address and port at the peer's side of the connection.\n+     * @retval true The new connection was accepted at the higher level.\n+     * @retval false The connection was refused at the higher level, so the\n+     * associated socket and node_id should be discarded by `SockMan`.\n+     */\n+    virtual bool EventNewConnectionAccepted(NodeId node_id,\n+                                            const CService& me,\n+                                            const CService& them) = 0;\n+\n+    /**\n+     * Called when the socket is ready to send data and `ShouldTryToSend()` has\n+     * returned true. This is where the higher level code serializes its messages\n+     * and calls `SockMan::SendBytes()`.\n+     * @param[in] node_id Id of the node whose socket is ready to send.\n+     * @param[out] cancel_recv Should always be set upon return and if it is true,\n+     * then the next attempt to receive data from that node will be omitted.\n+     */\n+    virtual void EventReadyToSend(NodeId node_id, bool& cancel_recv) = 0;",
       "path": "src/common/sockman.h",
-      "position": 189,
+      "position": 196,
       "original_position": 189,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
       "in_reply_to_id": null,
       "user": {
@@ -6238,11 +6364,11 @@
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
         }
       },
-      "start_line": 181,
+      "start_line": 188,
       "original_start_line": 181,
       "start_side": "RIGHT",
-      "line": 189,
-      "original_line": 189,
+      "line": 196,
+      "original_line": 196,
       "side": "RIGHT"
     },
     {
@@ -6254,7 +6380,7 @@
       "path": "src/net.cpp",
       "position": 386,
       "original_position": 6,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "fd81820214e695ba228a954506397c3d781fe3fe",
       "in_reply_to_id": 1916382790,
       "user": {
@@ -6307,7 +6433,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 60,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "0241b04cf406d482abfac3fddfad9a9c28725f32",
       "in_reply_to_id": 1916431512,
       "user": {
@@ -6358,9 +6484,9 @@
       "node_id": "PRRC_kwDOABII585zLVUG",
       "diff_hunk": "@@ -59,6 +66,26 @@ class SockMan\n \n private:\n \n+    //\n+    // Pure virtual functions must be implemented by children classes.\n+    //\n+\n+    //\n+    // Non-pure virtual functions can be overridden by children classes or left\n+    // alone to use the default implementation from SockMan.\n+    //\n+\n+    /**\n+     * Be notified of a change in the state of listening for incoming I2P connections.\n+     * The default behavior, implemented by `SockMan`, is to ignore this event.\n+     * @param[in] addr Our listening address.\n+     * @param[in] success If true then the listen succeeded and we are now",
       "path": "src/common/sockman.h",
-      "position": 256,
+      "position": 263,
       "original_position": 31,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
       "in_reply_to_id": 1916636569,
       "user": {
@@ -6400,8 +6526,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 256,
-      "original_line": 82,
+      "line": 263,
+      "original_line": 263,
       "side": "RIGHT"
     },
     {
@@ -6411,9 +6537,9 @@
       "node_id": "PRRC_kwDOABII585zLjXC",
       "diff_hunk": "@@ -59,6 +66,26 @@ class SockMan\n \n private:\n \n+    //\n+    // Pure virtual functions must be implemented by children classes.\n+    //\n+\n+    //\n+    // Non-pure virtual functions can be overridden by children classes or left\n+    // alone to use the default implementation from SockMan.\n+    //\n+\n+    /**\n+     * Be notified of a change in the state of listening for incoming I2P connections.\n+     * The default behavior, implemented by `SockMan`, is to ignore this event.\n+     * @param[in] addr Our listening address.\n+     * @param[in] success If true then the listen succeeded and we are now",
       "path": "src/common/sockman.h",
-      "position": 256,
+      "position": 263,
       "original_position": 31,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2",
       "in_reply_to_id": 1916636569,
       "user": {
@@ -6453,8 +6579,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 256,
-      "original_line": 82,
+      "line": 263,
+      "original_line": 263,
       "side": "RIGHT"
     },
     {
@@ -6464,9 +6590,9 @@
       "node_id": "PRRC_kwDOABII585zLzon",
       "diff_hunk": "@@ -1150,7 +1151,7 @@ class CConnman : private SockMan\n     void ForEachNode(const NodeFn& func)\n     {\n         LOCK(m_nodes_mutex);\n-        for (auto&& node : m_nodes) {\n+        for (auto& [id, node] : m_nodes) {",
       "path": "src/net.h",
-      "position": 134,
+      "position": null,
       "original_position": 13,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "21c5e05619c8a6eb736bb1c61725f4b5f669ffb4",
       "in_reply_to_id": 1916699333,
       "user": {
@@ -6506,7 +6632,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 1127,
+      "line": null,
       "original_line": 1154,
       "side": "RIGHT"
     },
@@ -6517,9 +6643,9 @@
       "node_id": "PRRC_kwDOABII585zL6I1",
       "diff_hunk": "@@ -133,6 +133,22 @@ class SockMan\n     // alone to use the default implementation from SockMan.\n     //\n \n+    /**\n+     * SockMan would only call EventReadyToSend() if this returns true.",
       "path": "src/common/sockman.h",
-      "position": 220,
+      "position": null,
       "original_position": 5,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "dc6393cb93c4851a363b69fd474656cac1ae3b3b",
       "in_reply_to_id": 1916714492,
       "user": {
@@ -6559,7 +6685,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 220,
+      "line": null,
       "original_line": 137,
       "side": "RIGHT"
     },
@@ -6572,7 +6698,7 @@
       "path": "src/net.cpp",
       "position": null,
       "original_position": 69,
-      "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
       "original_commit_id": "dc6393cb93c4851a363b69fd474656cac1ae3b3b",
       "in_reply_to_id": 1916723639,
       "user": {
@@ -6614,6 +6740,59 @@
       "start_side": null,
       "line": null,
       "original_line": 2060,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1932564964",
+      "pull_request_review_id": 2578936007,
+      "id": 1932564964,
+      "node_id": "PRRC_kwDOABII585zMJnk",
+      "diff_hunk": "@@ -0,0 +1,532 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://opensource.org/license/mit/.\n+\n+#include <bitcoin-build-config.h> // IWYU pragma: keep\n+\n+#include <common/sockman.h>\n+#include <logging.h>\n+#include <netbase.h>\n+#include <util/sock.h>\n+#include <util/thread.h>\n+\n+#include <cassert>\n+\n+// The set of sockets cannot be modified while waiting\n+// The sleep time needs to be small to avoid new sockets stalling\n+static constexpr auto SELECT_TIMEOUT{50ms};\n+\n+static CService GetBindAddress(const Sock& sock)\n+{\n+    CService addr_bind;\n+    struct sockaddr_storage sockaddr_bind;\n+    socklen_t sockaddr_bind_len = sizeof(sockaddr_bind);\n+    if (!sock.GetSockName((struct sockaddr*)&sockaddr_bind, &sockaddr_bind_len)) {\n+        addr_bind.SetSockAddr((const struct sockaddr*)&sockaddr_bind);\n+    } else {\n+        LogPrintLevel(BCLog::NET, BCLog::Level::Warning, \"getsockname failed\\n\");\n+    }\n+    return addr_bind;\n+}\n+\n+bool SockMan::BindAndStartListening(const CService& to, bilingual_str& errmsg)\n+{\n+    // Create socket for listening for incoming connections\n+    struct sockaddr_storage storage;\n+    socklen_t len{sizeof(storage)};\n+    if (!to.GetSockAddr(reinterpret_cast<sockaddr*>(&storage), &len)) {\n+        errmsg = Untranslated(strprintf(\"Bind address family for %s not supported\", to.ToStringAddrPort()));\n+        return false;\n+    }\n+\n+    std::unique_ptr<Sock> sock{CreateSock(to.GetSAFamily(), SOCK_STREAM, IPPROTO_TCP)};\n+    if (!sock) {\n+        errmsg = Untranslated(strprintf(\"Cannot create %s listen socket: %s\",\n+                                        to.ToStringAddrPort(),\n+                                        NetworkErrorString(WSAGetLastError())));\n+        return false;\n+    }\n+\n+    int one{1};\n+\n+    // Allow binding if the port is still in TIME_WAIT state after\n+    // the program was closed and restarted.\n+    if (sock->SetSockOpt(SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+        LogPrintLevel(BCLog::NET,\n+                      BCLog::Level::Info,\n+                      \"Cannot set SO_REUSEADDR on %s listen socket: %s, continuing anyway\\n\",\n+                      to.ToStringAddrPort(),\n+                      NetworkErrorString(WSAGetLastError()));\n+    }\n+\n+    // some systems don't have IPV6_V6ONLY but are always v6only; others do have the option\n+    // and enable it by default or not. Try to enable it, if possible.\n+    if (to.IsIPv6()) {\n+#ifdef IPV6_V6ONLY\n+        if (sock->SetSockOpt(IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<sockopt_arg_type>(&one), sizeof(one)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_V6ONLY on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+#ifdef WIN32\n+        int prot_level{PROTECTION_LEVEL_UNRESTRICTED};\n+        if (sock->SetSockOpt(IPPROTO_IPV6,\n+                             IPV6_PROTECTION_LEVEL,\n+                             reinterpret_cast<const char*>(&prot_level),\n+                             sizeof(prot_level)) == SOCKET_ERROR) {\n+            LogPrintLevel(BCLog::NET,\n+                          BCLog::Level::Info,\n+                          \"Cannot set IPV6_PROTECTION_LEVEL on %s listen socket: %s, continuing anyway\\n\",\n+                          to.ToStringAddrPort(),\n+                          NetworkErrorString(WSAGetLastError()));\n+        }\n+#endif\n+    }\n+\n+    if (sock->Bind(reinterpret_cast<sockaddr*>(&storage), len) == SOCKET_ERROR) {\n+        const int err{WSAGetLastError()};\n+        errmsg = strprintf(_(\"Cannot bind to %s: %s%s\"),\n+                           to.ToStringAddrPort(),\n+                           NetworkErrorString(err),\n+                           err == WSAEADDRINUSE\n+                               ? std::string{\" (\"} + CLIENT_NAME + \" already running?)\"\n+                               : \"\");\n+        return false;\n+    }\n+\n+    // Listen for incoming connections\n+    if (sock->Listen(SOMAXCONN) == SOCKET_ERROR) {\n+        errmsg = strprintf(_(\"Cannot listen to %s: %s\"), to.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));\n+        return false;\n+    }\n+\n+    m_listen.emplace_back(std::move(sock));\n+\n+    return true;\n+}\n+\n+void SockMan::StartSocketsThreads(const Options& options)\n+{\n+    m_thread_socket_handler = std::thread(&util::TraceThread, \"net\", [this] { ThreadSocketHandler(); });",
+      "path": "src/common/sockman.cpp",
+      "position": null,
+      "original_position": 113,
+      "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "original_commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
+      "in_reply_to_id": 1920546152,
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Yes, it would mess up the logging. I put both `\"net\"` and `\"i2paccept\"` in `SockMan::Options`, so that they are not hardcoded here anymore and can be set by the callers of `SockMan`.",
+      "created_at": "2025-01-28T17:15:25Z",
+      "updated_at": "2025-01-28T17:15:25Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#discussion_r1932564964",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1932564964"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 113,
       "side": "RIGHT"
     }
   ]
