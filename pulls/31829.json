@@ -1,0 +1,1284 @@
+{
+  "type": "pull",
+  "pull": {
+    "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829",
+    "id": 2324761179,
+    "node_id": "PR_kwDOABII586KkQpb",
+    "html_url": "https://github.com/bitcoin/bitcoin/pull/31829",
+    "diff_url": "https://github.com/bitcoin/bitcoin/pull/31829.diff",
+    "patch_url": "https://github.com/bitcoin/bitcoin/pull/31829.patch",
+    "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31829",
+    "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829/commits",
+    "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829/comments",
+    "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
+    "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31829/comments",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/d302324edcff648574c5df467435abee05e62a2e",
+    "number": 31829,
+    "state": "open",
+    "locked": false,
+    "maintainer_can_modify": true,
+    "title": "p2p: improve TxOrphanage denial of service bounds and increase -maxorphantxs",
+    "user": {
+      "login": "glozow",
+      "id": 25183001,
+      "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+      "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/glozow",
+      "html_url": "https://github.com/glozow",
+      "followers_url": "https://api.github.com/users/glozow/followers",
+      "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+      "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+      "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+      "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+      "organizations_url": "https://api.github.com/users/glozow/orgs",
+      "repos_url": "https://api.github.com/users/glozow/repos",
+      "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+      "received_events_url": "https://api.github.com/users/glozow/received_events",
+      "type": "User",
+      "site_admin": false,
+      "patch_url": null
+    },
+    "body": "This PR is built on top of #31810 and is part of the orphan resolution project, see #27463.\r\n\r\nWe want to limit the CPU work and memory used by `TxOrphanage` to avoid denial of service attacks. On master, this is achieved by limiting the number of transactions in this data structure to 100, and the weight of each transaction to 400KWu (the largest standard tx) [0]. We always allow new orphans, but if the addition causes us to exceed 100, we evict one randomly. This is dead simple, but has problems:\r\n- It makes the orphanage trivially churnable: any one peer can render it useless by spamming us with lots of orphans.\r\n- Effectively, opportunistic 1p1c is useless in the presence of adversaries: it is *opportunistic* and pairs a low feerate tx with a child that happens to be in the orphanage.\r\n- This number is also often insufficient for the volume of orphans we handle: historical data show that overflows are pretty common, and there are times where \"it seems like [the node] forgot about the orphans and re-requested them multiple times.\" [1] \r\n \r\nJust jacking up the `-maxorphantxs` number is not a good enough solution, because it doesn't solve the churnability problem, and the effective resource bounds scale poorly.\r\n\r\nThis PR introduces numbers for {global, per-peer} {memory usage, announcements}, representing resource limits:\r\n- The (constant) **global announcement limit** is the number of unique (wtxid, peer) pairs in the orphanage [2]. This represents a cap on CPU, and does not change with the number of peers we have. Evictions must happen whenever this limit is reached.\r\n- The (variable) **per-peer announcement limit** is the global announcement limit divided by the number of peers. Peers are allowed to exceed this limit provided the global announcement limit has not been reached. The per-peer announcement limit decreases with more peers.\r\n- The (constant) **per-peer memory usage reservation** is the amount of orphan weight [3] reserved per peer [4]. Reservation means that peers are effectively guaranteed this amount of space. It is not a limit; peers are allowed to exceed this limit provided the global usage limit is not reached.\r\n- The (variable) **global memory usage limit** is the number of peers multiplied by the per-peer reservation [5]. As such, the global memory usage limit scales up with the number of peers we have. Evictions must happen whenever this limit is reached.\r\n- We introduce a \"Peer DoS Score\" which is the maximum between its \"CPU Score\" and \"Memory Score.\" The CPU score is the ratio between the number of orphans announced by this peer / peer announcement limit. The memory score is the total usage of all orphans announced by this peer / peer usage reservation.\r\n\r\nEviction changes in a few ways:\r\n- It is triggered if any of these 3 conditions are true: (1) `-maxorphantxs` is exceeded (2) the global announcement limit is exceeded (3) the global memory usage limit is exceeded.\r\n- Instead of evicting orphans randomly, it does this in a loop until all 3 conditions are no longer true:\r\n  - Sort the peers by their DoS score\r\n  - Select the \"DoSiest peer\" with the highest DoS score.\r\n  - Select a random orphan from the DoSiest peer. Remove this peer as an announcer, or delete the orphan if it only has 1 announcer.\r\n\r\nThis PR also:\r\n- Bounds the number of transactions that can be in a peer's work set within `AddChildrenToWorkset`. It also attempts to use this set more effectively if it fills up: Since work sets can contain orphans that have already been deleted, once per AddChildrenToWorkset call, iterate through the work set and delete the ones that don't correspond to a tx in `m_orphans`.\r\n- Changes the default `-maxorphantxs` to the global announcement limit.\r\n\r\nThis means we can receive 1p1c packages in the presence of spammy peers. It also makes the orphanage more useful and increases our download capacity without drastically increasing orphanage resource usage.\r\n\r\n[0]: This means the effective memory limit in orphan weight is 100 * 400KWu = 40MWu\r\n[1]: https://delvingbitcoin.org/t/stats-on-orphanage-overflows/1421\r\n[2]: Limit is 3000, which is equivalent to one max size ancestor package (24 transactions can be missing inputs) for each peer (default max connections is 125).\r\n[3]: Orphan weight is used in place of actual memory usage because something like \"one maximally sized standard tx\" is easier to reason about than \"considering the bytes allocated for vin and vout vectors, it needs to be within N bytes...\" etc. We can also consider a different formula to encapsulate more the memory overhead but still have an interface that is easy to reason about.\r\n[4]: The limit is 404KWu, which is the maximum size of an ancestor package.\r\n[5]: With 125 peers, this is 50.5MWu, which is a small increase from the existing limit of 40MWu. While the actual memory usage limit is higher (this number does not include the other memory used by `TxOrphanage` to store the outpoints map, etc.), this is within the same ballpark as the old limit.",
+    "labels": [
+      {
+        "id": 98298007,
+        "node_id": "MDU6TGFiZWw5ODI5ODAwNw==",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/P2P",
+        "name": "P2P",
+        "color": "006b75",
+        "default": false
+      },
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
+    "created_at": "2025-02-09T21:14:45Z",
+    "updated_at": "2025-02-09T21:28:54Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merge_commit_sha": "d2c78c9cccd9c92b7ca863389d0cace28755515d",
+    "assignees": [],
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "rebaseable": true,
+    "head": {
+      "label": "glozow:2025-01-orphanage-peer-dos",
+      "ref": "2025-01-orphanage-peer-dos",
+      "sha": "d302324edcff648574c5df467435abee05e62a2e",
+      "user": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "repo": {
+        "id": 244262754,
+        "node_id": "MDEwOlJlcG9zaXRvcnkyNDQyNjI3NTQ=",
+        "name": "bitcoin",
+        "full_name": "glozow/bitcoin",
+        "owner": {
+          "login": "glozow",
+          "id": 25183001,
+          "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+          "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/glozow",
+          "html_url": "https://github.com/glozow",
+          "followers_url": "https://api.github.com/users/glozow/followers",
+          "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+          "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+          "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+          "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+          "organizations_url": "https://api.github.com/users/glozow/orgs",
+          "repos_url": "https://api.github.com/users/glozow/repos",
+          "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+          "received_events_url": "https://api.github.com/users/glozow/received_events",
+          "type": "User",
+          "site_admin": false,
+          "patch_url": null
+        },
+        "private": false,
+        "html_url": "https://github.com/glozow/bitcoin",
+        "description": "Bitcoin Core integration/staging tree",
+        "fork": true,
+        "url": "https://api.github.com/repos/glozow/bitcoin",
+        "archive_url": "https://api.github.com/repos/glozow/bitcoin/%7Barchive_format%7D%7B/ref%7D",
+        "assignees_url": "https://api.github.com/repos/glozow/bitcoin/assignees%7B/user%7D",
+        "blobs_url": "https://api.github.com/repos/glozow/bitcoin/git/blobs%7B/sha%7D",
+        "branches_url": "https://api.github.com/repos/glozow/bitcoin/branches%7B/branch%7D",
+        "collaborators_url": "https://api.github.com/repos/glozow/bitcoin/collaborators%7B/collaborator%7D",
+        "comments_url": "https://api.github.com/repos/glozow/bitcoin/comments%7B/number%7D",
+        "commits_url": "https://api.github.com/repos/glozow/bitcoin/commits%7B/sha%7D",
+        "compare_url": "https://api.github.com/repos/glozow/bitcoin/compare/%7Bbase%7D...%7Bhead%7D",
+        "contents_url": "https://api.github.com/repos/glozow/bitcoin/contents/%7B+path%7D",
+        "contributors_url": "https://api.github.com/repos/glozow/bitcoin/contributors",
+        "deployments_url": "https://api.github.com/repos/glozow/bitcoin/deployments",
+        "downloads_url": "https://api.github.com/repos/glozow/bitcoin/downloads",
+        "events_url": "https://api.github.com/repos/glozow/bitcoin/events",
+        "forks_url": "https://api.github.com/repos/glozow/bitcoin/forks",
+        "git_commits_url": "https://api.github.com/repos/glozow/bitcoin/git/commits%7B/sha%7D",
+        "git_refs_url": "https://api.github.com/repos/glozow/bitcoin/git/refs%7B/sha%7D",
+        "git_tags_url": "https://api.github.com/repos/glozow/bitcoin/git/tags%7B/sha%7D",
+        "git_url": "git://github.com/glozow/bitcoin.git",
+        "issue_comment_url": "https://api.github.com/repos/glozow/bitcoin/issues/comments%7B/number%7D",
+        "issue_events_url": "https://api.github.com/repos/glozow/bitcoin/issues/events%7B/number%7D",
+        "issues_url": "https://api.github.com/repos/glozow/bitcoin/issues%7B/number%7D",
+        "keys_url": "https://api.github.com/repos/glozow/bitcoin/keys%7B/key_id%7D",
+        "labels_url": "https://api.github.com/repos/glozow/bitcoin/labels%7B/name%7D",
+        "languages_url": "https://api.github.com/repos/glozow/bitcoin/languages",
+        "merges_url": "https://api.github.com/repos/glozow/bitcoin/merges",
+        "milestones_url": "https://api.github.com/repos/glozow/bitcoin/milestones%7B/number%7D",
+        "notifications_url": "https://api.github.com/repos/glozow/bitcoin/notifications%7B?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/glozow/bitcoin/pulls%7B/number%7D",
+        "releases_url": "https://api.github.com/repos/glozow/bitcoin/releases%7B/id%7D",
+        "ssh_url": "git@github.com:glozow/bitcoin.git",
+        "stargazers_url": "https://api.github.com/repos/glozow/bitcoin/stargazers",
+        "statuses_url": "https://api.github.com/repos/glozow/bitcoin/statuses/%7Bsha%7D",
+        "subscribers_url": "https://api.github.com/repos/glozow/bitcoin/subscribers",
+        "subscription_url": "https://api.github.com/repos/glozow/bitcoin/subscription",
+        "tags_url": "https://api.github.com/repos/glozow/bitcoin/tags",
+        "teams_url": "https://api.github.com/repos/glozow/bitcoin/teams",
+        "trees_url": "https://api.github.com/repos/glozow/bitcoin/git/trees%7B/sha%7D",
+        "clone_url": "https://github.com/glozow/bitcoin.git",
+        "hooks_url": "https://api.github.com/repos/glozow/bitcoin/hooks",
+        "svn_url": "https://github.com/glozow/bitcoin",
+        "homepage": "https://bitcoincore.org/en/download",
+        "language": "C++",
+        "forks_count": 4,
+        "stargazers_count": 12,
+        "watchers_count": 12,
+        "size": 266228,
+        "default_branch": "master",
+        "open_issues_count": 1,
+        "is_template": false,
+        "topics": [],
+        "has_issues": false,
+        "has_projects": true,
+        "has_wiki": true,
+        "has_pages": false,
+        "has_downloads": false,
+        "archived": false,
+        "disabled": false,
+        "visibility": "public",
+        "pushed_at": "2025-02-09T21:28:53Z",
+        "created_at": "2020-03-02T02:31:56Z",
+        "updated_at": "2025-02-07T16:27:09Z",
+        "allow_forking": true,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "html_url": null,
+          "description": null,
+          "implementation": null,
+          "permissions": null,
+          "conditions": null,
+          "limitations": null,
+          "body": null,
+          "featured": null
+        }
+      }
+    },
+    "base": {
+      "label": "bitcoin:master",
+      "ref": "master",
+      "sha": "fb0ada982a73687520c43b8fde480fa5d456f3e1",
+      "user": {
+        "login": "bitcoin",
+        "id": 528860,
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjUyODg2MA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/528860?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/bitcoin",
+        "html_url": "https://github.com/bitcoin",
+        "followers_url": "https://api.github.com/users/bitcoin/followers",
+        "following_url": "https://api.github.com/users/bitcoin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/bitcoin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/bitcoin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/bitcoin/subscriptions",
+        "organizations_url": "https://api.github.com/users/bitcoin/orgs",
+        "repos_url": "https://api.github.com/users/bitcoin/repos",
+        "events_url": "https://api.github.com/users/bitcoin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/bitcoin/received_events",
+        "type": "Organization",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "repo": {
+        "id": 1181927,
+        "node_id": "MDEwOlJlcG9zaXRvcnkxMTgxOTI3",
+        "name": "bitcoin",
+        "full_name": "bitcoin/bitcoin",
+        "owner": {
+          "login": "bitcoin",
+          "id": 528860,
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjUyODg2MA==",
+          "avatar_url": "https://avatars.githubusercontent.com/u/528860?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/bitcoin",
+          "html_url": "https://github.com/bitcoin",
+          "followers_url": "https://api.github.com/users/bitcoin/followers",
+          "following_url": "https://api.github.com/users/bitcoin/following%7B/other_user%7D",
+          "gists_url": "https://api.github.com/users/bitcoin/gists%7B/gist_id%7D",
+          "starred_url": "https://api.github.com/users/bitcoin/starred%7B/owner%7D%7B/repo%7D",
+          "subscriptions_url": "https://api.github.com/users/bitcoin/subscriptions",
+          "organizations_url": "https://api.github.com/users/bitcoin/orgs",
+          "repos_url": "https://api.github.com/users/bitcoin/repos",
+          "events_url": "https://api.github.com/users/bitcoin/events%7B/privacy%7D",
+          "received_events_url": "https://api.github.com/users/bitcoin/received_events",
+          "type": "Organization",
+          "site_admin": false,
+          "patch_url": null
+        },
+        "private": false,
+        "html_url": "https://github.com/bitcoin/bitcoin",
+        "description": "Bitcoin Core integration/staging tree",
+        "fork": false,
+        "url": "https://api.github.com/repos/bitcoin/bitcoin",
+        "archive_url": "https://api.github.com/repos/bitcoin/bitcoin/%7Barchive_format%7D%7B/ref%7D",
+        "assignees_url": "https://api.github.com/repos/bitcoin/bitcoin/assignees%7B/user%7D",
+        "blobs_url": "https://api.github.com/repos/bitcoin/bitcoin/git/blobs%7B/sha%7D",
+        "branches_url": "https://api.github.com/repos/bitcoin/bitcoin/branches%7B/branch%7D",
+        "collaborators_url": "https://api.github.com/repos/bitcoin/bitcoin/collaborators%7B/collaborator%7D",
+        "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/comments%7B/number%7D",
+        "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/commits%7B/sha%7D",
+        "compare_url": "https://api.github.com/repos/bitcoin/bitcoin/compare/%7Bbase%7D...%7Bhead%7D",
+        "contents_url": "https://api.github.com/repos/bitcoin/bitcoin/contents/%7B+path%7D",
+        "contributors_url": "https://api.github.com/repos/bitcoin/bitcoin/contributors",
+        "deployments_url": "https://api.github.com/repos/bitcoin/bitcoin/deployments",
+        "downloads_url": "https://api.github.com/repos/bitcoin/bitcoin/downloads",
+        "events_url": "https://api.github.com/repos/bitcoin/bitcoin/events",
+        "forks_url": "https://api.github.com/repos/bitcoin/bitcoin/forks",
+        "git_commits_url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits%7B/sha%7D",
+        "git_refs_url": "https://api.github.com/repos/bitcoin/bitcoin/git/refs%7B/sha%7D",
+        "git_tags_url": "https://api.github.com/repos/bitcoin/bitcoin/git/tags%7B/sha%7D",
+        "git_url": "git://github.com/bitcoin/bitcoin.git",
+        "issue_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments%7B/number%7D",
+        "issue_events_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events%7B/number%7D",
+        "issues_url": "https://api.github.com/repos/bitcoin/bitcoin/issues%7B/number%7D",
+        "keys_url": "https://api.github.com/repos/bitcoin/bitcoin/keys%7B/key_id%7D",
+        "labels_url": "https://api.github.com/repos/bitcoin/bitcoin/labels%7B/name%7D",
+        "languages_url": "https://api.github.com/repos/bitcoin/bitcoin/languages",
+        "merges_url": "https://api.github.com/repos/bitcoin/bitcoin/merges",
+        "milestones_url": "https://api.github.com/repos/bitcoin/bitcoin/milestones%7B/number%7D",
+        "notifications_url": "https://api.github.com/repos/bitcoin/bitcoin/notifications%7B?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls%7B/number%7D",
+        "releases_url": "https://api.github.com/repos/bitcoin/bitcoin/releases%7B/id%7D",
+        "ssh_url": "git@github.com:bitcoin/bitcoin.git",
+        "stargazers_url": "https://api.github.com/repos/bitcoin/bitcoin/stargazers",
+        "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/%7Bsha%7D",
+        "subscribers_url": "https://api.github.com/repos/bitcoin/bitcoin/subscribers",
+        "subscription_url": "https://api.github.com/repos/bitcoin/bitcoin/subscription",
+        "tags_url": "https://api.github.com/repos/bitcoin/bitcoin/tags",
+        "teams_url": "https://api.github.com/repos/bitcoin/bitcoin/teams",
+        "trees_url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees%7B/sha%7D",
+        "clone_url": "https://github.com/bitcoin/bitcoin.git",
+        "hooks_url": "https://api.github.com/repos/bitcoin/bitcoin/hooks",
+        "svn_url": "https://github.com/bitcoin/bitcoin",
+        "homepage": "https://bitcoincore.org/en/download",
+        "language": "C++",
+        "forks_count": 36694,
+        "stargazers_count": 81896,
+        "watchers_count": 81896,
+        "size": 275268,
+        "default_branch": "master",
+        "open_issues_count": 704,
+        "is_template": false,
+        "topics": [
+          "bitcoin",
+          "c-plus-plus",
+          "cryptocurrency",
+          "cryptography",
+          "p2p"
+        ],
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": false,
+        "has_pages": false,
+        "has_downloads": false,
+        "archived": false,
+        "disabled": false,
+        "visibility": "public",
+        "pushed_at": "2025-02-07T16:30:31Z",
+        "created_at": "2010-12-19T15:16:43Z",
+        "updated_at": "2025-02-09T21:04:43Z",
+        "allow_forking": true,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "html_url": null,
+          "description": null,
+          "implementation": null,
+          "permissions": null,
+          "conditions": null,
+          "limitations": null,
+          "body": null,
+          "featured": null
+        }
+      }
+    },
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829"
+      }
+    },
+    "author_association": "MEMBER",
+    "draft": true,
+    "additions": 729,
+    "deletions": 101,
+    "changed_files": 13,
+    "commits": 17,
+    "review_comments": 0,
+    "comments": 2
+  },
+  "events": [
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDU5Y2QwZjBlMDkxZjc4Y2Q0MjQ4YzljNGFjNjA3NDc0MGRkZTJhMjU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/59cd0f0e091f78cd4248c9c4ac6074740dde2a25",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/59cd0f0e091f78cd4248c9c4ac6074740dde2a25",
+      "tree": {
+        "sha": "6632b83b380096dd7c32cf68b7c9e3e5363c0415",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6632b83b380096dd7c32cf68b7c9e3e5363c0415"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/82ba50513425bf0568d4f9456282dc9713132490",
+          "sha": "82ba50513425bf0568d4f9456282dc9713132490",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/82ba50513425bf0568d4f9456282dc9713132490"
+        }
+      ],
+      "message": "[txorphanage] account for weight of orphans",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:29:46Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-27T11:56:43Z"
+      },
+      "sha": "59cd0f0e091f78cd4248c9c4ac6074740dde2a25"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDY3MmM2OWM2ODhmMjE2ZDcwZjMzNDQ5OGE1ZmU5YjA1MWRjM2M2NTI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/672c69c688f216d70f334498a5fe9b051dc3c652",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/672c69c688f216d70f334498a5fe9b051dc3c652",
+      "tree": {
+        "sha": "18d9e0dbd37cee3ed910c3427e72b7f7078e170c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/18d9e0dbd37cee3ed910c3427e72b7f7078e170c"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/59cd0f0e091f78cd4248c9c4ac6074740dde2a25",
+          "sha": "59cd0f0e091f78cd4248c9c4ac6074740dde2a25",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/59cd0f0e091f78cd4248c9c4ac6074740dde2a25"
+        }
+      ],
+      "message": "[refactor] change per-peer workset to info map within orphanage\n\nNo change for now, moving from map of NodeId->workset to\nNodeId->PeerOrphanInfo struct that holds the workset.\n\nIn future commits, we will start tracking more things per-peer in the\norphanage.",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:29:48Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-27T12:12:19Z"
+      },
+      "sha": "672c69c688f216d70f334498a5fe9b051dc3c652"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGU1ZWE3ZGFlZTAxZTAzMTNkNDc2MjViNDgyYjNlMzdiZDk3N2EzZTc",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5ea7daee01e0313d47625b482b3e37bd977a3e7",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e5ea7daee01e0313d47625b482b3e37bd977a3e7",
+      "tree": {
+        "sha": "ebd6a6c371d9f7db2d28716639f0dda7ac72f413",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/ebd6a6c371d9f7db2d28716639f0dda7ac72f413"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/672c69c688f216d70f334498a5fe9b051dc3c652",
+          "sha": "672c69c688f216d70f334498a5fe9b051dc3c652",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/672c69c688f216d70f334498a5fe9b051dc3c652"
+        }
+      ],
+      "message": "[txorphanage] add per-peer weight accounting",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:45:30Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-27T12:41:36Z"
+      },
+      "sha": "e5ea7daee01e0313d47625b482b3e37bd977a3e7"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMyODkyMTdjMDE0NjVhYjdmYzBiMGE1ZTM2YzUxNDgzNjE0NmNlMGU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c289217c01465ab7fc0b0a5e36c514836146ce0e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c289217c01465ab7fc0b0a5e36c514836146ce0e",
+      "tree": {
+        "sha": "4cf23bef44511ae9bdc1894ac273c7619664dc19",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4cf23bef44511ae9bdc1894ac273c7619664dc19"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5ea7daee01e0313d47625b482b3e37bd977a3e7",
+          "sha": "e5ea7daee01e0313d47625b482b3e37bd977a3e7",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e5ea7daee01e0313d47625b482b3e37bd977a3e7"
+        }
+      ],
+      "message": "[txorphanage] track the total number of announcements",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:45:30Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-05T12:53:25Z"
+      },
+      "sha": "c289217c01465ab7fc0b0a5e36c514836146ce0e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDk4MmNlMTAxNzgxNjNlMDdjYjAwOWQ1ZmExYmNjYzBkNWI3YWJlY2U",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/982ce10178163e07cb009d5fa1bccc0d5b7abece",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/982ce10178163e07cb009d5fa1bccc0d5b7abece",
+      "tree": {
+        "sha": "61b5967c9ac4f3e8994d3893b4c939e2f87a3202",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/61b5967c9ac4f3e8994d3893b4c939e2f87a3202"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c289217c01465ab7fc0b0a5e36c514836146ce0e",
+          "sha": "c289217c01465ab7fc0b0a5e36c514836146ce0e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c289217c01465ab7fc0b0a5e36c514836146ce0e"
+        }
+      ],
+      "message": "add orphanage byte accounting to TxDownloadManagerImpl::CheckIsEmpty()",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:45:30Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-27T13:22:44Z"
+      },
+      "sha": "982ce10178163e07cb009d5fa1bccc0d5b7abece"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDIyZGNjZWE1NTMyNTNhODNjNTBiMjUwOWI4ODFkMWMzYWU5MjViZGM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/22dccea553253a83c50b2509b881d1c3ae925bdc",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/22dccea553253a83c50b2509b881d1c3ae925bdc",
+      "tree": {
+        "sha": "fafab16a678e2bc9409345e5e28a479bfec2b4d6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fafab16a678e2bc9409345e5e28a479bfec2b4d6"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/982ce10178163e07cb009d5fa1bccc0d5b7abece",
+          "sha": "982ce10178163e07cb009d5fa1bccc0d5b7abece",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/982ce10178163e07cb009d5fa1bccc0d5b7abece"
+        }
+      ],
+      "message": "[fuzz] txorphan byte accounting\n\nCo-authored-by: Greg Sanders <gsanders87@gmail.com>",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-06T20:45:30Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-27T13:17:30Z"
+      },
+      "sha": "22dccea553253a83c50b2509b881d1c3ae925bdc"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGUxMDdiZjc4ZjlkNzIyZmNkZWI1YzFmYmE1YTc4NGRkNzc0N2UxMmY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e107bf78f9d722fcdeb5c1fba5a784dd7747e12f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e107bf78f9d722fcdeb5c1fba5a784dd7747e12f",
+      "tree": {
+        "sha": "2e053c7aac88d71df33f900f41f5d0ae1791f29c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2e053c7aac88d71df33f900f41f5d0ae1791f29c"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/22dccea553253a83c50b2509b881d1c3ae925bdc",
+          "sha": "22dccea553253a83c50b2509b881d1c3ae925bdc",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/22dccea553253a83c50b2509b881d1c3ae925bdc"
+        }
+      ],
+      "message": "[fuzz] TxOrphanage::SanityCheck accounting",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T18:55:57Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-30T05:46:01Z"
+      },
+      "sha": "e107bf78f9d722fcdeb5c1fba5a784dd7747e12f"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGI2MDk4YTEwMTI4NjhlMzVkN2Q5MDc2NDE3MmVjYjVhMzY4NmQ1MTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b6098a1012868e35d7d90764172ecb5a3686d519",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/b6098a1012868e35d7d90764172ecb5a3686d519",
+      "tree": {
+        "sha": "11f107cbe60253b1abb9e8b1adfaa6958d9af7db",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/11f107cbe60253b1abb9e8b1adfaa6958d9af7db"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e107bf78f9d722fcdeb5c1fba5a784dd7747e12f",
+          "sha": "e107bf78f9d722fcdeb5c1fba5a784dd7747e12f",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e107bf78f9d722fcdeb5c1fba5a784dd7747e12f"
+        }
+      ],
+      "message": "[txorphanage] change type of usage to int64_t",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-08T16:52:35Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-08T16:52:35Z"
+      },
+      "sha": "b6098a1012868e35d7d90764172ecb5a3686d519"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDY3N2IyNDk0NjA4NmE2ZTk5YWVjODBkYjBhMGFhYjUzMDBhZDJlNWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/677b24946086a6e99aec80db0a0aab5300ad2e5e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/677b24946086a6e99aec80db0a0aab5300ad2e5e",
+      "tree": {
+        "sha": "40f16485497281745364cf98da3869026e739c8a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/40f16485497281745364cf98da3869026e739c8a"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b6098a1012868e35d7d90764172ecb5a3686d519",
+          "sha": "b6098a1012868e35d7d90764172ecb5a3686d519",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/b6098a1012868e35d7d90764172ecb5a3686d519"
+        }
+      ],
+      "message": "[refactor] LimitOrphans into MaybeExpire and MaybeTrim",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T14:10:01Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T11:31:00Z"
+      },
+      "sha": "677b24946086a6e99aec80db0a0aab5300ad2e5e"
+    },
+    {
+      "event": "labeled",
+      "id": 16239377177,
+      "node_id": "LE_lADOABII586pVaFFzwAAAAPH8TsZ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16239377177",
+      "actor": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-02-09T21:14:45Z",
+      "label": {
+        "name": "P2P",
+        "color": "006b75"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2646604015,
+      "node_id": "IC_kwDOABII586dv_jv",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2646604015",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-02-09T21:14:49Z",
+      "updated_at": "2025-02-09T21:14:50Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/31829.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\nA summary of reviews will appear here.\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#issuecomment-2646604015",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31829"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 16239389279,
+      "node_id": "HRFPE_lADOABII586pVaFFzwAAAAPH8Wpf",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16239389279",
+      "actor": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "765fcdf42418581061f9d01d24594d915be6f1a6",
+      "commit_url": "https://api.github.com/repos/glozow/bitcoin/commits/765fcdf42418581061f9d01d24594d915be6f1a6",
+      "created_at": "2025-02-09T21:20:42Z"
+    },
+    {
+      "event": "labeled",
+      "id": 16239389767,
+      "node_id": "LE_lADOABII586pVaFFzwAAAAPH8WxH",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16239389767",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-02-09T21:20:52Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2646606231,
+      "node_id": "IC_kwDOABII586dwAGX",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2646606231",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-02-09T21:20:53Z",
+      "updated_at": "2025-02-09T21:20:53Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--85328a0da195eb286784d51f73fa0af9-->\n🚧 At least one of the CI tasks failed.\n<sub>Debug: https://github.com/bitcoin/bitcoin/runs/36925040096</sub>\n\n<details><summary>Hints</summary>\n\nTry to run the tests locally, according to the documentation. However, a CI failure may still\nhappen due to a number of reasons, for example:\n\n* Possibly due to a silent merge conflict (the changes in this pull request being\nincompatible with the current code in the target branch). If so, make sure to rebase on the latest\ncommit of the target branch.\n\n* A sanitizer issue, which can only be found by compiling with the sanitizer and running the\n  affected test.\n\n* An intermittent issue.\n\nLeave a comment here, if you need help tracking down a confusing failure.\n\n</details>\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#issuecomment-2646606231",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31829"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGZhN2NlNzQ5Yjg0NmM1NjBmODc3NmE2NGQ1MTJkMmZkZjk1ZTAwOWY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fa7ce749b846c560f8776a64d512d2fdf95e009f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/fa7ce749b846c560f8776a64d512d2fdf95e009f",
+      "tree": {
+        "sha": "830e7ba158b72d483573bd9e531997c877a22468",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/830e7ba158b72d483573bd9e531997c877a22468"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/677b24946086a6e99aec80db0a0aab5300ad2e5e",
+          "sha": "677b24946086a6e99aec80db0a0aab5300ad2e5e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/677b24946086a6e99aec80db0a0aab5300ad2e5e"
+        }
+      ],
+      "message": "[txorphanage] when full, evict from the DoSiest peers first\n\nThe max_orphans param is retained to preserve test behavior.\nMAX_GLOBAL_ORPHAN_ANNOUNCEMENTS and RESERVED_ORPHAN_WEIGHT_PER_PEER are\nchosen to allow 1 maximally-sized ancestor set to be resolved with each\npeer:\n* DEFAULT_MAX_PEER_CONNECTIONS x (DEFAULT_ANCESTOR_LIMIT - 1) = 3000\n* DEFAULT_ANCESTOR_SIZE_LIMIT = 404'000.",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T10:56:08Z"
+      },
+      "sha": "fa7ce749b846c560f8776a64d512d2fdf95e009f"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDkxNzQ5Y2FiNmNkZDllYzFmMjU5YTViMTQwMWUxYTAxOGQ3MGM1ZGU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/91749cab6cdd9ec1f259a5b1401e1a018d70c5de",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/91749cab6cdd9ec1f259a5b1401e1a018d70c5de",
+      "tree": {
+        "sha": "84a654faf15926ede8c194cedb4accbd291ddc2a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/84a654faf15926ede8c194cedb4accbd291ddc2a"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fa7ce749b846c560f8776a64d512d2fdf95e009f",
+          "sha": "fa7ce749b846c560f8776a64d512d2fdf95e009f",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/fa7ce749b846c560f8776a64d512d2fdf95e009f"
+        }
+      ],
+      "message": "[txorphanage] SanityCheck PeerOrphanInfo::m_iter_list is consistent with m_orphans",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T13:21:37Z"
+      },
+      "sha": "91749cab6cdd9ec1f259a5b1401e1a018d70c5de"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDU5YWFjZWE0Y2NlYWE2YjYwZWFlOThjNjQ5MWQzYzM5OWM5M2Y2NzA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/59aacea4cceaa6b60eae98c6491d3c399c93f670",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/59aacea4cceaa6b60eae98c6491d3c399c93f670",
+      "tree": {
+        "sha": "61b70a8ca3974fea3ac9f4ccb043c8c1ef8317ca",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/61b70a8ca3974fea3ac9f4ccb043c8c1ef8317ca"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/91749cab6cdd9ec1f259a5b1401e1a018d70c5de",
+          "sha": "91749cab6cdd9ec1f259a5b1401e1a018d70c5de",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/91749cab6cdd9ec1f259a5b1401e1a018d70c5de"
+        }
+      ],
+      "message": "[unit test] orphanage evicts dosy peers first",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T22:11:17Z"
+      },
+      "sha": "59aacea4cceaa6b60eae98c6491d3c399c93f670"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDU0NzljYjQzYWMxMTc5NWM3ZGY4NWM0MDZkNTllNzg4Mjg5MTU0Y2M",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5479cb43ac11795c7df85c406d59e788289154cc",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5479cb43ac11795c7df85c406d59e788289154cc",
+      "tree": {
+        "sha": "3aa692957be1100ad1a1cfc127339a904e211810",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3aa692957be1100ad1a1cfc127339a904e211810"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/59aacea4cceaa6b60eae98c6491d3c399c93f670",
+          "sha": "59aacea4cceaa6b60eae98c6491d3c399c93f670",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/59aacea4cceaa6b60eae98c6491d3c399c93f670"
+        }
+      ],
+      "message": "[bench] TxOrphanage::LimitOrphans",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-30T07:28:08Z"
+      },
+      "sha": "5479cb43ac11795c7df85c406d59e788289154cc"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGJmNTkxNTZhOTYwNjU4YTQyMjFjYzhhM2VhODYxM2U1NDgzZjZlMWQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bf59156a960658a4221cc8a3ea8613e5483f6e1d",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/bf59156a960658a4221cc8a3ea8613e5483f6e1d",
+      "tree": {
+        "sha": "8671374ea1f25b1b0ff9f5cb68e6d07b30b326d2",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8671374ea1f25b1b0ff9f5cb68e6d07b30b326d2"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5479cb43ac11795c7df85c406d59e788289154cc",
+          "sha": "5479cb43ac11795c7df85c406d59e788289154cc",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/5479cb43ac11795c7df85c406d59e788289154cc"
+        }
+      ],
+      "message": "[functional test] 1p1c is accepted in the presence of orphanage DoSers",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-29T13:26:23Z"
+      },
+      "sha": "bf59156a960658a4221cc8a3ea8613e5483f6e1d"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDJjMzgxODBhMGUwMWYyOTQwZTJkZWQ3YmY5ZDI3NTIzZDJmNGVjNmI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b",
+      "tree": {
+        "sha": "464b7252999259160ba36017cc0cbf0f2373d265",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/464b7252999259160ba36017cc0cbf0f2373d265"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bf59156a960658a4221cc8a3ea8613e5483f6e1d",
+          "sha": "bf59156a960658a4221cc8a3ea8613e5483f6e1d",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/bf59156a960658a4221cc8a3ea8613e5483f6e1d"
+        }
+      ],
+      "message": "[txorphanage] trim work sets in AddChildrenToWorkset\n\nBound the amount of orphans that can be in any peer's work set by\nensuring they never grow beyond a certain point. Since there is limited\nspace and work sets can contain orphans that have already been deleted,\nonce per AddChildrenToWorkset call, if we run out of space in a peer's\nwork set, iterate through it and delete the ones that don't correspond\nto a tx in m_orphans.",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T20:18:36Z"
+      },
+      "sha": "2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDRiNzdjMWVjNjMxNzk0NmUwZmE2NDRhZTRjZTEyMjRjNmU5NTNiM2U",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b77c1ec6317946e0fa644ae4ce1224c6e953b3e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4b77c1ec6317946e0fa644ae4ce1224c6e953b3e",
+      "tree": {
+        "sha": "8b6cd79b4b7e36fa0756e4901b4c1375a25a4fd5",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8b6cd79b4b7e36fa0756e4901b4c1375a25a4fd5"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b",
+          "sha": "2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/2c38180a0e01f2940e2ded7bf9d27523d2f4ec6b"
+        }
+      ],
+      "message": "[test] remove orphanage debug log assertions in p2p_invalid_tx.py\n\nAsserting debug logs does not actually test anything; test using\ngetorphantxs instead.\nAlso remove the test that exactly 101 orphans leads to eviction.",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-01-28T13:29:31Z"
+      },
+      "sha": "4b77c1ec6317946e0fa644ae4ce1224c6e953b3e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQzMDIzMjRlZGNmZjY0ODU3NGM1ZGY0Njc0MzVhYmVlMDVlNjJhMmU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d302324edcff648574c5df467435abee05e62a2e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d302324edcff648574c5df467435abee05e62a2e",
+      "tree": {
+        "sha": "d89558e990a0f0bba8511ec7a5fd4b3d341756f1",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d89558e990a0f0bba8511ec7a5fd4b3d341756f1"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b77c1ec6317946e0fa644ae4ce1224c6e953b3e",
+          "sha": "4b77c1ec6317946e0fa644ae4ce1224c6e953b3e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/4b77c1ec6317946e0fa644ae4ce1224c6e953b3e"
+        }
+      ],
+      "message": "Increase default -maxorphantx to 3000\n\nNow that TxOrphanage internally enforces more robust memory and\ncomputation bounds, it is safe to increase this number. Historical data\nshows that we frequently bust the 100 limit, leading to us evicting and\nredownloading the same orphans.",
+      "committer": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-09T21:27:11Z"
+      },
+      "author": {
+        "name": "glozow",
+        "email": "gloriajzhao@gmail.com",
+        "date": "2025-02-07T13:34:05Z"
+      },
+      "sha": "d302324edcff648574c5df467435abee05e62a2e"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 16239406371,
+      "node_id": "HRFPE_lADOABII586pVaFFzwAAAAPH8a0j",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16239406371",
+      "actor": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "d302324edcff648574c5df467435abee05e62a2e",
+      "commit_url": "https://api.github.com/repos/glozow/bitcoin/commits/d302324edcff648574c5df467435abee05e62a2e",
+      "created_at": "2025-02-09T21:28:54Z"
+    }
+  ],
+  "comments": []
+}
