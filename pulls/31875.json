@@ -40,19 +40,9 @@
       "patch_url": null
     },
     "body": "This is an extension of https://github.com/bitcoin/bitcoin/pull/31645 - drafted for now to receive comments.\r\n\r\nIt looks like sorting the coins before flushing speeds up `MemTable` insertion considerably (will move the image to comments, after undrafting):\r\n![descending sort](https://github.com/user-attachments/assets/ba30667c-bd83-4e15-a218-f5edf8545abe)\r\n\r\nRan a few `assumeUTXO` loads and a few complete reindexes to check the LevelDB write batch size increase with/without sorting:\r\n\r\n# assumeUTXO final dumps:\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\n/mnt/my_storage/bitcoin # tail -3 ../logs/debug-35bf426e02210c1bbb04926f4ca2e0285fbfcd11.log \r\n2025-01-14T00:46:32Z [warning] Flushing large (26 GiB) UTXO set to disk, it may take several minutes\r\n2025-01-14T01:18:53Z Shutdown: done\r\n\r\n/mnt/my_storage/bitcoin # tail -3 ../logs/debug-256a5c04f2eb190e45ec7d7ffb058c189174780a.log \r\n2025-01-14T13:44:14Z [warning] Flushing large (26 GiB) UTXO set to disk, it may take several minutes\r\n2025-01-14T14:06:10Z Shutdown: done\r\n\r\n/mnt/my_storage/bitcoin # tail -3 ../logs/debug-a5920ec25f02b8b66b6f23f00e696a86b5352d69.log \r\n2025-01-15T02:15:49Z [warning] Flushing large (26 GiB) UTXO set to disk, it may take several minutes\r\n2025-01-15T02:24:16Z Shutdown: done\r\n```\r\n\r\n</details>\r\n\r\n> 35bf426e02210c1bbb04926f4ca2e0285fbfcd11 (master):         Duration: 0:32:21\r\n> 256a5c04f2eb190e45ec7d7ffb058c189174780a (64 << 20):       Duration: 0:21:56\r\n> a5920ec25f02b8b66b6f23f00e696a86b5352d69 (SortedWrite 64): Duration: 0:08:27\r\n\r\nMeaning that the `64 MiB batch size increase` + `descending sorting` improves the final UTXO set dump from **32 minutes** to **8 minutes**.\r\n\r\n# reindex-chainstate until 878k blocks\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nhyperfine --runs 2 --parameter-list COMMIT 35bf426e02210c1bbb04926f4ca2e0285fbfcd11,256a5c04f2eb190e45ec7d7ffb058c189174780a,a5920ec25f02b8b66b6f23f00e696a86b5352d69 --prepare 'rm -f /mnt/my_storage/BitcoinData/debug.log && git checkout {COMMIT} && git clean -fxd && git reset --hard && cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_UTIL=OFF -DBUILD_TX=OFF -DBUILD_TESTS=OFF -DENABLE_WALLET=OFF -DINSTALL_MAN=OFF && cmake --build build -j$(nproc)' --cleanup 'mv /mnt/my_storage/BitcoinData/debug.log /mnt/my_storage/logs/debug-{COMMIT}.log' 'COMMIT={COMMIT} ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0'\r\n\r\nBenchmark 1: COMMIT=35bf426e02210c1bbb04926f4ca2e0285fbfcd11 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0\r\n  Time (mean ± σ):     23766.362 s ±  5.864 s    [User: 36042.690 s, System: 701.176 s]\r\n  Range (min … max):   23762.216 s … 23770.509 s    2 runs\r\n \r\nBenchmark 2: COMMIT=256a5c04f2eb190e45ec7d7ffb058c189174780a ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0\r\n  Time (mean ± σ):     22966.570 s ± 97.248 s    [User: 35741.689 s, System: 642.797 s]\r\n  Range (min … max):   22897.805 s … 23035.335 s    2 runs\r\n \r\nBenchmark 3: COMMIT=a5920ec25f02b8b66b6f23f00e696a86b5352d69 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0\r\n  Time (mean ± σ):     22119.481 s ± 50.626 s    [User: 35457.379 s, System: 578.014 s]\r\n  Range (min … max):   22083.683 s … 22155.279 s    2 runs\r\n```\r\n\r\n</details>\r\n\r\n```bash\r\nSummary\r\n  COMMIT=a5920ec25f02b8b66b6f23f00e696a86b5352d69 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0 ran\r\n    1.04 ± 0.00 times faster than COMMIT=256a5c04f2eb190e45ec7d7ffb058c189174780a ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0\r\n    1.07 ± 0.00 times faster than COMMIT=35bf426e02210c1bbb04926f4ca2e0285fbfcd11 ./build/src/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=878000 -dbcache=30000 -reindex-chainstate -connect=0\r\n```\r\n\r\nIndicating that the two changes combined result in 7% faster reindex (and likely IBD).\r\n\r\n---\r\n\r\nOne of the drawbacks of this approach that I'd like guidance on (as noted by @sipa in the [64-MiB-bump PR](https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2587500105) as well), is that this will increase max memory usage temporarily at a critical time (e.g. while dumping the calculated final UTXO set), when we are already using the most memory.\r\nThis can likely be mitigated in a few ways as far as I can tell:\r\n1) similarly to how we [warn on low disk storage space](https://github.com/bitcoin/bitcoin/blob/master/src/init.cpp#L1775-L1791), we could warn at the beginning when `dbcache` size is unrealistically big. (`bitcoind -dbcache=300000` (300GiB) simply prints `Using 299990.0 MiB for in-memory UTXO set` - we could add a warning at least in this case).\r\n2) merge https://github.com/bitcoin/bitcoin/pull/30611 by @andrewtoth and lose at most 1 hour's worth of work.\r\n3) make the upstream [LevelDB batch](https://github.com/google/leveldb/blob/main/include/leveldb/write_batch.h#L33) sortable (or automatically sort itself before insertion).\r\n",
-    "labels": [
-      {
-        "id": 5334691551,
-        "node_id": "LA_kwDOABII588AAAABPfju3w",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
-        "name": "CI failed",
-        "description": "",
-        "color": "cccccc",
-        "default": false
-      }
-    ],
+    "labels": [],
     "created_at": "2025-02-14T22:34:47Z",
-    "updated_at": "2025-02-15T03:34:05Z",
+    "updated_at": "2025-02-15T15:26:01Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -175,7 +165,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-02-15T00:46:32Z",
+        "pushed_at": "2025-02-15T15:25:20Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2024-07-18T12:40:18Z",
         "allow_forking": true,
@@ -294,12 +284,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36723,
-        "stargazers_count": 82002,
-        "watchers_count": 82002,
+        "forks_count": 36724,
+        "stargazers_count": 82007,
+        "watchers_count": 82007,
         "size": 275624,
         "default_branch": "master",
-        "open_issues_count": 679,
+        "open_issues_count": 680,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -318,7 +308,7 @@
         "visibility": "public",
         "pushed_at": "2025-02-14T23:22:17Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-02-15T09:53:37Z",
+        "updated_at": "2025-02-15T15:45:51Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -781,6 +771,40 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2025-02-15T00:46:38Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "unlabeled",
+      "id": 16321898924,
+      "node_id": "UNLE_lADOABII586qKPunzwAAAAPM3Gms",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/16321898924",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-02-15T15:26:01Z",
       "label": {
         "name": "CI failed",
         "color": "cccccc"
