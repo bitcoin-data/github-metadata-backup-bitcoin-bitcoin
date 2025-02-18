@@ -42,7 +42,7 @@
     "body": "Currently `CConnman` is a mixture of:\r\n* low level socket handling, e.g. send, recv, poll, bind, listen, connect, and\r\n* higher level logic that is specific to the Bitcoin P2P protocol, e.g. V1/V2 transport, choosing which address to connect to, if we manage to connect mark the address good in `AddrMan`, maintaining the number of inbound and outbound connections, banning of peers, interacting with `PeerManager`.\r\n\r\n---\r\n\r\nThis PR splits the socket handling into a new class which makes the code more modular and reusable. Having more modular and reusable code is a good thing on its own, even if the code is not reused. Stratum V2 and libevent-less RPC/HTTP server could benefit from this, but it makes sense on its own, even without those projects.\r\n\r\n---\r\n\r\nThe socket operations are driven by the new class `SockMan` which informs the higher level via provided methods when e.g. new data arrives on the socket or a new connection is accepted. For this, `SockMan` provides some non-virtual methods to start it rolling and then it calls pure virtual methods which are implemented by the higher level (e.g. `CConnman`) on certain events, for example \"got this new data on this node's socket\".\r\n\r\nThe interface of `SockMan` is:\r\n\r\n```cpp\r\n/**\r\n * A socket manager class which handles socket operations.\r\n * To use this class, inherit from it and implement the pure virtual methods.\r\n * Handled operations:\r\n * - binding and listening on sockets\r\n * - starting of necessary threads to process socket operations\r\n * - accepting incoming connections\r\n * - making outbound connections\r\n * - closing connections\r\n * - waiting for IO readiness on sockets and doing send/recv accordingly\r\n */\r\nclass SockMan\r\n{\r\npublic:\r\n\r\n    //\r\n    // Non-virtual functions, to be reused by children classes.\r\n    //\r\n\r\n    /**\r\n     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\r\n     * Should be called before `StartSocketsThreads()`.\r\n     * @param[in] to Where to bind.\r\n     * @param[out] err_msg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `err_msg` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& err_msg);\r\n\r\n    /**\r\n     * Start the necessary threads for sockets IO.\r\n     */\r\n    void StartSocketsThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\r\n     */\r\n    void JoinSocketsThreads();\r\n\r\n    /**\r\n     * Make an outbound connection, save the socket internally and return a newly generated connection id.\r\n     * @param[in] to The address to connect to, either as CService or a host as string and port as\r\n     * an integer, if the later is used, then `proxy` must be valid.\r\n     * @param[in] is_important If true, then log failures with higher severity.\r\n     * @param[in] proxy Proxy to connect through, if set.\r\n     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\r\n     * proxy, then it will be set to true.\r\n     * @param[out] me If the connection was successful then this is set to the address on the\r\n     * local side of the socket.\r\n     * @return Newly generated id, or std::nullopt if the operation fails.\r\n     */\r\n    std::optional<SockMan::Id> ConnectAndMakeId(const std::variant<CService, StringHostIntPort>& to,\r\n                                                bool is_important,\r\n                                                std::optional<Proxy> proxy,\r\n                                                bool& proxy_failed,\r\n                                                CService& me)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex, !m_unused_i2p_sessions_mutex);\r\n\r\n    /**\r\n     * Destroy a given connection by closing its socket and release resources occupied by it.\r\n     * @param[in] id Connection to destroy.\r\n     * @return Whether the connection existed and its socket was closed by this call.\r\n     */\r\n    bool CloseConnection(Id id)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Try to send some data over the given connection.\r\n     * @param[in] id Identifier of the connection.\r\n     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\r\n     * @param[in] will_send_more Used as an optimization if the caller knows that they will\r\n     * be sending more data soon after this call.\r\n     * @param[out] errmsg If <0 is returned then this will contain a human readable message\r\n     * explaining the error.\r\n     * @retval >=0 The number of bytes actually sent.\r\n     * @retval <0 A permanent error has occurred.\r\n     */\r\n    ssize_t SendBytes(Id id,\r\n                      std::span<const unsigned char> data,\r\n                      bool will_send_more,\r\n                      std::string& errmsg) const\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Stop listening by closing all listening sockets.\r\n     */\r\n    void StopListening();\r\n\r\n    //\r\n    // Pure virtual functions must be implemented by children classes.\r\n    //\r\n\r\n    /**\r\n     * Be notified when a new connection has been accepted.\r\n     * @param[in] id Id of the newly accepted connection.\r\n     * @param[in] me The address and port at our side of the connection.\r\n     * @param[in] them The address and port at the peer's side of the connection.\r\n     * @retval true The new connection was accepted at the higher level.\r\n     * @retval false The connection was refused at the higher level, so the\r\n     * associated socket and id should be discarded by `SockMan`.\r\n     */\r\n    virtual bool EventNewConnectionAccepted(Id id,\r\n                                            const CService& me,\r\n                                            const CService& them) = 0;\r\n\r\n    /**\r\n     * Called when the socket is ready to send data and `ShouldTryToSend()` has\r\n     * returned true. This is where the higher level code serializes its messages\r\n     * and calls `SockMan::SendBytes()`.\r\n     * @param[in] id Id of the connection whose socket is ready to send.\r\n     * @param[out] cancel_recv Should always be set upon return and if it is true,\r\n     * then the next attempt to receive data from that connection will be omitted.\r\n     */\r\n    virtual void EventReadyToSend(Id id, bool& cancel_recv) = 0;\r\n\r\n    /**\r\n     * Called when new data has been received.\r\n     * @param[in] id Connection for which the data arrived.\r\n     * @param[in] data Received data.\r\n     */\r\n    virtual void EventGotData(Id id, std::span<const uint8_t> data) = 0;\r\n\r\n    /**\r\n     * Called when the remote peer has sent an EOF on the socket. This is a graceful\r\n     * close of their writing side, we can still send and they will receive, if it\r\n     * makes sense at the application level.\r\n     * @param[in] id Connection whose socket got EOF.\r\n     */\r\n    virtual void EventGotEOF(Id id) = 0;\r\n\r\n    /**\r\n     * Called when we get an irrecoverable error trying to read from a socket.\r\n     * @param[in] id Connection whose socket got an error.\r\n     * @param[in] errmsg Message describing the error.\r\n     */\r\n    virtual void EventGotPermanentReadError(Id id, const std::string& errmsg) = 0;\r\n};\r\n```\r\n\r\nResolves: https://github.com/bitcoin/bitcoin/issues/30694\r\n\r\n---\r\n\r\nReview hint: this PR moves some code around, so reviewers may find this helpful: `git show --color-moved --color-moved-ws=allow-indentation-change`.",
     "labels": [],
     "created_at": "2024-09-27T07:57:10Z",
-    "updated_at": "2025-02-17T18:44:39Z",
+    "updated_at": "2025-02-18T05:44:27Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -307,11 +307,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 36735,
-        "stargazers_count": 82041,
-        "watchers_count": 82041,
+        "stargazers_count": 82048,
+        "watchers_count": 82048,
         "size": 275610,
         "default_branch": "master",
-        "open_issues_count": 688,
+        "open_issues_count": 689,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -330,7 +330,7 @@
         "visibility": "public",
         "pushed_at": "2025-02-17T15:31:10Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-02-17T17:31:51Z",
+        "updated_at": "2025-02-18T04:01:33Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -360,7 +360,7 @@
     "deletions": 729,
     "changed_files": 20,
     "commits": 17,
-    "review_comments": 165,
+    "review_comments": 166,
     "comments": 34
   },
   "events": [
@@ -13929,6 +13929,59 @@
       "start_side": null,
       "line": null,
       "original_line": 339,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1959105072",
+      "pull_request_review_id": 2622503578,
+      "id": 1959105072,
+      "node_id": "PRRC_kwDOABII5850xZIw",
+      "diff_hunk": "@@ -1660,9 +1588,24 @@ std::pair<size_t, bool> CConnman::SocketSendData(CNode& node) const\n         assert(node.m_send_memusage == 0);\n     }\n     node.vSendMsg.erase(node.vSendMsg.begin(), it);\n+\n+    if (nSentSize > 0) {\n+        RecordBytesSent(nSentSize);\n+    }\n+\n     return {nSentSize, data_left};\n }\n \n+CNode* CConnman::GetNodeById(NodeId node_id) const\n+{\n+    LOCK(m_nodes_mutex);\n+    auto it{m_nodes.find(node_id)};\n+    if (it != m_nodes.end()) {\n+        return it->second;",
+      "path": "src/net.cpp",
+      "position": 306,
+      "original_position": 301,
+      "commit_id": "741f17e51ddac002fadbc735e2ca650117594a3c",
+      "original_commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
+      "in_reply_to_id": 1935423919,
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "After thinking about this a bit more and doing some changes to the code, I decided to:\r\n\r\n1. Open a separate PR to remove the manual ref counting on `CNode` and replace it with `shared_ptr` and change `CConnman::m_nodes` from `vector<CNode*>` to `unordered_set<shared_ptr<CNode>>`. That PR would be independent from this one.\r\n\r\n2. In this PR, change the communication between `SockMan` and `CConman` to be based on pointer to `CNode` instead of node id. Similarly to https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2485715952. I will start with a raw pointer and the responsibility of destruction will be in `CConnman`, like it is now. If 1. is merged in the mean time before this PR, then I will just change this PR to use `shared_ptr` instead of a raw pointer.",
+      "created_at": "2025-02-18T05:44:27Z",
+      "updated_at": "2025-02-18T05:44:27Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#discussion_r1959105072",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1959105072"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+        }
+      },
+      "start_line": 1602,
+      "original_start_line": 1601,
+      "start_side": "RIGHT",
+      "line": 1605,
+      "original_line": 1605,
       "side": "RIGHT"
     }
   ]
