@@ -42,11 +42,11 @@
     "body": "This PR introduces `waitNext()`. It waits for either the tip to update or for fees at the top of the mempool to rise sufficiently. It then returns a new template, with which the caller can rinse and repeat.\r\n\r\nOn testnet3 and testnet4 the difficulty drops after 20 minutes, so the second ensures that a new template is returned in that case.\r\n\r\nAlternative approach to #31003, suggested in https://github.com/bitcoin/bitcoin/issues/31109#issuecomment-2451942362",
     "labels": [],
     "created_at": "2024-11-13T12:30:36Z",
-    "updated_at": "2025-02-14T02:55:07Z",
+    "updated_at": "2025-02-18T15:38:10Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "063c6a074dfcd38c4aa514bad3115c0b2e73bc9d",
+    "merge_commit_sha": "8556c960ec39273e2968df4f626c555ceace9521",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -174,7 +174,7 @@
         "forks_count": 10,
         "stargazers_count": 11,
         "watchers_count": 11,
-        "size": 256704,
+        "size": 256885,
         "default_branch": "sv2",
         "open_issues_count": 12,
         "is_template": false,
@@ -187,7 +187,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-02-13T19:40:51Z",
+        "pushed_at": "2025-02-18T15:34:56Z",
         "created_at": "2017-05-25T10:05:54Z",
         "updated_at": "2025-02-10T14:41:39Z",
         "allow_forking": true,
@@ -306,12 +306,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36723,
-        "stargazers_count": 82002,
-        "watchers_count": 82002,
+        "forks_count": 36737,
+        "stargazers_count": 82057,
+        "watchers_count": 82057,
         "size": 275624,
         "default_branch": "master",
-        "open_issues_count": 679,
+        "open_issues_count": 686,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -328,9 +328,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-02-14T23:22:17Z",
+        "pushed_at": "2025-02-18T15:37:32Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-02-15T09:53:37Z",
+        "updated_at": "2025-02-18T15:56:39Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -360,7 +360,7 @@
     "deletions": 11,
     "changed_files": 8,
     "commits": 2,
-    "review_comments": 113,
+    "review_comments": 114,
     "comments": 32
   },
   "events": [
@@ -11037,6 +11037,59 @@
       "start_side": null,
       "line": 43,
       "original_line": 43,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1960003712",
+      "pull_request_review_id": 2624026405,
+      "id": 1960003712,
+      "node_id": "PRRC_kwDOABII585000iA",
+      "diff_hunk": "@@ -936,9 +937,99 @@ class BlockTemplateImpl : public BlockTemplate\n         return chainman().ProcessNewBlock(block_ptr, /*force_processing=*/true, /*min_pow_checked=*/true, /*new_block=*/nullptr);\n     }\n \n+    std::unique_ptr<BlockTemplate> waitNext(BlockWaitOptions options) override\n+    {\n+        // Delay calculating the current template fees, just in case a new block\n+        // comes in before the next tick.\n+        CAmount current_fees = -1;\n+\n+        // Alternate waiting for a new tip and checking if fees have risen.\n+        // The latter check is expensive so we only run it once per second.\n+        auto now{NodeClock::now()};\n+        const auto deadline = now + options.timeout;\n+        const MillisecondsDouble tick{1000};\n+        const bool allow_min_difficulty{chainman().GetParams().GetConsensus().fPowAllowMinDifficultyBlocks};\n+\n+        while (now <= deadline) {\n+            bool tip_changed{false};\n+            {\n+                WAIT_LOCK(notifications().m_tip_block_mutex, lock);\n+                notifications().m_tip_block_cv.wait_until(lock, std::min(now + tick, deadline), [&]() EXCLUSIVE_LOCKS_REQUIRED(notifications().m_tip_block_mutex) {\n+                    Assert(notifications().TipBlock());\n+                    tip_changed = notifications().TipBlock() != m_block_template->block.hashPrevBlock;\n+                    return tip_changed || chainman().m_interrupt;\n+                });\n+            }\n+\n+            if (chainman().m_interrupt) return nullptr;\n+\n+            // Must release m_tip_block_mutex before locking cs_main, to avoid deadlocks.\n+            LOCK(::cs_main);\n+\n+            // On test networks return a minimum difficulty block after 20 minutes\n+            if (!tip_changed && allow_min_difficulty) {\n+                const NodeClock::time_point tip_time{std::chrono::seconds{chainman().ActiveChain().Tip()->GetBlockTime()}};\n+                if (now > tip_time + std::chrono::seconds(20 * 60)) {\n+                    tip_changed = true;\n+                }\n+            }\n+\n+            /**\n+             * The only way to determine if fees increased compared to the previous template,\n+             * is to generate a fresh template. Cluster Mempool may allow for a more efficient\n+             * way to determine how much (approximate) fees for the next block increased.\n+             *\n+             * We'll also create a new template if the tip changed during the last tick.\n+             */\n+            if (options.fee_threshold < MAX_MONEY || tip_changed) {\n+                auto block_template{std::make_unique<BlockTemplateImpl>(m_assemble_options, BlockAssembler{chainman().ActiveChainstate(), context()->mempool.get(), m_assemble_options}.CreateNewBlock(), m_node)};\n+\n+                // If the tip changed, return the new template regardless of its fees.\n+                if (tip_changed) {\n+                    return block_template;\n+                }\n+\n+                // Calculate the original template total fees if we haven't already\n+                if (current_fees == -1) {\n+                    current_fees = 0;\n+                    for (CAmount fee : m_block_template->vTxFees) {\n+                        // Skip coinbase\n+                        if (fee < 0) continue;\n+                        current_fees += fee;\n+                    }\n+                }",
+      "path": "src/node/interfaces.cpp",
+      "position": 88,
+      "original_position": 81,
+      "commit_id": "2d65225c4696dcc8312d546eb67f4eae11b9b8fe",
+      "original_commit_id": "6bf77e5a376804c0681897fa032537ba16e9a99a",
+      "in_reply_to_id": 1937311760,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "I opened #31897 to drop this `-nFees` dummy.",
+      "created_at": "2025-02-18T15:38:10Z",
+      "updated_at": "2025-02-18T15:38:10Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31283#discussion_r1960003712",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/1960003712"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31283"
+        }
+      },
+      "start_line": 1006,
+      "original_start_line": 993,
+      "start_side": "RIGHT",
+      "line": 1013,
+      "original_line": 1013,
       "side": "RIGHT"
     }
   ]
