@@ -42,11 +42,11 @@
     "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\nWe can serialize the blocks and undos to any `Stream` which implements the appropriate read/write methods.\r\n`AutoFile` is one of these, writing the results \"directly\" to disk (through the OS file cache). Batching these in memory first and reading/writing these to disk is measurably faster (likely because of fewer native fread calls or less locking, as [observed](https://github.com/bitcoin/bitcoin/pull/28226#issuecomment-1666842501) by @martinus in a similar change).\r\n\r\n### Unlocking new optimization opportunities\r\n\r\nBuffered writes will also enable batched obfuscation calculations (implemented in https://github.com/bitcoin/bitcoin/pull/31144) - especially since currently we need to copy the write input's std::span to do the obfuscation on it, and batching enables doing the operations on the internal buffer directly.\r\n\r\n### Measurements (micro benchmarks, full IBDs and reindexes)\r\n\r\nMicrobenchmarks for `[Read|Write]BlockBench` show a ~**30%**/**168%** speedup with `macOS/Clang`, and ~**19%**/**24%** with `Linux/GCC` (the follow-up XOR batching improves these further):\r\n\r\n<details>\r\n<summary>macOS Sequoia - Clang 19.1.7</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        2,271,441.67 |              440.25 |    0.1% |     11.00 | `ReadBlockBench`\r\n|        5,149,564.31 |              194.19 |    0.8% |     10.95 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        1,738,683.04 |              575.15 |    0.2% |     11.04 | `ReadBlockBench`\r\n|        3,052,658.88 |              327.58 |    1.0% |     10.91 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Ubuntu 24 - GNU 13.3.0</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        6,895,987.11 |              145.01 |    0.0% |   71,055,269.86 |   23,977,374.37 |  2.963 |   5,074,828.78 |    0.4% |     22.00 | `ReadBlockBench`\r\n|        5,152,973.58 |              194.06 |    2.2% |   19,350,886.41 |    8,784,539.75 |  2.203 |   3,079,335.21 |    0.4% |     23.18 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        5,771,882.71 |              173.25 |    0.0% |   65,741,889.82 |   20,453,232.33 |  3.214 |   3,971,321.75 |    0.3% |     22.01 | `ReadBlockBench`\r\n|        4,145,681.13 |              241.21 |    4.0% |   15,337,596.85 |    5,732,186.47 |  2.676 |   2,239,662.64 |    0.1% |     23.94 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n\r\n2 full IBD runs against master (compiled with GCC where the gains seem more modest) for **888888** blocks (seeded from real nodes) indicates a ~**7%** total speedup.\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nCOMMITS=\"8af40aaf283cc81fe2b3cc125d21f090c562460e 5c21f6c26fd6b6eab33e208cd565577735fe9aa7 97d30e2534b0a8c388a4a2059277f64d3b2243af\"; \\\r\nSTOP_HEIGHT=888888; DBCACHE=1000; \\\r\nC_COMPILER=gcc; CXX_COMPILER=g++; \\\r\nBASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"${BASE_DIR}/BitcoinData\"; LOG_DIR=\"${BASE_DIR}/logs\"; \\\r\ngit fetch --all -q && (for c in $COMMITS; do git fetch origin $c -q && git log -1 --oneline $c || exit 1; done) && \\\r\nhyperfine \\\r\n  --export-json \"${BASE_DIR}/ibd-${COMMITS// /-}-${STOP_HEIGHT}-${DBCACHE}-${C_COMPILER}.json\" \\\r\n  --runs 2 \\\r\n  --parameter-list COMMIT ${COMMITS// /,} \\\r\n  --prepare \"killall bitcoind; rm -rf ${DATA_DIR}/*; git checkout {COMMIT}; git clean -fxd; git reset --hard; \\\r\n    cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=$C_COMPILER -DCMAKE_CXX_COMPILER=$CXX_COMPILER && \\\r\n    cmake --build build -j$(nproc) --target bitcoind && \\\r\n    ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=1 -printtoconsole=0\" \\\r\n  --cleanup \"cp ${DATA_DIR}/debug.log ${LOG_DIR}/debug-{COMMIT}-$(date +%s).log\" \\\r\n  \"COMPILER=$C_COMPILER COMMIT={COMMIT} ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=$STOP_HEIGHT -dbcache=$DBCACHE -blocksonly -printtoconsole=0\"\r\n\r\n8af40aaf28 refactor: replace raw values in ReadRawBlock with HEADER_BYTE_SIZE\r\n5c21f6c26f optimization: Bulk serialization reads in `UndoRead`, `ReadBlock`, and `ReadRawBlock`\r\n97d30e2534 optimization: Bulk serialization writes in `WriteBlockUndo` and `WriteBlock`\r\n\r\nBenchmark 1: COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     30899.137 s ± 501.097 s    [User: 43094.744 s, System: 3295.980 s]\r\n  Range (min … max):   30544.808 s … 31253.467 s    2 runs\r\n \r\nBenchmark 2: COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     29956.405 s ± 111.231 s    [User: 42278.888 s, System: 3239.997 s]\r\n  Range (min … max):   29877.754 s … 30035.057 s    2 runs\r\n \r\nBenchmark 3: COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     28826.445 s ± 147.749 s    [User: 41450.577 s, System: 2955.840 s]\r\n  Range (min … max):   28721.970 s … 28930.919 s    2 runs\r\n \r\nSummary\r\n  COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0 ran\r\n    1.04 ± 0.01 times faster than COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n    1.07 ± 0.02 times faster than COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n```\r\n\r\n</details>",
     "labels": [],
     "created_at": "2024-12-21T14:34:11Z",
-    "updated_at": "2025-04-02T02:35:37Z",
+    "updated_at": "2025-04-02T08:43:32Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "2a0e85bdcda5921e8a695f62164becf0aefa6415",
+    "merge_commit_sha": "2d02c2ab1bd4827c1d6b2994adb6f0da06a12f5d",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -284,12 +284,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36992,
-        "stargazers_count": 82729,
-        "watchers_count": 82729,
-        "size": 279267,
+        "forks_count": 36995,
+        "stargazers_count": 82732,
+        "watchers_count": 82732,
+        "size": 279319,
         "default_branch": "master",
-        "open_issues_count": 694,
+        "open_issues_count": 689,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -306,9 +306,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-04-02T01:56:13Z",
+        "pushed_at": "2025-04-02T06:15:17Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-04-02T01:56:19Z",
+        "updated_at": "2025-04-02T08:24:29Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -338,7 +338,7 @@
     "deletions": 63,
     "changed_files": 7,
     "commits": 7,
-    "review_comments": 22,
+    "review_comments": 23,
     "comments": 18
   },
   "events": [
@@ -5156,6 +5156,59 @@
       "start_side": null,
       "line": 666,
       "original_line": 666,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2024363508",
+      "pull_request_review_id": 2735316699,
+      "id": 2024363508,
+      "node_id": "PRRC_kwDOABII5854qVX0",
+      "diff_hunk": "@@ -666,24 +666,26 @@ bool BlockManager::ReadBlockUndo(CBlockUndo& blockundo, const CBlockIndex& index\n         return false;\n     }\n \n-    // Read block\n-    uint256 hashChecksum;\n-    HashVerifier verifier{filein}; // Use HashVerifier as reserializing may lose data, c.f. commit d342424301013ec47dc146a4beb49d5c9319d80a\n     try {\n+        // Read block\n+        HashVerifier verifier{filein}; // Use HashVerifier, as reserializing may lose data, c.f. commit d3424243",
+      "path": "src/node/blockstorage.cpp",
+      "position": 19,
+      "original_position": 9,
+      "commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
+      "original_commit_id": "fbe701bf32a33766d06bec58e4c0fb70e94f60b1",
+      "in_reply_to_id": 2023827585,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "I know that try/catch is often used as narrowly as possible, as if it were an additional return value, but catching an error type means that we shouldn't really care where it's coming from. That enables us to separate the happy path (uninterrupted flow in the try) from the error cases (the catches).\r\n\r\nWe can wrap only the method that can currently throw, but that would break the logical flow, it would mix the main algorithm with the error handling. I know we often do that, but I wanted to untangle it here (especially since it was needed for the previous implementation, now it's just a cleanup).\r\n\r\nEdit: added a short line mentining separation of concerns to the commit message.",
+      "created_at": "2025-04-02T08:43:32Z",
+      "updated_at": "2025-04-02T08:57:01Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31551#discussion_r2024363508",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2024363508"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31551"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 672,
+      "original_line": 671,
       "side": "RIGHT"
     }
   ]
