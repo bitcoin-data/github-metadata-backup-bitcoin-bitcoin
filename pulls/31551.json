@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31551/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31551/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/fe6b0e425c88c42fc501acef86a642bc19feca9f",
     "number": 31551,
     "state": "open",
     "locked": false,
@@ -40,13 +40,23 @@
       "patch_url": null
     },
     "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\nWe can serialize the blocks and undos to any `Stream` which implements the appropriate read/write methods.\r\n`AutoFile` is one of these, writing the results \"directly\" to disk (through the OS file cache). Batching these in memory first and reading/writing these to disk is measurably faster (likely because of fewer native fread calls or less locking, as [observed](https://github.com/bitcoin/bitcoin/pull/28226#issuecomment-1666842501) by @martinus in a similar change).\r\n\r\n### Unlocking new optimization opportunities\r\n\r\nBuffered writes will also enable batched obfuscation calculations (implemented in https://github.com/bitcoin/bitcoin/pull/31144) - especially since currently we need to copy the write input's std::span to do the obfuscation on it, and batching enables doing the operations on the internal buffer directly.\r\n\r\n### Measurements (micro benchmarks, full IBDs and reindexes)\r\n\r\nMicrobenchmarks for `[Read|Write]BlockBench` show a ~**30%**/**168%** speedup with `macOS/Clang`, and ~**19%**/**24%** with `Linux/GCC` (the follow-up XOR batching improves these further):\r\n\r\n<details>\r\n<summary>macOS Sequoia - Clang 19.1.7</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        2,271,441.67 |              440.25 |    0.1% |     11.00 | `ReadBlockBench`\r\n|        5,149,564.31 |              194.19 |    0.8% |     10.95 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        1,738,683.04 |              575.15 |    0.2% |     11.04 | `ReadBlockBench`\r\n|        3,052,658.88 |              327.58 |    1.0% |     10.91 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Ubuntu 24 - GNU 13.3.0</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        6,895,987.11 |              145.01 |    0.0% |   71,055,269.86 |   23,977,374.37 |  2.963 |   5,074,828.78 |    0.4% |     22.00 | `ReadBlockBench`\r\n|        5,152,973.58 |              194.06 |    2.2% |   19,350,886.41 |    8,784,539.75 |  2.203 |   3,079,335.21 |    0.4% |     23.18 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        5,771,882.71 |              173.25 |    0.0% |   65,741,889.82 |   20,453,232.33 |  3.214 |   3,971,321.75 |    0.3% |     22.01 | `ReadBlockBench`\r\n|        4,145,681.13 |              241.21 |    4.0% |   15,337,596.85 |    5,732,186.47 |  2.676 |   2,239,662.64 |    0.1% |     23.94 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n\r\n2 full IBD runs against master (compiled with GCC where the gains seem more modest) for **888888** blocks (seeded from real nodes) indicates a ~**7%** total speedup.\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nCOMMITS=\"8af40aaf283cc81fe2b3cc125d21f090c562460e 5c21f6c26fd6b6eab33e208cd565577735fe9aa7 97d30e2534b0a8c388a4a2059277f64d3b2243af\"; \\\r\nSTOP_HEIGHT=888888; DBCACHE=1000; \\\r\nC_COMPILER=gcc; CXX_COMPILER=g++; \\\r\nBASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"${BASE_DIR}/BitcoinData\"; LOG_DIR=\"${BASE_DIR}/logs\"; \\\r\ngit fetch --all -q && (for c in $COMMITS; do git fetch origin $c -q && git log -1 --oneline $c || exit 1; done) && \\\r\nhyperfine \\\r\n  --export-json \"${BASE_DIR}/ibd-${COMMITS// /-}-${STOP_HEIGHT}-${DBCACHE}-${C_COMPILER}.json\" \\\r\n  --runs 2 \\\r\n  --parameter-list COMMIT ${COMMITS// /,} \\\r\n  --prepare \"killall bitcoind; rm -rf ${DATA_DIR}/*; git checkout {COMMIT}; git clean -fxd; git reset --hard; \\\r\n    cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=$C_COMPILER -DCMAKE_CXX_COMPILER=$CXX_COMPILER && \\\r\n    cmake --build build -j$(nproc) --target bitcoind && \\\r\n    ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=1 -printtoconsole=0\" \\\r\n  --cleanup \"cp ${DATA_DIR}/debug.log ${LOG_DIR}/debug-{COMMIT}-$(date +%s).log\" \\\r\n  \"COMPILER=$C_COMPILER COMMIT={COMMIT} ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=$STOP_HEIGHT -dbcache=$DBCACHE -blocksonly -printtoconsole=0\"\r\n\r\n8af40aaf28 refactor: replace raw values in ReadRawBlock with HEADER_BYTE_SIZE\r\n5c21f6c26f optimization: Bulk serialization reads in `UndoRead`, `ReadBlock`\r\n97d30e2534 optimization: Bulk serialization writes in `WriteBlockUndo` and `WriteBlock`\r\n\r\nBenchmark 1: COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     30899.137 s ± 501.097 s    [User: 43094.744 s, System: 3295.980 s]\r\n  Range (min … max):   30544.808 s … 31253.467 s    2 runs\r\n \r\nBenchmark 2: COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     29956.405 s ± 111.231 s    [User: 42278.888 s, System: 3239.997 s]\r\n  Range (min … max):   29877.754 s … 30035.057 s    2 runs\r\n \r\nBenchmark 3: COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     28826.445 s ± 147.749 s    [User: 41450.577 s, System: 2955.840 s]\r\n  Range (min … max):   28721.970 s … 28930.919 s    2 runs\r\n \r\nSummary\r\n  COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0 ran\r\n    1.04 ± 0.01 times faster than COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n    1.07 ± 0.02 times faster than COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n```\r\n\r\n</details>",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2024-12-21T14:34:11Z",
-    "updated_at": "2025-04-03T15:57:39Z",
+    "updated_at": "2025-04-03T17:48:33Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "b103ff095dcf66624fe129eb381ca65f7c9e237b",
+    "merge_commit_sha": "f901fd65484b7b3fa2523a43faceb3a6ead0a065",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -76,7 +86,7 @@
     "head": {
       "label": "l0rinc:l0rinc/bulk-block-read-write",
       "ref": "l0rinc/bulk-block-read-write",
-      "sha": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "sha": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -174,7 +184,7 @@
         "forks_count": 0,
         "stargazers_count": 1,
         "watchers_count": 1,
-        "size": 257863,
+        "size": 257868,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -187,7 +197,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-04-03T15:57:37Z",
+        "pushed_at": "2025-04-03T17:47:41Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2024-07-18T12:40:18Z",
         "allow_forking": true,
@@ -307,11 +317,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 36996,
-        "stargazers_count": 82751,
-        "watchers_count": 82751,
+        "stargazers_count": 82752,
+        "watchers_count": 82752,
         "size": 279385,
         "default_branch": "master",
-        "open_issues_count": 696,
+        "open_issues_count": 697,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -330,7 +340,7 @@
         "visibility": "public",
         "pushed_at": "2025-04-03T10:54:34Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-04-03T15:49:19Z",
+        "updated_at": "2025-04-03T17:52:38Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -356,7 +366,7 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": false,
-    "additions": 310,
+    "additions": 306,
     "deletions": 69,
     "changed_files": 7,
     "commits": 7,
@@ -4324,9 +4334,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2025-04-02T21:34:19Z",
-      "updated_at": "2025-04-03T11:22:37Z",
+      "updated_at": "2025-04-03T17:48:32Z",
       "author_association": "CONTRIBUTOR",
-      "body": "* BufferedReader takes ownership of the underlying stream now;\r\n* `read_buffer` was removed;\r\n* In the tests made sure file_size and max_read_length are never empty and that test state doesn't propagate between comparisons;\r\n* Fixed `writeer` typo;\r\n* ~Added back `BufferedWriter` `size = 1 << 20` - I have a hunch of why it failed, let's see if it passes now;~ I have to figure this out before it's merged\r\n\r\nhttps://github.com/bitcoin/bitcoin/compare/71610707a8b69eeef0c5345f78aac40c38fc3b88..85b0c6d309cea981fda75e8cf268a144ae472d8d\r\n\r\nhttps://github.com/bitcoin/bitcoin/compare/aef99ea38d85d7e56e64bbd0809a7298f21e7b8a..652b4e3de5c5e09fb812abe265f4a8946fa96b54\r\n\r\nRebased again in separate commit since QT5 wasn't found after the QT6 merge.\r\n",
+      "body": "* BufferedReader takes ownership of the underlying stream now;\r\n* `read_buffer` was removed;\r\n* In the tests made sure file_size and max_read_length are never empty and that test state doesn't propagate between comparisons;\r\n* Fixed `writeer` typo;\r\n* ~Added back `BufferedWriter` `size = 1 << 20` - I have a hunch of why it failed, let's see if it passes now;~ I have to figure this out before it's merged\r\n\r\nhttps://github.com/bitcoin/bitcoin/compare/71610707a8b69eeef0c5345f78aac40c38fc3b88..85b0c6d309cea981fda75e8cf268a144ae472d8d\r\n\r\nhttps://github.com/bitcoin/bitcoin/compare/aef99ea38d85d7e56e64bbd0809a7298f21e7b8a..652b4e3de5c5e09fb812abe265f4a8946fa96b54\r\n\r\nRebased again in separate commit since QT5 wasn't found after the QT6 merge.\r\n\r\nEdit: there seems to be some inconsistency in the flushing behavior on Windows in one of the tests",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -4680,86 +4690,6 @@
       "created_at": "2025-04-03T15:14:59Z"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQ3ZWQ0NTQ0YzM0YWNmOTI1OTdiNzlhZjc3YjEzNzVlMmUxY2YyNzk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/47ed4544c34acf92597b79af77b1375e2e1cf279",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/47ed4544c34acf92597b79af77b1375e2e1cf279",
-      "tree": {
-        "sha": "4f595535a69224521e6677722f9e11cfe570a29c",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4f595535a69224521e6677722f9e11cfe570a29c"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1076917109e668f4cffb93e235666235e9347c19",
-          "sha": "1076917109e668f4cffb93e235666235e9347c19",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/1076917109e668f4cffb93e235666235e9347c19"
-        }
-      ],
-      "message": "optimization: Bulk serialization reads in `UndoRead`, `ReadBlock`\n\nThe Obfuscation (XOR) operations are currently done byte-by-byte during serialization, buffering the reads will enable batching the obfuscation operations later (not yet done here).\n\nAlso, different operating systems seem to handle file caching differently, so reading bigger batches (and processing those from memory) is also a bit faster (likely because of fewer native fread calls or less locking).\n\nNote that `ReadRawBlock` doesn't need buffering since it's already reading the whole block directly.\n\nThe current implementation of iterating over a fixed-sized buffer is a more general alternative to the solution provided by Cory Fields of reading the whole block size in advance.\n\n------\n\n> macOS Sequoia 15.3.1\n> C++ compiler .......................... Clang 19.1.7\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='ReadBlockBench' -min-time=10000\n\nBefore:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        2,271,441.67 |              440.25 |    0.1% |     11.00 | `ReadBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        1,746,437.29 |              572.59 |    0.2% |     11.02 | `ReadBlockBench`\n\n------\n\n> Ubuntu 24.04.2 LTS\n> C++ compiler .......................... GNU 13.3.0\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='ReadBlockBench' -min-time=20000\n\nBefore:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        6,895,987.11 |              145.01 |    0.0% |   71,055,269.86 |   23,977,374.37 |  2.963 |   5,074,828.78 |    0.4% |     22.00 | `ReadBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        5,771,882.71 |              173.25 |    0.0% |   65,741,889.82 |   20,453,232.33 |  3.214 |   3,971,321.75 |    0.3% |     22.01 | `ReadBlockBench`\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\nCo-authored-by: Martin Leitner-Ankerl <martin.ankerl@gmail.com>\nCo-authored-by: Cory Fields <cory-nospam-@coryfields.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-04-03T15:56:54Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-03-26T11:52:29Z"
-      },
-      "sha": "47ed4544c34acf92597b79af77b1375e2e1cf279"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDM4YjdlOGU1Y2VkMzZjZGRkN2U4N2ZhODUyYWMzOGRhZjkwNjUwMWE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/38b7e8e5ced36cddd7e87fa852ac38daf906501a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/38b7e8e5ced36cddd7e87fa852ac38daf906501a",
-      "tree": {
-        "sha": "322300dfc176ae436535c58999f7fccbf9b19d35",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/322300dfc176ae436535c58999f7fccbf9b19d35"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/47ed4544c34acf92597b79af77b1375e2e1cf279",
-          "sha": "47ed4544c34acf92597b79af77b1375e2e1cf279",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/47ed4544c34acf92597b79af77b1375e2e1cf279"
-        }
-      ],
-      "message": "optimization: Bulk serialization writes in `WriteBlockUndo` and `WriteBlock`\n\nAdded `AutoFile::write_buffer` for batching obfuscation operations, so instead of copying the data and doing the xor in a 4096 byte array, we're doing it directly on the input.\n\nSimilarly to the serialization reads, buffered writes will enable batched xor calculations - especially since currently we need to copy the write input's std::span to do the obfuscation on it, batching enables doing the xor on the internal buffer instead.\n\n------\n\n> macOS Sequoia 15.3.1\n> C++ compiler .......................... Clang 19.1.7\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='WriteBlockBench' -min-time=10000\n\nBefore:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        5,149,564.31 |              194.19 |    0.8% |     10.95 | `WriteBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        2,990,564.63 |              334.39 |    1.5% |     11.27 | `WriteBlockBench`\n\n------\n\n> Ubuntu 24.04.2 LTS\n> C++ compiler .......................... GNU 13.3.0\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='WriteBlockBench' -min-time=20000\n\nBefore:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        5,152,973.58 |              194.06 |    2.2% |   19,350,886.41 |    8,784,539.75 |  2.203 |   3,079,335.21 |    0.4% |     23.18 | `WriteBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        4,145,681.13 |              241.21 |    4.0% |   15,337,596.85 |    5,732,186.47 |  2.676 |   2,239,662.64 |    0.1% |     23.94 | `WriteBlockBench`\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\nCo-authored-by: Cory Fields <cory-nospam-@coryfields.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-04-03T15:57:14Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-03-26T11:54:07Z"
-      },
-      "sha": "38b7e8e5ced36cddd7e87fa852ac38daf906501a"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 17116743498,
       "node_id": "HRFPE_lADOABII586kKCBYzwAAAAP8PMdK",
@@ -4788,6 +4718,150 @@
       "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
       "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/38b7e8e5ced36cddd7e87fa852ac38daf906501a",
       "created_at": "2025-04-03T15:57:39Z"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDBkZTAwZDUyMmFmOTIwZDcxMmZhNmZkNjBlOTEzZmE3ZWFkODRmZTY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0de00d522af920d712fa6fd60e913fa7ead84fe6",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/0de00d522af920d712fa6fd60e913fa7ead84fe6",
+      "tree": {
+        "sha": "63f99a7f6cc7740537561c94d51d9e2f7509a2bc",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/63f99a7f6cc7740537561c94d51d9e2f7509a2bc"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1076917109e668f4cffb93e235666235e9347c19",
+          "sha": "1076917109e668f4cffb93e235666235e9347c19",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/1076917109e668f4cffb93e235666235e9347c19"
+        }
+      ],
+      "message": "optimization: Bulk serialization reads in `UndoRead`, `ReadBlock`\n\nThe Obfuscation (XOR) operations are currently done byte-by-byte during serialization, buffering the reads will enable batching the obfuscation operations later (not yet done here).\n\nAlso, different operating systems seem to handle file caching differently, so reading bigger batches (and processing those from memory) is also a bit faster (likely because of fewer native fread calls or less locking).\n\nNote that `ReadRawBlock` doesn't need buffering since it's already reading the whole block directly.\n\nThe current implementation of iterating over a fixed-sized buffer is a more general alternative to the solution provided by Cory Fields of reading the whole block size in advance.\n\n------\n\n> macOS Sequoia 15.3.1\n> C++ compiler .......................... Clang 19.1.7\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='ReadBlockBench' -min-time=10000\n\nBefore:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        2,271,441.67 |              440.25 |    0.1% |     11.00 | `ReadBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        1,746,437.29 |              572.59 |    0.2% |     11.02 | `ReadBlockBench`\n\n------\n\n> Ubuntu 24.04.2 LTS\n> C++ compiler .......................... GNU 13.3.0\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='ReadBlockBench' -min-time=20000\n\nBefore:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        6,895,987.11 |              145.01 |    0.0% |   71,055,269.86 |   23,977,374.37 |  2.963 |   5,074,828.78 |    0.4% |     22.00 | `ReadBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        5,771,882.71 |              173.25 |    0.0% |   65,741,889.82 |   20,453,232.33 |  3.214 |   3,971,321.75 |    0.3% |     22.01 | `ReadBlockBench`\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\nCo-authored-by: Martin Leitner-Ankerl <martin.ankerl@gmail.com>\nCo-authored-by: Cory Fields <cory-nospam-@coryfields.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-03T17:45:37Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-03-26T11:52:29Z"
+      },
+      "sha": "0de00d522af920d712fa6fd60e913fa7ead84fe6"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGZlNmIwZTQyNWM4OGM0MmZjNTAxYWNlZjg2YTY0MmJjMTlmZWNhOWY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fe6b0e425c88c42fc501acef86a642bc19feca9f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/fe6b0e425c88c42fc501acef86a642bc19feca9f",
+      "tree": {
+        "sha": "35e30313fc9e26b386df968efde8dca98505d21b",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/35e30313fc9e26b386df968efde8dca98505d21b"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0de00d522af920d712fa6fd60e913fa7ead84fe6",
+          "sha": "0de00d522af920d712fa6fd60e913fa7ead84fe6",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/0de00d522af920d712fa6fd60e913fa7ead84fe6"
+        }
+      ],
+      "message": "optimization: Bulk serialization writes in `WriteBlockUndo` and `WriteBlock`\n\nAdded `AutoFile::write_buffer` for batching obfuscation operations, so instead of copying the data and doing the xor in a 4096 byte array, we're doing it directly on the input.\n\nSimilarly to the serialization reads, buffered writes will enable batched xor calculations - especially since currently we need to copy the write input's std::span to do the obfuscation on it, batching enables doing the xor on the internal buffer instead.\n\n------\n\n> macOS Sequoia 15.3.1\n> C++ compiler .......................... Clang 19.1.7\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='WriteBlockBench' -min-time=10000\n\nBefore:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        5,149,564.31 |              194.19 |    0.8% |     10.95 | `WriteBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|        2,990,564.63 |              334.39 |    1.5% |     11.27 | `WriteBlockBench`\n\n------\n\n> Ubuntu 24.04.2 LTS\n> C++ compiler .......................... GNU 13.3.0\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='WriteBlockBench' -min-time=20000\n\nBefore:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        5,152,973.58 |              194.06 |    2.2% |   19,350,886.41 |    8,784,539.75 |  2.203 |   3,079,335.21 |    0.4% |     23.18 | `WriteBlockBench`\n\nAfter:\n\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|        4,145,681.13 |              241.21 |    4.0% |   15,337,596.85 |    5,732,186.47 |  2.676 |   2,239,662.64 |    0.1% |     23.94 | `WriteBlockBench`\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\nCo-authored-by: Cory Fields <cory-nospam-@coryfields.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-03T17:45:51Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-03-26T11:54:07Z"
+      },
+      "sha": "fe6b0e425c88c42fc501acef86a642bc19feca9f"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 17118185245,
+      "node_id": "HRFPE_lADOABII586kKCBYzwAAAAP8Uscd",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17118185245",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/fe6b0e425c88c42fc501acef86a642bc19feca9f",
+      "created_at": "2025-04-03T17:47:43Z"
+    },
+    {
+      "event": "labeled",
+      "id": 17118186090,
+      "node_id": "LE_lADOABII586kKCBYzwAAAAP8Uspq",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17118186090",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-03T17:47:48Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
@@ -4800,7 +4874,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 113,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "0e9fb2ed330960c0e4cd36b077c64ac7d0f84240",
       "in_reply_to_id": null,
       "user": {
@@ -4853,7 +4927,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 113,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "0e9fb2ed330960c0e4cd36b077c64ac7d0f84240",
       "in_reply_to_id": 1928718017,
       "user": {
@@ -4906,7 +4980,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f8b1b218b4f8533128b337168b6769e2e4c30c02",
       "in_reply_to_id": null,
       "user": {
@@ -4959,7 +5033,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 32,
       "original_position": 47,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f8b1b218b4f8533128b337168b6769e2e4c30c02",
       "in_reply_to_id": null,
       "user": {
@@ -5012,7 +5086,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f72c2dd3a0c5005bb527587dc5576a19dc6a790d",
       "in_reply_to_id": null,
       "user": {
@@ -5065,7 +5139,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "2a5c52ac4e0c098dc6dcf354d9e00fc5c78b6dfe",
       "in_reply_to_id": null,
       "user": {
@@ -5118,7 +5192,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 32,
       "original_position": 47,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f8b1b218b4f8533128b337168b6769e2e4c30c02",
       "in_reply_to_id": 1928892086,
       "user": {
@@ -5171,7 +5245,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f72c2dd3a0c5005bb527587dc5576a19dc6a790d",
       "in_reply_to_id": 1928903169,
       "user": {
@@ -5224,7 +5298,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 32,
       "original_position": 47,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f8b1b218b4f8533128b337168b6769e2e4c30c02",
       "in_reply_to_id": 1928892086,
       "user": {
@@ -5277,7 +5351,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f8b1b218b4f8533128b337168b6769e2e4c30c02",
       "in_reply_to_id": 1928886925,
       "user": {
@@ -5330,7 +5404,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "2a5c52ac4e0c098dc6dcf354d9e00fc5c78b6dfe",
       "in_reply_to_id": 1928906424,
       "user": {
@@ -5383,7 +5457,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "f72c2dd3a0c5005bb527587dc5576a19dc6a790d",
       "in_reply_to_id": 1928903169,
       "user": {
@@ -5436,7 +5510,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 40,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "cf019b73a7487df6bf15d2950a013723bf007405",
       "in_reply_to_id": null,
       "user": {
@@ -5489,7 +5563,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 40,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "cf019b73a7487df6bf15d2950a013723bf007405",
       "in_reply_to_id": 2005770365,
       "user": {
@@ -5542,7 +5616,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 40,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "cf019b73a7487df6bf15d2950a013723bf007405",
       "in_reply_to_id": 2005770365,
       "user": {
@@ -5595,7 +5669,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 19,
       "original_position": 9,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "fbe701bf32a33766d06bec58e4c0fb70e94f60b1",
       "in_reply_to_id": null,
       "user": {
@@ -5648,7 +5722,7 @@
       "path": "src/node/blockstorage.h",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "4d90db8b960bf1ea969bedfebfdceccfabf6f9a5",
       "in_reply_to_id": null,
       "user": {
@@ -5701,7 +5775,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "fc97b819969bb6c31245a8e2e0b5987881329967",
       "in_reply_to_id": null,
       "user": {
@@ -5754,7 +5828,7 @@
       "path": "src/streams.h",
       "position": 33,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "29678d79e7e127bf2694f83194f47e0bfd9849b9",
       "in_reply_to_id": null,
       "user": {
@@ -5807,7 +5881,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": null,
       "user": {
@@ -5860,7 +5934,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 21,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": null,
       "user": {
@@ -5913,7 +5987,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 19,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": null,
       "user": {
@@ -5966,7 +6040,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 19,
       "original_position": 9,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "fbe701bf32a33766d06bec58e4c0fb70e94f60b1",
       "in_reply_to_id": 2023827585,
       "user": {
@@ -6019,7 +6093,7 @@
       "path": "src/node/blockstorage.h",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "4d90db8b960bf1ea969bedfebfdceccfabf6f9a5",
       "in_reply_to_id": 2023836900,
       "user": {
@@ -6072,7 +6146,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 5,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "fc97b819969bb6c31245a8e2e0b5987881329967",
       "in_reply_to_id": 2023839131,
       "user": {
@@ -6125,7 +6199,7 @@
       "path": "src/streams.h",
       "position": 33,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "29678d79e7e127bf2694f83194f47e0bfd9849b9",
       "in_reply_to_id": 2023879247,
       "user": {
@@ -6178,7 +6252,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": 2023885148,
       "user": {
@@ -6231,7 +6305,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 21,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": 2023887267,
       "user": {
@@ -6284,7 +6358,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 19,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "8fe73a102f5b8406f166d7ac4b1a36bba84de7c4",
       "in_reply_to_id": 2023893888,
       "user": {
@@ -6337,7 +6411,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": 19,
       "original_position": 9,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "fbe701bf32a33766d06bec58e4c0fb70e94f60b1",
       "in_reply_to_id": 2023827585,
       "user": {
@@ -6390,7 +6464,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 20,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": null,
       "user": {
@@ -6443,7 +6517,7 @@
       "path": "src/streams.cpp",
       "position": null,
       "original_position": 4,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": null,
       "user": {
@@ -6496,7 +6570,7 @@
       "path": "src/streams.h",
       "position": 33,
       "original_position": 23,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "29678d79e7e127bf2694f83194f47e0bfd9849b9",
       "in_reply_to_id": 2023879247,
       "user": {
@@ -6549,7 +6623,7 @@
       "path": "src/streams.h",
       "position": 33,
       "original_position": 36,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": null,
       "user": {
@@ -6602,7 +6676,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 48,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": null,
       "user": {
@@ -6655,7 +6729,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 54,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": null,
       "user": {
@@ -6708,7 +6782,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 54,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": 2025090269,
       "user": {
@@ -6761,7 +6835,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 48,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": 2025077307,
       "user": {
@@ -6814,7 +6888,7 @@
       "path": "src/streams.h",
       "position": 33,
       "original_position": 36,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": 2025054471,
       "user": {
@@ -6867,7 +6941,7 @@
       "path": "src/streams.cpp",
       "position": null,
       "original_position": 4,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": 2024977782,
       "user": {
@@ -6920,7 +6994,7 @@
       "path": "src/node/blockstorage.cpp",
       "position": null,
       "original_position": 20,
-      "commit_id": "38b7e8e5ced36cddd7e87fa852ac38daf906501a",
+      "commit_id": "fe6b0e425c88c42fc501acef86a642bc19feca9f",
       "original_commit_id": "5d3cd74ac8f6acd381a11fe469d37d3c8b1630e1",
       "in_reply_to_id": 2024957398,
       "user": {
