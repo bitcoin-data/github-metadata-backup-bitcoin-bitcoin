@@ -40,19 +40,9 @@
       "patch_url": null
     },
     "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\nWe can serialize the blocks and undos to any `Stream` which implements the appropriate read/write methods.\r\n`AutoFile` is one of these, writing the results \"directly\" to disk (through the OS file cache). Batching these in memory first and reading/writing these to disk is measurably faster (likely because of fewer native fread calls or less locking, as [observed](https://github.com/bitcoin/bitcoin/pull/28226#issuecomment-1666842501) by @martinus in a similar change).\r\n\r\n### Unlocking new optimization opportunities\r\n\r\nBuffered writes will also enable batched obfuscation calculations (implemented in https://github.com/bitcoin/bitcoin/pull/31144) - especially since currently we need to copy the write input's std::span to do the obfuscation on it, and batching enables doing the operations on the internal buffer directly.\r\n\r\n### Measurements (micro benchmarks, full IBDs and reindexes)\r\n\r\nMicrobenchmarks for `[Read|Write]BlockBench` show a ~**30%**/**168%** speedup with `macOS/Clang`, and ~**19%**/**24%** with `Linux/GCC` (the follow-up XOR batching improves these further):\r\n\r\n<details>\r\n<summary>macOS Sequoia - Clang 19.1.7</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        2,271,441.67 |              440.25 |    0.1% |     11.00 | `ReadBlockBench`\r\n|        5,149,564.31 |              194.19 |    0.8% |     10.95 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|        1,738,683.04 |              575.15 |    0.2% |     11.04 | `ReadBlockBench`\r\n|        3,052,658.88 |              327.58 |    1.0% |     10.91 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Ubuntu 24 - GNU 13.3.0</summary>\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        6,895,987.11 |              145.01 |    0.0% |   71,055,269.86 |   23,977,374.37 |  2.963 |   5,074,828.78 |    0.4% |     22.00 | `ReadBlockBench`\r\n|        5,152,973.58 |              194.06 |    2.2% |   19,350,886.41 |    8,784,539.75 |  2.203 |   3,079,335.21 |    0.4% |     23.18 | `WriteBlockBench`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|        5,771,882.71 |              173.25 |    0.0% |   65,741,889.82 |   20,453,232.33 |  3.214 |   3,971,321.75 |    0.3% |     22.01 | `ReadBlockBench`\r\n|        4,145,681.13 |              241.21 |    4.0% |   15,337,596.85 |    5,732,186.47 |  2.676 |   2,239,662.64 |    0.1% |     23.94 | `WriteBlockBench`\r\n\r\n</details>\r\n\r\n\r\n2 full IBD runs against master (compiled with GCC where the gains seem more modest) for **888888** blocks (seeded from real nodes) indicates a ~**7%** total speedup.\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nCOMMITS=\"8af40aaf283cc81fe2b3cc125d21f090c562460e 5c21f6c26fd6b6eab33e208cd565577735fe9aa7 97d30e2534b0a8c388a4a2059277f64d3b2243af\"; \\\r\nSTOP_HEIGHT=888888; DBCACHE=1000; \\\r\nC_COMPILER=gcc; CXX_COMPILER=g++; \\\r\nBASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"${BASE_DIR}/BitcoinData\"; LOG_DIR=\"${BASE_DIR}/logs\"; \\\r\ngit fetch --all -q && (for c in $COMMITS; do git fetch origin $c -q && git log -1 --oneline $c || exit 1; done) && \\\r\nhyperfine \\\r\n  --export-json \"${BASE_DIR}/ibd-${COMMITS// /-}-${STOP_HEIGHT}-${DBCACHE}-${C_COMPILER}.json\" \\\r\n  --runs 2 \\\r\n  --parameter-list COMMIT ${COMMITS// /,} \\\r\n  --prepare \"killall bitcoind; rm -rf ${DATA_DIR}/*; git checkout {COMMIT}; git clean -fxd; git reset --hard; \\\r\n    cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=$C_COMPILER -DCMAKE_CXX_COMPILER=$CXX_COMPILER && \\\r\n    cmake --build build -j$(nproc) --target bitcoind && \\\r\n    ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=1 -printtoconsole=0\" \\\r\n  --cleanup \"cp ${DATA_DIR}/debug.log ${LOG_DIR}/debug-{COMMIT}-$(date +%s).log\" \\\r\n  \"COMPILER=$C_COMPILER COMMIT={COMMIT} ./build/bin/bitcoind -datadir=${DATA_DIR} -stopatheight=$STOP_HEIGHT -dbcache=$DBCACHE -blocksonly -printtoconsole=0\"\r\n\r\n8af40aaf28 refactor: replace raw values in ReadRawBlock with HEADER_BYTE_SIZE\r\n5c21f6c26f optimization: Bulk serialization reads in `UndoRead`, `ReadBlock`\r\n97d30e2534 optimization: Bulk serialization writes in `WriteBlockUndo` and `WriteBlock`\r\n\r\nBenchmark 1: COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     30899.137 s ± 501.097 s    [User: 43094.744 s, System: 3295.980 s]\r\n  Range (min … max):   30544.808 s … 31253.467 s    2 runs\r\n \r\nBenchmark 2: COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     29956.405 s ± 111.231 s    [User: 42278.888 s, System: 3239.997 s]\r\n  Range (min … max):   29877.754 s … 30035.057 s    2 runs\r\n \r\nBenchmark 3: COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n  Time (mean ± σ):     28826.445 s ± 147.749 s    [User: 41450.577 s, System: 2955.840 s]\r\n  Range (min … max):   28721.970 s … 28930.919 s    2 runs\r\n \r\nSummary\r\n  COMPILER=gcc COMMIT=97d30e2534b0a8c388a4a2059277f64d3b2243af ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0 ran\r\n    1.04 ± 0.01 times faster than COMPILER=gcc COMMIT=5c21f6c26fd6b6eab33e208cd565577735fe9aa7 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n    1.07 ± 0.02 times faster than COMPILER=gcc COMMIT=8af40aaf283cc81fe2b3cc125d21f090c562460e ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=888888 -dbcache=1000 -blocksonly -printtoconsole=0\r\n```\r\n\r\n</details>",
-    "labels": [
-      {
-        "id": 5334691551,
-        "node_id": "LA_kwDOABII588AAAABPfju3w",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
-        "name": "CI failed",
-        "description": "",
-        "color": "cccccc",
-        "default": false
-      }
-    ],
+    "labels": [],
     "created_at": "2024-12-21T14:34:11Z",
-    "updated_at": "2025-04-03T11:22:38Z",
+    "updated_at": "2025-04-03T13:43:45Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -184,7 +174,7 @@
         "forks_count": 0,
         "stargazers_count": 1,
         "watchers_count": 1,
-        "size": 257800,
+        "size": 257863,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -316,9 +306,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 36996,
-        "stargazers_count": 82747,
-        "watchers_count": 82747,
+        "forks_count": 36997,
+        "stargazers_count": 82748,
+        "watchers_count": 82748,
         "size": 279385,
         "default_branch": "master",
         "open_issues_count": 695,
@@ -340,7 +330,7 @@
         "visibility": "public",
         "pushed_at": "2025-04-03T10:54:34Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-04-03T10:54:40Z",
+        "updated_at": "2025-04-03T13:11:48Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -370,7 +360,7 @@
     "deletions": 69,
     "changed_files": 7,
     "commits": 7,
-    "review_comments": 48,
+    "review_comments": 49,
     "comments": 21
   },
   "events": [
@@ -4704,6 +4694,40 @@
       "commit_id": "aaceecad2ba85ac7513d1e2973960bdae65ab0fc",
       "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/aaceecad2ba85ac7513d1e2973960bdae65ab0fc",
       "created_at": "2025-04-03T11:21:58Z"
+    },
+    {
+      "event": "unlabeled",
+      "id": 17114098700,
+      "node_id": "UNLE_lADOABII586kKCBYzwAAAAP8FGwM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17114098700",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-03T13:43:45Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
