@@ -12,12 +12,12 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31645/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31645/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/868413340f8d6058d74186b65ac3498d6b7f254a",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/5da4003c613b1700a9326187b85b20d50faeaa02",
     "number": 31645,
     "state": "open",
     "locked": false,
     "maintainer_can_modify": true,
-    "title": "[IBD] flush UTXOs in bigger batches",
+    "title": "[IBD] flush UTXOs in bigger batches based on dbcache size",
     "user": {
       "login": "l0rinc",
       "id": 1841944,
@@ -39,7 +39,7 @@
       "site_admin": false,
       "patch_url": null
     },
-    "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\n\r\nWhen the in-memory UTXO set is [flushed](https://github.com/bitcoin/bitcoin/blob/master/src/txdb.cpp#L130-L133) to LevelDB (after IBD or AssumeUTXO load), it does so in batches to manage memory usage during the flush.\r\nWhile a hidden [`-dbbatchsize`](https://github.com/bitcoin/bitcoin/blob/master/src/init.cpp#L490) config option exists to modify this value, this PR introduces *dynamic calculation* of the batch size based on the `-dbcache` setting. By using larger batches when more memory is available (i.e., higher `-dbcache`), we can reduce the overhead from numerous small writes, minimize constant overhead per batch, improve I/O efficiency (especially on HDDs), and potentially allow LevelDB to optimize writes more effectively (e.g. by sorting the keys before write).\r\n\r\n### Context\r\n\r\nThe UTXO set has grown significantly since [2017](https://github.com/bitcoin/bitcoin/pull/10148/files#diff-d102b6032635ce90158c1e6e614f03b50e4449aa46ce23370da5387a658342fdR26-R27), when the original fixed 16MiB batch size was chosen.\r\n\r\nWith the current multi-gigabyte UTXO set and the common practice of using larger `-dbcache` values, the fixed 16MiB batch size leads to several inefficiencies:\r\n\r\n* Flushing the entire UTXO set requires hundreds or thousands of separate 16MiB write operations.\r\n* Particularly on HDDs, the cumulative disk seek time and per-operation overhead from numerous small writes significantly slow down the flushing process.\r\n* Each `WriteBatch` call incurs internal LevelDB overhead (e.g., MemTable handling, compaction triggering logic). More frequent, smaller batches amplify this cumulative overhead.\r\n* Systems configured with large `-dbcache` values have sufficient memory to handle larger batches more efficiently, but the fixed size prevents leveraging this potential.\r\n\r\nFlush times of 20-30 minutes are not uncommon, even on capable hardware.\r\n\r\n### Considerations\r\n\r\nAs [noted by @sipa](https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2587500105), flushing involves a temporary memory usage increase as the batch is prepared. A larger batch size naturally leads to a larger peak during this phase. Crashing due to OOM during a flush is highly undesirable. Future work like [#30611](https://github.com/bitcoin/bitcoin/pull/30611) could mitigate this somewhat.\r\n\r\nThe dynamic approach implemented here *only* increases the batch size if the user has explicitly set `-dbcache` higher than the default 450MiB, implying they have more memory available. For default or lower `-dbcache` values, the batch size (and thus the memory spike) remains unchanged from current behavior. This makes the memory increase an opt-in consequence of allocating more resources via `-dbcache`. \r\n\r\nThe increased peak memory usage (detailed below) is primarily attributed to LevelDB's `leveldb::Arena` (backing MemTables) and the temporary storage of serialized batch data (e.g., `std::string` in `CDBBatch::WriteImpl`).\r\n\r\nPerformance gains are most pronounced on systems with slower I/O (HDDs), but some SSDs also show measurable improvements.\r\n\r\n### Solution\r\n\r\nThis change introduces dynamic sizing for the LevelDB write batch used in `FlushSnapshotToDisk`, based on the configured `-dbcache` size. The effective batch size is calculated to keep the current 16MiB for the default 450MiB `dbcache` and below, scaling linearly upwards from there, capped at 256MiB (gains are barely measurable for bigger batches):\r\n\r\n$$\r\n\\text{GetDbBatchSize}(dbcache)\r\n= \\max\\Bigl(16\\mathrm{MiB},\\\r\n   \\min\\bigl(256\\mathrm{MiB},\\\r\n     \\frac{dbcache}{450\\mathrm{MiB}} \\times 16\\mathrm{MiB}\r\n   \\bigr)\r\n\\Bigr).\r\n$$\r\n\r\nThis results in the following effective batch sizes and approximate number of batches required to flush the ~28 GiB UTXO set from the 880k snapshot:\r\n\r\n| dbcache (MiB) | Effective Batch Size (MiB) | Batches Needed |\r\n|---------------|----------------------------|----------------|\r\n| <=450         | 16.0                       | ~832           |\r\n| 1000          | 35.6                       | ~375           |\r\n| 2000          | 71.1                       | ~188           |\r\n| 4500          | 160.0                      | ~84            |\r\n| >7000         | 256.0 (Max)                | ~52            |\r\n\r\n**Key Aspects:**\r\n\r\n* For `-dbcache <= 450`, the batch size remains 16MiB. No impact on low-memory systems or default configurations.\r\n* Batch size increases proportionally with `-dbcache` above 450MiB.\r\n* The size is clamped between 16MiB (minimum) and 256MiB (maximum).\r\n\r\n### Measurements\r\n\r\n**Performance (`loadtxoutset` RPC call, GCC, Linux):**\r\n\r\nHyperfine benchmarks loading and flushing the `880000.dat` UTXO snapshot show consistent speedups with the dynamic batch sizing compared to the fixed 16MiB batch:\r\n\r\n* `-dbcache=1000` (Batch: 16MiB → ~35.5MiB): **~11.6% faster** (901s → 797s)\r\n* `-dbcache=2000` (Batch: 16MiB → ~71.1MiB): **~15.7% faster** (884s → 745s)\r\n* `-dbcache=4500` (Batch: 16MiB → 160MiB): **~7.8% faster** (823s → 760s)\r\n* `-dbcache=10000` (Batch: 16MiB → 256MiB): **~16.4% faster** (795s → 665s)\r\n* `-dbcache=45000` (Batch: 16MiB → 256MiB): **~(8.1% faster** (570s → 527s)\r\n\r\nLog analysis confirms the speedup originates from the flushing phase itself (e.g., ~11.4% faster `FlushSnapshotToDisk` sum for `-dbcache=1000`).\r\n\r\n**HDD Performance (`-reindex-chainstate`, `-dbcache=30000`):**\r\n\r\nComparing the old fixed 16MiB batch to a fixed 64MiB batch (for reference, not the dynamic size) showed a **~33% reduction** in flush time (31m -> 20.5m), indicating the substantial benefit on slower storage. The dynamic approach aims to capture similar gains when `dbcache` allows.\r\n\r\n**Memory Usage (Massif Peak during `loadtxoutset`):**\r\n\r\nPeak memory usage increases modestly when `-dbcache` is raised above the default, reflecting the larger batches being processed during the flush:\r\n\r\n| dbcache (MiB) | Batch Size (Before→After,MiB) | Peak Mem (Before,GiB) | Peak Mem (After,GiB) | Increase (%) |\r\n|---------------|--------------------------------|------------------------|----------------------|--------------|\r\n| 1000          | 16 → ~35.5                     | 1.24                   | 1.31                 | +5.9%        |\r\n| 4500          | 16 → 160                       | 4.56                   | 5.11                 | +11.9%       |\r\n| 10000         | 16 → 256                       | 9.79                   | 10.77                | +10.1%       |\r\n\r\nThe increase is primarily attributed to larger allocations in `leveldb::Arena` and for batch serialization (`std::string` in `CDBBatch::WriteImpl`).\r\n\r\n### Reproducer:\r\n\r\n```bash\r\n# Set up a clean demo environment\r\nmkdir -p demo && rm -rfd demo/chainstate demo/chainstate_snapshot demo/debug.log\r\n\r\n# Build Bitcoin Core\r\ncmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)\r\n\r\n# Start bitcoind with minimal settings without mempool and internet connection\r\nbuild/bin/bitcoind -datadir=demo -stopatheight=1\r\nbuild/bin/bitcoind -datadir=demo -blocksonly=1 -connect=0 -dbcache=30000 -daemon\r\n\r\n# Load the AssumeUTXO snapshot, making sure the path is correct\r\n# Expected output includes `\"coins_loaded\": 184821030`\r\nbuild/bin/bitcoin-cli -datadir=demo -rpcclienttimeout=0 loadtxoutset ~/utxo-880000.dat\r\n\r\n# Stop the daemon and verify snapshot flushes in the logs\r\nbuild/bin/bitcoin-cli -datadir=demo stop\r\ngrep \"FlushSnapshotToDisk: completed\" demo/debug.log\r\n```\r\n\r\n---\r\n\r\n\r\nNote that the scope of the PR has change since it was opened - the measurements are all valid, but they may be slightly different now with the latest dynamic calculations.",
+    "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\n\r\nWhen the in-memory UTXO set is [flushed](https://github.com/bitcoin/bitcoin/blob/master/src/txdb.cpp#L130-L133) to LevelDB (after IBD or AssumeUTXO load), it does so in batches to manage memory usage during the flush.\r\nWhile a hidden [`-dbbatchsize`](https://github.com/bitcoin/bitcoin/blob/master/src/init.cpp#L490) config option exists to modify this value, this PR introduces *dynamic calculation* of the batch size based on the `-dbcache` setting. By using larger batches when more memory is available (i.e., higher `-dbcache`), we can reduce the overhead from numerous small writes, minimize constant overhead per batch, improve I/O efficiency (especially on HDDs), and potentially allow LevelDB to optimize writes more effectively (e.g. by sorting the keys before write).\r\n\r\n### Context\r\n\r\nThe UTXO set has grown significantly since [2017](https://github.com/bitcoin/bitcoin/pull/10148/files#diff-d102b6032635ce90158c1e6e614f03b50e4449aa46ce23370da5387a658342fdR26-R27), when the original fixed 16MiB batch size was chosen.\r\n\r\nWith the current multi-gigabyte UTXO set and the common practice of using larger `-dbcache` values, the fixed 16MiB batch size leads to several inefficiencies:\r\n\r\n* Flushing the entire UTXO set requires hundreds or thousands of separate 16MiB write operations.\r\n* Particularly on HDDs, the cumulative disk seek time and per-operation overhead from numerous small writes significantly slow down the flushing process.\r\n* Each `WriteBatch` call incurs internal LevelDB overhead (e.g., MemTable handling, compaction triggering logic). More frequent, smaller batches amplify this cumulative overhead.\r\n* Systems configured with large `-dbcache` values have sufficient memory to handle larger batches more efficiently, but the fixed size prevents leveraging this potential.\r\n\r\nFlush times of 20-30 minutes are not uncommon, even on capable hardware.\r\n\r\n### Considerations\r\n\r\nAs [noted by @sipa](https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2587500105), flushing involves a temporary memory usage increase as the batch is prepared. A larger batch size naturally leads to a larger peak during this phase. Crashing due to OOM during a flush is highly undesirable. Future work like [#30611](https://github.com/bitcoin/bitcoin/pull/30611) could mitigate this somewhat.\r\n\r\nThe dynamic approach implemented here *only* increases the batch size if the user has explicitly set `-dbcache` higher than the default 450MiB, implying they have more memory available. For default or lower `-dbcache` values, the batch size (and thus the memory spike) remains unchanged from current behavior. This makes the memory increase an opt-in consequence of allocating more resources via `-dbcache`. \r\n\r\nThe increased peak memory usage (detailed below) is primarily attributed to LevelDB's `leveldb::Arena` (backing MemTables) and the temporary storage of serialized batch data (e.g., `std::string` in `CDBBatch::WriteImpl`).\r\n\r\nPerformance gains are most pronounced on systems with slower I/O (HDDs), but some SSDs also show measurable improvements.\r\n\r\n### Solution\r\n\r\nThis change introduces dynamic sizing for the LevelDB write batch used in `FlushSnapshotToDisk`, based on the configured `-dbcache` size. The effective batch size is calculated to keep the current 16MiB for the default 450MiB `dbcache` and below, scaling linearly upwards from there, capped at 256MiB (gains are barely measurable for bigger batches):\r\n\r\n$$\r\n\\text{GetDbBatchSize}(dbcache)\r\n= \\max\\Bigl(16\\mathrm{MiB},\\\r\n   \\min\\bigl(256\\mathrm{MiB},\\\r\n     \\frac{dbcache}{450\\mathrm{MiB}} \\times 16\\mathrm{MiB}\r\n   \\bigr)\r\n\\Bigr).\r\n$$\r\n\r\nThis results in the following effective batch sizes and approximate number of batches required to flush the ~28 GiB UTXO set from the 880k snapshot:\r\n\r\n| dbcache (MiB) | Effective Batch Size (MiB) | Batches Needed |\r\n|---------------|----------------------------|----------------|\r\n| <=450         | 16.0                       | ~832           |\r\n| 1000          | 35.6                       | ~375           |\r\n| 2000          | 71.1                       | ~188           |\r\n| 4500          | 160.0                      | ~84            |\r\n| >7000         | 256.0 (Max)                | ~52            |\r\n\r\n**Key Aspects:**\r\n\r\n* For `-dbcache <= 450`, the batch size remains 16MiB. No impact on low-memory systems or default configurations.\r\n* Batch size increases proportionally with `-dbcache` above 450MiB.\r\n* The size is clamped between 16MiB (minimum) and 256MiB (maximum).\r\n\r\n### Measurements\r\n\r\n**Performance (`loadtxoutset` RPC call, GCC, Linux):**\r\n\r\nHyperfine benchmarks loading and flushing the `880000.dat` UTXO snapshot show consistent speedups with the dynamic batch sizing compared to the fixed 16MiB batch:\r\n\r\n* `-dbcache=1000` (Batch: 16MiB → ~35.5MiB): **~11.6% faster** (901s → 797s)\r\n* `-dbcache=2000` (Batch: 16MiB → ~71.1MiB): **~15.7% faster** (884s → 745s)\r\n* `-dbcache=4500` (Batch: 16MiB → 160MiB): **~7.8% faster** (823s → 760s)\r\n* `-dbcache=10000` (Batch: 16MiB → 256MiB): **~16.4% faster** (795s → 665s)\r\n* `-dbcache=45000` (Batch: 16MiB → 256MiB): **~(8.1% faster** (570s → 527s)\r\n\r\nLog analysis confirms the speedup originates from the flushing phase itself (e.g., ~11.4% faster `FlushSnapshotToDisk` sum for `-dbcache=1000`).\r\n\r\n**HDD Performance (`-reindex-chainstate`, `-dbcache=30000`):**\r\n\r\nComparing the old fixed 16MiB batch to a fixed 64MiB batch (for reference, not the dynamic size) showed a **~33% reduction** in flush time (31m -> 20.5m), indicating the substantial benefit on slower storage. The dynamic approach aims to capture similar gains when `dbcache` allows.\r\n\r\n**Memory Usage (Massif Peak during `loadtxoutset`):**\r\n\r\nPeak memory usage increases modestly when `-dbcache` is raised above the default, reflecting the larger batches being processed during the flush:\r\n\r\n| dbcache (MiB) | Batch Size (Before→After,MiB) | Peak Mem (Before,GiB) | Peak Mem (After,GiB) | Increase (%) |\r\n|---------------|--------------------------------|------------------------|----------------------|--------------|\r\n| 1000          | 16 → ~35.5                     | 1.24                   | 1.31                 | +5.9%        |\r\n| 4500          | 16 → 160                       | 4.56                   | 5.11                 | +11.9%       |\r\n| 10000         | 16 → 256                       | 9.79                   | 10.77                | +10.1%       |\r\n\r\nThe increase is primarily attributed to larger allocations in `leveldb::Arena` and for batch serialization (`std::string` in `CDBBatch::WriteImpl`).\r\n\r\n### Reproducer:\r\n\r\n```bash\r\n# Set up a clean demo environment\r\nmkdir -p demo && rm -rfd demo/chainstate demo/chainstate_snapshot demo/debug.log\r\n\r\n# Build Bitcoin Core\r\ncmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)\r\n\r\n# Start bitcoind with minimal settings without mempool and internet connection\r\nbuild/bin/bitcoind -datadir=demo -stopatheight=1\r\nbuild/bin/bitcoind -datadir=demo -blocksonly=1 -connect=0 -dbcache=30000 -daemon\r\n\r\n# Load the AssumeUTXO snapshot, making sure the path is correct\r\n# Expected output includes `\"coins_loaded\": 184821030`\r\nbuild/bin/bitcoin-cli -datadir=demo -rpcclienttimeout=0 loadtxoutset ~/utxo-880000.dat\r\n\r\n# Stop the daemon and verify snapshot flushes in the logs\r\nbuild/bin/bitcoin-cli -datadir=demo stop\r\ngrep \"FlushSnapshotToDisk: completed\" demo/debug.log\r\n```\r\n\r\n---\r\n\r\nFor more details see: https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2787771040\r\n\r\n---\r\n\r\nNote that the scope of the PR has change since it was opened - the measurements in the replies are all valid, but they may be slightly different now with the latest dynamic calculations.",
     "labels": [
       {
         "id": 97470796,
@@ -48,14 +48,23 @@
         "name": "UTXO Db and Indexes",
         "color": "fbca04",
         "default": false
+      },
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
       }
     ],
     "created_at": "2025-01-12T20:08:03Z",
-    "updated_at": "2025-04-08T21:56:47Z",
+    "updated_at": "2025-04-08T22:45:59Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "58502141f4162825d29165596d628b80c946c1ed",
+    "merge_commit_sha": "a39464730920606431761f4772fe95cbcf9c2e1e",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -63,7 +72,7 @@
     "head": {
       "label": "l0rinc:l0rinc/utxo-dump-batching",
       "ref": "l0rinc/utxo-dump-batching",
-      "sha": "868413340f8d6058d74186b65ac3498d6b7f254a",
+      "sha": "5da4003c613b1700a9326187b85b20d50faeaa02",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -174,7 +183,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-04-08T20:29:25Z",
+        "pushed_at": "2025-04-08T22:45:57Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2025-04-04T07:50:27Z",
         "allow_forking": true,
@@ -198,7 +207,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "df8bf657450d5383870d40790ea9f4fdb03c360d",
+      "sha": "bb92bb36f211b88e4c1aa031a4364795cbd24767",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -296,7 +305,7 @@
         "forks_count": 37016,
         "stargazers_count": 82821,
         "watchers_count": 82821,
-        "size": 279457,
+        "size": 279446,
         "default_branch": "master",
         "open_issues_count": 695,
         "is_template": false,
@@ -342,13 +351,13 @@
       }
     },
     "author_association": "CONTRIBUTOR",
-    "draft": true,
-    "additions": 1,
-    "deletions": 1,
-    "changed_files": 1,
-    "commits": 1,
+    "draft": false,
+    "additions": 42,
+    "deletions": 10,
+    "changed_files": 6,
+    "commits": 2,
     "review_comments": 0,
-    "comments": 18
+    "comments": 20
   },
   "events": [
     {
@@ -436,9 +445,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2025-01-12T20:11:29Z",
-      "updated_at": "2025-03-13T20:22:29Z",
+      "updated_at": "2025-04-08T22:10:36Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/31645.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| ACK | [ryanofsky](https://github.com/bitcoin/bitcoin/pull/31645#pullrequestreview-2679668648), [jonatack](https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2722607551) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nNo conflicts as of last run.\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/31645.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Stale ACK | [ryanofsky](https://github.com/bitcoin/bitcoin/pull/31645#pullrequestreview-2679668648), [jonatack](https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2722607551) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nNo conflicts as of last run.\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -1162,46 +1171,6 @@
         "name": "Needs rebase",
         "color": "cccccc"
       }
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDg2ODQxMzM0MGY4ZDYwNThkNzQxODZiNjVhYzM0OThkNmI3ZjI1NGE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/868413340f8d6058d74186b65ac3498d6b7f254a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/868413340f8d6058d74186b65ac3498d6b7f254a",
-      "tree": {
-        "sha": "c0de8be8712d13ec96582b5e0de1b5abca8d4cd9",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c0de8be8712d13ec96582b5e0de1b5abca8d4cd9"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/df8bf657450d5383870d40790ea9f4fdb03c360d",
-          "sha": "df8bf657450d5383870d40790ea9f4fdb03c360d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/df8bf657450d5383870d40790ea9f4fdb03c360d"
-        }
-      ],
-      "message": "coins: bump default LevelDB write batch size to 64 MiB\n\nThe UTXO set has grown significantly, and flushing it from memory to LevelDB often takes over 20 minutes after a successful IBD with large dbcache values.\nThe final UTXO set is written to disk in batches, which LevelDB sorts into SST files.\nBy increasing the default batch size, we can reduce overhead from repeated compaction cycles, minimize constant overhead per batch, and achieve more sequential writes.\n\nExperiments with different batch sizes (loaded via assumeutxo at block 840k, then measuring final flush time) show that 64 MiB batches significantly reduce flush time without notably increasing memory usage:\n\n| dbbatchsize | flush_sum (ms) |\n|-------------|----------------|\n| 8 MiB       | ~240,000       |\n| 16 MiB      | ~220,000       |\n| 32 MiB      | ~200,000       |\n| *64 MiB*    | *~150,000*     |\n| 128 MiB     | ~156,000       |\n| 256 MiB     | ~166,000       |\n| 512 MiB     | ~186,000       |\n| 1 GiB       | ~186,000       |\n\nChecking the impact of a `-reindex-chainstate` with `-stopatheight=878000` and `-dbcache=30000` gives:\n16 << 20\n```\n2025-01-12T07:31:05Z Flushed fee estimates to fee_estimates.dat.\n2025-01-12T07:31:05Z [warning] Flushing large (26 GiB) UTXO set to disk, it may take several minutes\n2025-01-12T07:53:51Z Shutdown: done\n```\nFlush time: 22 minutes and 46 seconds\n\n64 >> 20\n```\n2025-01-12T18:30:00Z Flushed fee estimates to fee_estimates.dat.\n2025-01-12T18:30:00Z [warning] Flushing large (26 GiB) UTXO set to disk, it may take several minutes\n2025-01-12T18:44:43Z Shutdown: done\n```\nFlush time: ~14 minutes 43 seconds.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-01-16T15:23:43Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-01-05T20:44:27Z"
-      },
-      "sha": "868413340f8d6058d74186b65ac3498d6b7f254a"
     },
     {
       "event": "head_ref_force_pushed",
@@ -2250,9 +2219,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2025-03-30T15:47:45Z",
-      "updated_at": "2025-04-08T21:46:08Z",
+      "updated_at": "2025-04-08T22:00:37Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<details>\r\n<summary>Edit: old experiment values</summary>\r\n\r\nI've experimented a bit with changing the fixed write batch size to a dynamic value that scales with dbcache size, basically something like:\r\n```C++\r\nstatic int64_t GetDefaultDbBatchSize(int64_t dbcache_bytes) {\r\n    return std::min<int64_t>(\r\n        MAX_DB_CACHE_BATCH, // 512 MiB upper limit\r\n        std::max<int64_t>(\r\n            MIN_DB_CACHE,   // 4 MiB lower limit\r\n            dbcache_bytes * DEFAULT_KERNEL_CACHE_BATCH_SIZE / DEFAULT_KERNEL_CACHE\r\n        )\r\n    );\r\n}\r\n```\r\n\r\nCorresponding to:\r\n\r\n| dbcache (MiB) | Before (Fixed) |  | After (Dynamic) |  |\r\n|---------------|----------------|-----------------|----------------|-----------------|\r\n|               | **Batch Size** | **Batch Count** | **Batch Size** | **Batch Count** |\r\n| 4             | 16 MiB         | 1,546           | 4 MiB          | 3,111           |\r\n| 10            | 16 MiB         | 1,546           | 4 MiB          | 3,090           |\r\n| 45            | 16 MiB         | 780             | 4 MiB          | 3,090           |\r\n| 100           | 16 MiB         | 929             | 4 MiB          | 3,085           |\r\n| 450 (default) | 16 MiB         | 775             | 19.6 MiB       | 646             |\r\n| 1,000         | 16 MiB         | 788             | 44 MiB         | 285             |\r\n| 4,500         | 16 MiB         | 774             | 200 MiB        | 69              |\r\n| 10,000        | 16 MiB         | 772             | 444 MiB        | 33              |\r\n| 45,000        | 16 MiB         | 771             | 512 MiB        | 28              |\r\n\r\nThis would:\r\n* Provide smaller batches (4 MiB) for memory-constrained systems (likely making them a bit slower).\r\n* Maintains a similar batch size for default dbcache (20 MiB instead of 16 MiB, making it a bit faster, using a bit more memory).\r\n* Scales to larger batches for high-memory systems (up to 512 MiB, making it a lot faster, using a lot more memory).\r\n\r\n-----\r\n\r\nThe chart illustrates how the dynamic batch sizing maintains approximately a 1:22 ratio (~4.5%) between batch size and dbcache size, while capping at 4 MiB minimum for memory-constrained systems and 512 MiB maximum for high-memory systems (I chose this simply to maintain a similar batch size for the default value (20 MiB instead of 16 MiB for dbcache=440) while scaling linearly for other values).\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/cf237a62-e303-4bbb-aa28-d3fc7aaa0b9f\" />\r\n\r\nI have drafted the PR until I fine-tune these values based on performance and memory usage.\r\n\r\n</details>\r\n\r\n\r\nEdit:\r\n\r\nEnded up with keeping the `16 MiB` batch size for `dbcache` sizes below-or-equal to the default:\r\n\r\n$$\r\n\\text{GetDbBatchSize}(x)\r\n= \\max\\Bigl(16\\mathrm{MiB},\\ \r\n   \\min\\bigl(256\\mathrm{MiB},\\ \r\n     \\frac{x}{450\\mathrm{MiB}} \\times 16\\mathrm{MiB}\r\n   \\bigr)\r\n\\Bigr).\r\n$$\r\n\r\nWhich produces:\r\n\r\n<details>\r\n<summary>dbcache (MiB) | Batch Size (MiB) | Batches </summary>\r\n\r\n```bash\r\n           4 |          16.0 |     832\r\n          10 |          16.0 |     832\r\n          45 |          16.0 |     832\r\n         100 |          16.0 |     832\r\n         450 |          16.0 |     832\r\n        1000 |          35.6 |     375\r\n        2000 |          71.1 |     188\r\n        4500 |         160.0 |      84\r\n       10000 |         256.0 |      52\r\n       45000 |         256.0 |      52\r\n```\r\n\r\n</details>\r\n\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f9a779e4-a8d6-43fc-be75-958aede9fb31\" />\r\n\r\nWhich corresponds to the following peak memory increase per `dbcache`:\r\n\r\n<details>\r\n<summary>dbcache (MiB) | Before (GB) | After (GB) | Increase (GB) | Increase (%) | Batch Size (Before → After)</summary>\r\n\r\n```bash\r\n         450 |     0.753 |    0.755 |       0.001 |       0.2% | 16 MiB → 16 MiB\r\n        1000 |     1.240 |    1.313 |       0.073 |       5.9% | 16 MiB → 35 MiB\r\n        4500 |     4.564 |    5.109 |       0.545 |      11.9% | 16 MiB → 128 MiB\r\n       10000 |     9.785 |   10.770 |       0.985 |      10.1% | 16 MiB → 256 MiB\r\n```\r\n\r\n</details>\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f80ecfd9-8505-48b8-aefc-6b1bcc4f31b1\" />\r\n\r\n256MiB was chosen as the top value because bigger batches didn't show any further improvement:\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/ead0ef81-e90b-4eb8-8202-ab942a7ce4af\" />\r\n\r\nSpeedup depends on the dbcache size now - more available memory allows bigger batches:\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/9fbc42de-74b8-493a-8962-3020f2a5d7ea\" />\r\n\r\n\r\n\r\n",
+      "body": "I've experimented a bit with changing the fixed write batch size to a dynamic value that scales with dbcache size, basically something like:\r\n```C++\r\nstatic int64_t GetDefaultDbBatchSize(int64_t dbcache_bytes) {\r\n    return std::min<int64_t>(\r\n        MAX_DB_CACHE_BATCH, // 512 MiB upper limit\r\n        std::max<int64_t>(\r\n            MIN_DB_CACHE,   // 4 MiB lower limit\r\n            dbcache_bytes * DEFAULT_KERNEL_CACHE_BATCH_SIZE / DEFAULT_KERNEL_CACHE\r\n        )\r\n    );\r\n}\r\n```\r\n\r\nCorresponding to:\r\n\r\n| dbcache (MiB) | Before (Fixed) |  | After (Dynamic) |  |\r\n|---------------|----------------|-----------------|----------------|-----------------|\r\n|               | **Batch Size** | **Batch Count** | **Batch Size** | **Batch Count** |\r\n| 4             | 16 MiB         | 1,546           | 4 MiB          | 3,111           |\r\n| 10            | 16 MiB         | 1,546           | 4 MiB          | 3,090           |\r\n| 45            | 16 MiB         | 780             | 4 MiB          | 3,090           |\r\n| 100           | 16 MiB         | 929             | 4 MiB          | 3,085           |\r\n| 450 (default) | 16 MiB         | 775             | 19.6 MiB       | 646             |\r\n| 1,000         | 16 MiB         | 788             | 44 MiB         | 285             |\r\n| 4,500         | 16 MiB         | 774             | 200 MiB        | 69              |\r\n| 10,000        | 16 MiB         | 772             | 444 MiB        | 33              |\r\n| 45,000        | 16 MiB         | 771             | 512 MiB        | 28              |\r\n\r\nThis would:\r\n* Provide smaller batches (4 MiB) for memory-constrained systems (likely making them a bit slower).\r\n* Maintains a similar batch size for default dbcache (20 MiB instead of 16 MiB, making it a bit faster, using a bit more memory).\r\n* Scales to larger batches for high-memory systems (up to 512 MiB, making it a lot faster, using a lot more memory).\r\n\r\n-----\r\n\r\nThe chart illustrates how the dynamic batch sizing maintains approximately a 1:22 ratio (~4.5%) between batch size and dbcache size, while capping at 4 MiB minimum for memory-constrained systems and 512 MiB maximum for high-memory systems (I chose this simply to maintain a similar batch size for the default value (20 MiB instead of 16 MiB for dbcache=440) while scaling linearly for other values).\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/cf237a62-e303-4bbb-aa28-d3fc7aaa0b9f\" />\r\n\r\nI have drafted the PR until I fine-tune these values based on performance and memory usage.\r\n\r\n\r\n",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -2276,6 +2245,386 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2764621216",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31645"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 17178568392,
+      "node_id": "HRFPE_lADOABII586l3CxmzwAAAAP_7CbI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178568392",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "cc8d5446a6ca5f5e0566f062ab2e15ae5b6186c4",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/cc8d5446a6ca5f5e0566f062ab2e15ae5b6186c4",
+      "created_at": "2025-04-08T22:10:33Z"
+    },
+    {
+      "event": "commented",
+      "id": 2787771040,
+      "node_id": "IC_kwDOABII586mKgKg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2787771040",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-08T22:11:40Z",
+      "updated_at": "2025-04-08T22:11:40Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "TLDR: new version has dynamic batch size, memory and performance stays the same for the default `-dbcache=450` and below.\r\nThe memory and performance increase gradually for higher `dbcache` values.\r\nMeasured memory peaks don't exceed 12% of dbcache, batch size is capped at 256MiB, AssumeUTXO speedup is ~10-20%, reindex-chainstate and IBD performance is measured collectively in https://github.com/bitcoin/bitcoin/pull/32043.\r\nPR description was rewritten from scratch, PR is ready for review again.\r\n\r\n---\r\n\r\nEnded up with keeping the `16 MiB` batch size for `dbcache` sizes below-or-equal to the default (this should simplify things):\r\n\r\n$$\r\n\\text{GetDbBatchSize}(dbcache)\r\n= \\max\\Bigl(16\\mathrm{MiB},\\\r\n   \\min\\bigl(256\\mathrm{MiB},\\\r\n     \\frac{dbcache}{450\\mathrm{MiB}} \\times 16\\mathrm{MiB}\r\n   \\bigr)\r\n\\Bigr).\r\n$$\r\n\r\nWhich produces:\r\n\r\n<details>\r\n<summary>dbcache (MiB) | Batch Size (MiB) | Batches </summary>\r\n\r\n```bash\r\n           4 |          16.0 |     832\r\n          10 |          16.0 |     832\r\n          45 |          16.0 |     832\r\n         100 |          16.0 |     832\r\n         450 |          16.0 |     832\r\n        1000 |          35.6 |     375\r\n        2000 |          71.1 |     188\r\n        4500 |         160.0 |      84\r\n       10000 |         256.0 |      52\r\n       45000 |         256.0 |      52\r\n```\r\n\r\n</details>\r\n\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f9a779e4-a8d6-43fc-be75-958aede9fb31\" />\r\n\r\nWhich corresponds to the following peak memory increase per `dbcache`:\r\n\r\n<details>\r\n<summary>dbcache (MiB) | Before (GB) | After (GB) | Increase (GB) | Increase (%) | Batch Size (Before → After)</summary>\r\n\r\n```bash\r\n         450 |     0.753 |    0.755 |       0.001 |       0.2% | 16 MiB → 16 MiB\r\n        1000 |     1.240 |    1.313 |       0.073 |       5.9% | 16 MiB → 35 MiB\r\n        4500 |     4.564 |    5.109 |       0.545 |      11.9% | 16 MiB → 128 MiB\r\n       10000 |     9.785 |   10.770 |       0.985 |      10.1% | 16 MiB → 256 MiB\r\n```\r\n\r\n</details>\r\n\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/f80ecfd9-8505-48b8-aefc-6b1bcc4f31b1\" />\r\n\r\n256MiB was chosen as the top value because bigger batches didn't show any further improvement:\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/ead0ef81-e90b-4eb8-8202-ab942a7ce4af\" />\r\n\r\nSpeedup depends on the dbcache size now - more available memory allows bigger batches:\r\n<img width=\"1000\" alt=\"image\" src=\"https://github.com/user-attachments/assets/9fbc42de-74b8-493a-8962-3020f2a5d7ea\" />\r\n",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2787771040",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31645"
+    },
+    {
+      "event": "ready_for_review",
+      "id": 17178590405,
+      "node_id": "RFRE_lADOABII586l3CxmzwAAAAP_7HzF",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178590405",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-08T22:13:07Z"
+    },
+    {
+      "event": "renamed",
+      "id": 17178610254,
+      "node_id": "RTE_lADOABII586l3CxmzwAAAAP_7MpO",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178610254",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-08T22:15:13Z",
+      "rename": {
+        "from": "[IBD] flush UTXOs in bigger batches",
+        "to": "[IBD] flush UTXOs in bigger batches based on dbcache size"
+      }
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 17178656152,
+      "node_id": "HRFPE_lADOABII586l3CxmzwAAAAP_7X2Y",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178656152",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "9012c91efc8eb6c47e723f741bf55d891a3dc419",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/9012c91efc8eb6c47e723f741bf55d891a3dc419",
+      "created_at": "2025-04-08T22:21:04Z"
+    },
+    {
+      "event": "labeled",
+      "id": 17178656840,
+      "node_id": "LE_lADOABII586l3CxmzwAAAAP_7YBI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178656840",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-08T22:21:09Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2787784018,
+      "node_id": "IC_kwDOABII586mKjVS",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2787784018",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-08T22:21:10Z",
+      "updated_at": "2025-04-08T22:21:10Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--85328a0da195eb286784d51f73fa0af9-->\n🚧 At least one of the CI tasks failed.\n<sub>Debug: https://github.com/bitcoin/bitcoin/runs/40211589754</sub>\n\n<details><summary>Hints</summary>\n\nTry to run the tests locally, according to the documentation. However, a CI failure may still\nhappen due to a number of reasons, for example:\n\n* Possibly due to a silent merge conflict (the changes in this pull request being\nincompatible with the current code in the target branch). If so, make sure to rebase on the latest\ncommit of the target branch.\n\n* A sanitizer issue, which can only be found by compiling with the sanitizer and running the\n  affected test.\n\n* An intermittent issue.\n\nLeave a comment here, if you need help tracking down a confusing failure.\n\n</details>\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31645#issuecomment-2787784018",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31645"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDRlZTk3NTc5ODc0NjNmNDMyMjI1MjhkYWEyODg2ODJjYzY4OWZlYWY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4ee9757987463f43222528daa288682cc689feaf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4ee9757987463f43222528daa288682cc689feaf",
+      "tree": {
+        "sha": "037ee0c78909294239c9e9311c1ed4b462abe96c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/037ee0c78909294239c9e9311c1ed4b462abe96c"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bb92bb36f211b88e4c1aa031a4364795cbd24767",
+          "sha": "bb92bb36f211b88e4c1aa031a4364795cbd24767",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/bb92bb36f211b88e4c1aa031a4364795cbd24767"
+        }
+      ],
+      "message": "coins: introduce dynamic batch size calculator based on dbcache value\n\nThe size scales linearly with -dbcache above the default 450 MiB, clamped between a minimum of 16 MiB and a maximum of 256 MiB.\nThis allows larger in-memory caches to use proportionally larger batch sizes, improving flush efficiency without impacting default configurations.\n\nIncludes unit test coverage for key transition points.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-08T22:45:25Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-08T15:49:19Z"
+      },
+      "sha": "4ee9757987463f43222528daa288682cc689feaf"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDVkYTQwMDNjNjEzYjE3MDBhOTMyNjE4N2I4NWIyMGQ1MGZhZWFhMDI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5da4003c613b1700a9326187b85b20d50faeaa02",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5da4003c613b1700a9326187b85b20d50faeaa02",
+      "tree": {
+        "sha": "1a8d31833e3c2abfe5d93098d825f6a38a24d1b6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1a8d31833e3c2abfe5d93098d825f6a38a24d1b6"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4ee9757987463f43222528daa288682cc689feaf",
+          "sha": "4ee9757987463f43222528daa288682cc689feaf",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/4ee9757987463f43222528daa288682cc689feaf"
+        }
+      ],
+      "message": "coins: set CoinsViewOptions::batch_write_bytes from -dbcache if unset\n\nExtend `ReadCoinsViewArgs` to dynamically set `batch_write_bytes` using `GetDbBatchSize()` when `-dbbatchsize` is not explicitly provided.\n\nThis enables larger LevelDB batches on systems with high -dbcache values, which reduces the number of write operations during UTXO flushes and improves I/O efficiency, particularly during AssumeUTXO loads and IBD.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-08T22:45:35Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-04-08T15:50:48Z"
+      },
+      "sha": "5da4003c613b1700a9326187b85b20d50faeaa02"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 17178837508,
+      "node_id": "HRFPE_lADOABII586l3CxmzwAAAAP_8EIE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17178837508",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "5da4003c613b1700a9326187b85b20d50faeaa02",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/5da4003c613b1700a9326187b85b20d50faeaa02",
+      "created_at": "2025-04-08T22:45:59Z"
     }
   ],
   "comments": []
