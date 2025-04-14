@@ -40,13 +40,22 @@
       "patch_url": null
     },
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- INV/TX --------> tx-recipient (if we take the last commit: fixup!)\r\ntx-sender <--- GETDATA/TX ----< tx-recipient (if we take the last commit: fixup!)\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to a few (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>How to test this?</summary>\r\n\r\nThank you, @stratospher and @andrewtoth!\r\n\r\nStart `bitcoind` with `-privatebroadcast=1 -debug=privatebroadcast`.\r\n\r\nCreate a wallet and get a new address, go to the Signet faucet and request some coins to that address:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" createwallet test\r\nbuild/bin/bitcoin-cli -chain=\"signet\" getnewaddress\r\n```\r\n\r\nGet a new address for the test transaction recipient:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" loadwallet test\r\nnew_address=$(build/bin/bitcoin-cli -chain=\"signet\" getnewaddress)\r\n```\r\n\r\nCreate the transaction:\r\n```bash\r\n# Option 1: `createrawtransaction` and `signrawtransactionwithwallet`:\r\n\r\ntxid=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .txid')\r\nvout=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .vout')\r\necho \"txid: $txid\"\r\necho \"vout: $vout\"\r\n\r\ntx=$(build/bin/bitcoin-cli -chain=\"signet\" createrawtransaction \"[{\\\"txid\\\": \\\"$txid\\\", \\\"vout\\\": $vout}]\" \"[{\\\"$new_address\\\": 0.00001000}]\" 0 false)\r\necho \"tx: $tx\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" signrawtransactionwithwallet \"$tx\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n\r\n# OR Option 2: `walletcreatefundedpsbt` and `walletprocesspsbt`:\r\n# This makes it not have to worry about inputs and also automatically sends back change to the wallet.\r\n# Start `bitcoind` with `-fallbackfee=0.00003000` for instance for 3 sat/vbyte fee.\r\n\r\npsbt=$(build/bin/bitcoin-cli -chain=\"signet\" walletcreatefundedpsbt \"[]\" \"[{\\\"$new_address\\\": 0.00001000}]\" | jq -r '.psbt')\r\necho \"psbt: $psbt\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" walletprocesspsbt \"$psbt\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n```\r\n\r\nFinally, send the transaction:\r\n```bash\r\nraw_tx=$(build/bin/bitcoin-cli -chain=\"signet\" sendrawtransaction \"$signed_tx\")\r\necho \"raw_tx: $raw_tx\"\r\n```\r\n\r\n</details>\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: support overriding the proxy selection in ConnectNode()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvement:\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n* Add an intermediate step that sends `INV` message and waits for a request for the transaction. If reviewers like this, then I will squash it into the relevant commit, or otherwise drop it:\r\n  * `fixup! net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n\r\n</details>\r\n\r\n---\r\n\r\n**This PR would close the following issues:**\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\nhttps://github.com/bitcoin/bitcoin/issues/32235 Tor: TX circuit isolation\r\n\r\n**Issues that are related, but (maybe?) not to be closed by this PR:**\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n* Consider periodically sending transactions that did not originate from the node as decoy, discussed [here](https://github.com/bitcoin/bitcoin/pull/29415#discussion_r2035414972).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
-    "labels": [],
+    "labels": [
+      {
+        "id": 955867938,
+        "node_id": "MDU6TGFiZWw5NTU4Njc5Mzg=",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20rebase",
+        "name": "Needs rebase",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2025-04-14T15:16:20Z",
-    "mergeable": true,
-    "mergeable_state": "blocked",
+    "updated_at": "2025-04-14T22:58:29Z",
+    "mergeable": false,
+    "mergeable_state": "dirty",
     "merged": false,
-    "merge_commit_sha": "0ec714ad976c2f384b57857734278ae9dbc5fcd3",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -72,7 +81,7 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": true,
+    "rebaseable": false,
     "head": {
       "label": "vasild:private_broadcast",
       "ref": "private_broadcast",
@@ -306,12 +315,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37036,
-        "stargazers_count": 82881,
-        "watchers_count": 82881,
-        "size": 279768,
+        "forks_count": 37039,
+        "stargazers_count": 82883,
+        "watchers_count": 82883,
+        "size": 279798,
         "default_branch": "master",
-        "open_issues_count": 700,
+        "open_issues_count": 699,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -328,9 +337,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-04-14T09:59:23Z",
+        "pushed_at": "2025-04-14T21:40:18Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-04-14T14:29:39Z",
+        "updated_at": "2025-04-14T22:39:51Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -361,7 +370,7 @@
     "changed_files": 33,
     "commits": 15,
     "review_comments": 314,
-    "comments": 82
+    "comments": 83
   },
   "events": [
     {
@@ -11523,6 +11532,96 @@
       "submitted_at": "2025-04-13T16:29:49Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+    },
+    {
+      "event": "labeled",
+      "id": 17257224611,
+      "node_id": "LE_lADOABII585-yiT2zwAAAAQEnFmj",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/17257224611",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-14T22:58:26Z",
+      "label": {
+        "name": "Needs rebase",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 2803251061,
+      "node_id": "IC_kwDOABII586nFjd1",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/2803251061",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-04-14T22:58:28Z",
+      "updated_at": "2025-04-14T22:58:28Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--cf906140f33d8803c4a75a2196329ecb-->\n🐙 This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2803251061",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
     }
   ],
   "comments": [
@@ -27830,9 +27929,9 @@
         "site_admin": false,
         "patch_url": null
       },
-      "body": "> getting silence after sending INV does not equate to \"we sent the tx to the peer\".\r\n\r\nHere are some arguments for assuming silence after INV means a successful private broadcast connection:\r\n\r\n- Not receiving a GETDATA for 3 minutes and retaining the connection would mean it is highly likely the node already has seen the tx. Yes, there could be other issues with the node, but it is about probabilities. Receiving a PONG after we push the TX also does not guarantee the node will broadcast our tx. The node could die before it broadcasts our tx, or it is malicious and blackholes it. The same with silence after an INV.\r\n\r\n- If we receive the tx in our mempool while waiting for a timeout, we will still increment the connection count with the patch above if it times out. Then we would wastefully connect to another peer and disconnect in `PushPrivateBroadcastTx`. I think this can be improved though if we change your recent patch:\r\n```\r\n     if (!confirmed_by_node) {\r\n-        return;\r\n+        return Find(txid).has_value();\r\n     }\r\n```\r\n\r\nThe comment about the return value would also have to be updated.\r\n\r\n- If our node is not well connected, e.g. maxconnections=0, and we still want to use it to broadcast private broadcast txs, it will forever keep opening private broadcast txs that timeout since it would not receive our tx back.\r\n\r\n- This would make it very difficult to support decoy txs. If we schedule a tx that is already received to be a decoy to send to 3 peers, it will forever keep opening connections.",
+      "body": "> Here is an updated patch\r\n\r\nLooks good! Just one thing - if we receive the tx in our mempool before the node is finalized and disconnect before receiving a PONG, we will still increment the connection count. Then we would wastefully connect to another peer and disconnect in `PushPrivateBroadcastTx`. I think this can be fixed if we change the following:\r\n```\r\n     if (!confirmed_by_node) {\r\n-        return;\r\n+        return Find(txid).has_value();\r\n     }\r\n```\r\n\r\nThe comment about the return value would also have to be updated.\r\n\r\n> getting silence after sending INV does not equate to \"we sent the tx to the peer\".\r\n\r\nHere are some arguments for assuming silence after INV means a successful private broadcast connection:\r\n\r\n- Not receiving a GETDATA for 3 minutes and retaining the connection would mean it is highly likely the node already has seen the tx. Yes, there could be other issues with the node, but it is about probabilities. Receiving a PONG after we push the TX also does not guarantee the node will broadcast our tx. The node could die before it broadcasts our tx, or it is malicious and blackholes it. The same with silence after an INV.\r\n\r\n- If our node is not well connected, e.g. maxconnections=0, and we still want to use it to broadcast private broadcast txs, it will forever keep opening private broadcast txs that timeout since it would not receive our tx back.\r\n\r\n- This would make it very difficult to support decoy txs. If we schedule a tx that is already received to be a decoy to send to 3 peers, it will forever keep opening connections.",
       "created_at": "2025-04-14T15:16:20Z",
-      "updated_at": "2025-04-14T15:40:39Z",
+      "updated_at": "2025-04-14T17:54:47Z",
       "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r2042370434",
       "author_association": "CONTRIBUTOR",
       "_links": {
