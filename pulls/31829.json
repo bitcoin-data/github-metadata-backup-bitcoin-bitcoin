@@ -87,7 +87,7 @@
       "updated_at": "2025-06-03T08:26:07Z"
     },
     "created_at": "2025-02-09T21:14:45Z",
-    "updated_at": "2025-06-05T14:37:05Z",
+    "updated_at": "2025-06-05T18:14:05Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -372,9 +372,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37317,
-        "stargazers_count": 83980,
-        "watchers_count": 83980,
+        "forks_count": 37311,
+        "stargazers_count": 83982,
+        "watchers_count": 83982,
         "size": 283337,
         "default_branch": "master",
         "open_issues_count": 741,
@@ -396,7 +396,7 @@
         "visibility": "public",
         "pushed_at": "2025-06-05T13:36:24Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-06-05T13:32:32Z",
+        "updated_at": "2025-06-05T18:47:03Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -426,7 +426,7 @@
     "deletions": 883,
     "changed_files": 22,
     "commits": 17,
-    "review_comments": 215,
+    "review_comments": 217,
     "comments": 18
   },
   "events": [
@@ -15604,6 +15604,112 @@
       "start_side": null,
       "line": 231,
       "original_line": 232,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2129634568",
+      "pull_request_review_id": 2901493170,
+      "id": 2129634568,
+      "node_id": "PRRC_kwDOABII585-76UI",
+      "diff_hunk": "@@ -0,0 +1,672 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_NODE_TXORPHANAGE_IMPL_H\n+#define BITCOIN_NODE_TXORPHANAGE_IMPL_H\n+\n+#include <coins.h>\n+#include <consensus/amount.h>\n+#include <indirectmap.h>\n+#include <logging.h>\n+#include <net.h>\n+#include <policy/policy.h>\n+#include <primitives/transaction.h>\n+#include <sync.h>\n+#include <util/epochguard.h>\n+#include <util/hasher.h>\n+#include <util/result.h>\n+#include <util/feefrac.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/identity.hpp>\n+#include <boost/multi_index/indexed_by.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index/sequenced_index.hpp>\n+#include <boost/multi_index/tag.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+#include <atomic>\n+#include <map>\n+#include <optional>\n+#include <set>\n+#include <string>\n+#include <string_view>\n+#include <utility>\n+#include <vector>\n+\n+namespace node {\n+/** Default value for TxOrphanage::m_reserved_usage_per_peer. */\n+static constexpr int64_t DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER{404'000};\n+/** Default value for TxOrphanage::m_max_global_announcements. */\n+static constexpr unsigned int DEFAULT_MAX_ORPHAN_ANNOUNCEMENTS{3000};\n+/** Minimum NodeId for lower_bound lookups (in practice, NodeIds start at 0). */\n+static constexpr NodeId min_peer{std::numeric_limits<NodeId>::min()};\n+\n+class TxOrphanageImpl\n+{\n+    // Type alias for sequence numbers\n+    using SequenceNumber = uint64_t;\n+\n+    /** Global sequence number, increment each time an announcement is added. */\n+    SequenceNumber m_current_sequence{0};\n+\n+    /** One orphan announcement. Each announcement (i.e. combination of wtxid, nodeid) is unique. There may be multiple\n+     * announcements for the same tx, and multiple transactions with the same txid but different wtxid are possible. */\n+    struct Announcement\n+    {\n+        CTransactionRef m_tx;\n+        /** Which peer announced this tx */\n+        NodeId m_announcer;\n+        /** What order this transaction entered the orphanage. */\n+        SequenceNumber m_entry_sequence;\n+        /** Whether this tx should be reconsidered. Always starts out false. A peer's workset is the collection of all\n+         * announcements with m_reconsider=true. */\n+        bool m_reconsider{false};\n+\n+        Announcement(const CTransactionRef& tx, NodeId peer, SequenceNumber seq) :\n+            m_tx{tx}, m_announcer{peer}, m_entry_sequence{seq}\n+        { }\n+\n+        /** Get the weight of the transaction, our approximation for \"memory usage\". */\n+        int64_t GetUsage()  const {\n+            return GetTransactionWeight(*m_tx);\n+        }\n+    };\n+\n+    // Index by wtxid, then peer. Uses:\n+    // - Get a tx or query its existence, by wtxid.\n+    // - Erase all entries corresponding to an orphan by wtxid.\n+    // - Add a new announcer for a transaction, if we only know the wtxid and an entry already exists.\n+    // - AddChildrenToWorkSet: mark an orphan as reconsiderable when its parent is accepted\n+    // - GetOrphanTransactions: return the list of all unique transactions in orphanage.\n+    struct ByWtxid {};\n+    using ByWtxidView = std::tuple<Wtxid, NodeId>;\n+    struct WtxidExtractor\n+    {\n+        using result_type = ByWtxidView;\n+        result_type operator()(const Announcement& ann) const\n+        {\n+            return ByWtxidView{ann.m_tx->GetWitnessHash(), ann.m_announcer};\n+        }\n+    };\n+\n+    // Sort by peer, then by whether it is ready to reconsider, then by recency. Uses:\n+    // - Erase all announcements from a peer when it disconnects.\n+    // - Look up whether a peer has orphans to reconsider or return the oldest reconsiderable orphan.\n+    // - Get the children of a transaction provided by a given peer.\n+    // - Evict an orphan from a peer whose DoS score is high.\n+    struct ByPeer {};\n+    using ByPeerView = std::tuple<NodeId, bool, SequenceNumber>;\n+    struct ByPeerViewExtractor {\n+        using result_type = ByPeerView;\n+        result_type operator()(const Announcement& ann) const\n+        {\n+            return ByPeerView{ann.m_announcer, ann.m_reconsider, ann.m_entry_sequence};\n+        }\n+    };\n+\n+    struct OrphanIndices final : boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByWtxid>, WtxidExtractor>,\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>\n+    >{};\n+\n+    using OrphanMap = boost::multi_index::multi_index_container<Announcement, OrphanIndices>;\n+    template<typename Tag>\n+    using Iter = typename OrphanMap::index<Tag>::type::iterator;\n+    OrphanMap m_orphans;\n+\n+    const unsigned int m_max_global_announcements{DEFAULT_MAX_ORPHAN_ANNOUNCEMENTS};\n+    const int64_t m_reserved_usage_per_peer{DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER};\n+\n+    /** Number of unique orphans by wtxid. Less than or equal to the number of entries in m_orphans. */\n+    unsigned int m_unique_orphans{0};\n+\n+    /** Total bytes used by orphans, deduplicated by wtxid. */\n+    unsigned int m_unique_orphan_bytes{0};\n+\n+    /** Index from the parents' outputs to wtxids that exist in m_orphans. Used to find children of\n+     * a transaction that can be reconsidered and to remove entries that conflict with a block.*/\n+    std::map<COutPoint, std::set<Wtxid>> m_outpoint_to_orphan_it;",
+      "path": "src/node/txorphanage_impl.h",
+      "position": null,
+      "original_position": 130,
+      "commit_id": "9d4f8531fe9126dc0eea808db2d0d449cc3f129f",
+      "original_commit_id": "ea3a65e698f519afee23484ce1b399e9a4c62529",
+      "in_reply_to_id": 2112731246,
+      "user": {
+        "login": "glozow",
+        "id": 25183001,
+        "node_id": "MDQ6VXNlcjI1MTgzMDAx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/25183001?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/glozow",
+        "html_url": "https://github.com/glozow",
+        "followers_url": "https://api.github.com/users/glozow/followers",
+        "following_url": "https://api.github.com/users/glozow/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/glozow/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/glozow/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/glozow/subscriptions",
+        "organizations_url": "https://api.github.com/users/glozow/orgs",
+        "repos_url": "https://api.github.com/users/glozow/repos",
+        "events_url": "https://api.github.com/users/glozow/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/glozow/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "I went pretty far into implementing this, but realized there is a downside to this approach - the set stores entries for each announcement instead of each unique orphan. It requires us to update this map each time a new announcement is added/removed instead of just for unique ones. Perhaps worth keeping as `Wtxid` - what do you think?",
+      "created_at": "2025-06-05T18:01:49Z",
+      "updated_at": "2025-06-05T18:01:49Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#discussion_r2129634568",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2129634568"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 108,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2129683785",
+      "pull_request_review_id": 2901548354,
+      "id": 2129683785,
+      "node_id": "PRRC_kwDOABII585-8GVJ",
+      "diff_hunk": "@@ -0,0 +1,672 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_NODE_TXORPHANAGE_IMPL_H\n+#define BITCOIN_NODE_TXORPHANAGE_IMPL_H\n+\n+#include <coins.h>\n+#include <consensus/amount.h>\n+#include <indirectmap.h>\n+#include <logging.h>\n+#include <net.h>\n+#include <policy/policy.h>\n+#include <primitives/transaction.h>\n+#include <sync.h>\n+#include <util/epochguard.h>\n+#include <util/hasher.h>\n+#include <util/result.h>\n+#include <util/feefrac.h>\n+\n+#include <boost/multi_index/hashed_index.hpp>\n+#include <boost/multi_index/identity.hpp>\n+#include <boost/multi_index/indexed_by.hpp>\n+#include <boost/multi_index/ordered_index.hpp>\n+#include <boost/multi_index/sequenced_index.hpp>\n+#include <boost/multi_index/tag.hpp>\n+#include <boost/multi_index_container.hpp>\n+\n+#include <atomic>\n+#include <map>\n+#include <optional>\n+#include <set>\n+#include <string>\n+#include <string_view>\n+#include <utility>\n+#include <vector>\n+\n+namespace node {\n+/** Default value for TxOrphanage::m_reserved_usage_per_peer. */\n+static constexpr int64_t DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER{404'000};\n+/** Default value for TxOrphanage::m_max_global_announcements. */\n+static constexpr unsigned int DEFAULT_MAX_ORPHAN_ANNOUNCEMENTS{3000};\n+/** Minimum NodeId for lower_bound lookups (in practice, NodeIds start at 0). */\n+static constexpr NodeId min_peer{std::numeric_limits<NodeId>::min()};\n+\n+class TxOrphanageImpl\n+{\n+    // Type alias for sequence numbers\n+    using SequenceNumber = uint64_t;\n+\n+    /** Global sequence number, increment each time an announcement is added. */\n+    SequenceNumber m_current_sequence{0};\n+\n+    /** One orphan announcement. Each announcement (i.e. combination of wtxid, nodeid) is unique. There may be multiple\n+     * announcements for the same tx, and multiple transactions with the same txid but different wtxid are possible. */\n+    struct Announcement\n+    {\n+        CTransactionRef m_tx;\n+        /** Which peer announced this tx */\n+        NodeId m_announcer;\n+        /** What order this transaction entered the orphanage. */\n+        SequenceNumber m_entry_sequence;\n+        /** Whether this tx should be reconsidered. Always starts out false. A peer's workset is the collection of all\n+         * announcements with m_reconsider=true. */\n+        bool m_reconsider{false};\n+\n+        Announcement(const CTransactionRef& tx, NodeId peer, SequenceNumber seq) :\n+            m_tx{tx}, m_announcer{peer}, m_entry_sequence{seq}\n+        { }\n+\n+        /** Get the weight of the transaction, our approximation for \"memory usage\". */\n+        int64_t GetUsage()  const {\n+            return GetTransactionWeight(*m_tx);\n+        }\n+    };\n+\n+    // Index by wtxid, then peer. Uses:\n+    // - Get a tx or query its existence, by wtxid.\n+    // - Erase all entries corresponding to an orphan by wtxid.\n+    // - Add a new announcer for a transaction, if we only know the wtxid and an entry already exists.\n+    // - AddChildrenToWorkSet: mark an orphan as reconsiderable when its parent is accepted\n+    // - GetOrphanTransactions: return the list of all unique transactions in orphanage.\n+    struct ByWtxid {};\n+    using ByWtxidView = std::tuple<Wtxid, NodeId>;\n+    struct WtxidExtractor\n+    {\n+        using result_type = ByWtxidView;\n+        result_type operator()(const Announcement& ann) const\n+        {\n+            return ByWtxidView{ann.m_tx->GetWitnessHash(), ann.m_announcer};\n+        }\n+    };\n+\n+    // Sort by peer, then by whether it is ready to reconsider, then by recency. Uses:\n+    // - Erase all announcements from a peer when it disconnects.\n+    // - Look up whether a peer has orphans to reconsider or return the oldest reconsiderable orphan.\n+    // - Get the children of a transaction provided by a given peer.\n+    // - Evict an orphan from a peer whose DoS score is high.\n+    struct ByPeer {};\n+    using ByPeerView = std::tuple<NodeId, bool, SequenceNumber>;\n+    struct ByPeerViewExtractor {\n+        using result_type = ByPeerView;\n+        result_type operator()(const Announcement& ann) const\n+        {\n+            return ByPeerView{ann.m_announcer, ann.m_reconsider, ann.m_entry_sequence};\n+        }\n+    };\n+\n+    struct OrphanIndices final : boost::multi_index::indexed_by<\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByWtxid>, WtxidExtractor>,\n+        boost::multi_index::ordered_unique<boost::multi_index::tag<ByPeer>, ByPeerViewExtractor>\n+    >{};\n+\n+    using OrphanMap = boost::multi_index::multi_index_container<Announcement, OrphanIndices>;\n+    template<typename Tag>\n+    using Iter = typename OrphanMap::index<Tag>::type::iterator;\n+    OrphanMap m_orphans;\n+\n+    const unsigned int m_max_global_announcements{DEFAULT_MAX_ORPHAN_ANNOUNCEMENTS};\n+    const int64_t m_reserved_usage_per_peer{DEFAULT_RESERVED_ORPHAN_WEIGHT_PER_PEER};\n+\n+    /** Number of unique orphans by wtxid. Less than or equal to the number of entries in m_orphans. */\n+    unsigned int m_unique_orphans{0};\n+\n+    /** Total bytes used by orphans, deduplicated by wtxid. */\n+    unsigned int m_unique_orphan_bytes{0};\n+\n+    /** Index from the parents' outputs to wtxids that exist in m_orphans. Used to find children of\n+     * a transaction that can be reconsidered and to remove entries that conflict with a block.*/\n+    std::map<COutPoint, std::set<Wtxid>> m_outpoint_to_orphan_it;",
+      "path": "src/node/txorphanage_impl.h",
+      "position": null,
+      "original_position": 130,
+      "commit_id": "9d4f8531fe9126dc0eea808db2d0d449cc3f129f",
+      "original_commit_id": "ea3a65e698f519afee23484ce1b399e9a4c62529",
+      "in_reply_to_id": 2112731246,
+      "user": {
+        "login": "sipa",
+        "id": 548488,
+        "node_id": "MDQ6VXNlcjU0ODQ4OA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/548488?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sipa",
+        "html_url": "https://github.com/sipa",
+        "followers_url": "https://api.github.com/users/sipa/followers",
+        "following_url": "https://api.github.com/users/sipa/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sipa/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sipa/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sipa/subscriptions",
+        "organizations_url": "https://api.github.com/users/sipa/orgs",
+        "repos_url": "https://api.github.com/users/sipa/repos",
+        "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sipa/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Ah, I see. So you could have an $\\mathcal{O(n)}$ blowup factor with $n$ the number of peers that have announced that Wtxid? If so, that doesn't sound like a worthwhile tradeoff.\r\n",
+      "created_at": "2025-06-05T18:14:05Z",
+      "updated_at": "2025-06-05T18:14:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#discussion_r2129683785",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2129683785"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 108,
       "side": "RIGHT"
     }
   ]
