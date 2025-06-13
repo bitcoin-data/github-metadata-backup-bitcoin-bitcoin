@@ -42,11 +42,11 @@
     "body": "Currently `CConnman` is a mixture of:\r\n* low level socket handling, e.g. send, recv, poll, bind, listen, connect, and\r\n* higher level logic that is specific to the Bitcoin P2P protocol, e.g. V1/V2 transport, choosing which address to connect to, if we manage to connect mark the address good in `AddrMan`, maintaining the number of inbound and outbound connections, banning of peers, interacting with `PeerManager`.\r\n\r\n---\r\n\r\nThis PR splits the socket handling into a new class which makes the code more modular and reusable. Having more modular and reusable code is a good thing on its own, even if the code is not reused. Stratum V2 and libevent-less RPC/HTTP server could benefit from this, but it makes sense on its own, even without those projects.\r\n\r\n---\r\n\r\nThe socket operations are driven by the new class `SockMan` which informs the higher level via provided methods when e.g. new data arrives on the socket or a new connection is accepted. For this, `SockMan` provides some non-virtual methods to start it rolling and then it calls pure virtual methods which are implemented by the higher level (e.g. `CConnman`) on certain events, for example \"got this new data on this node's socket\".\r\n\r\nThe interface of `SockMan` is:\r\n\r\n```cpp\r\n/**\r\n * A socket manager class which handles socket operations.\r\n * To use this class, inherit from it and implement the pure virtual methods.\r\n * Handled operations:\r\n * - binding and listening on sockets\r\n * - starting of necessary threads to process socket operations\r\n * - accepting incoming connections\r\n * - making outbound connections\r\n * - closing connections\r\n * - waiting for IO readiness on sockets and doing send/recv accordingly\r\n */\r\nclass SockMan\r\n{\r\npublic:\r\n\r\n    //\r\n    // Non-virtual functions, to be reused by children classes.\r\n    //\r\n\r\n    /**\r\n     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\r\n     * Should be called before `StartSocketsThreads()`.\r\n     * @param[in] to Where to bind.\r\n     * @param[out] err_msg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `err_msg` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& err_msg);\r\n\r\n    /**\r\n     * Start the necessary threads for sockets IO.\r\n     */\r\n    void StartSocketsThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\r\n     */\r\n    void JoinSocketsThreads();\r\n\r\n    /**\r\n     * Make an outbound connection, save the socket internally and return a newly generated connection id.\r\n     * @param[in] to The address to connect to, either as CService or a host as string and port as\r\n     * an integer, if the later is used, then `proxy` must be valid.\r\n     * @param[in] is_important If true, then log failures with higher severity.\r\n     * @param[in] proxy Proxy to connect through, if set.\r\n     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\r\n     * proxy, then it will be set to true.\r\n     * @param[out] me If the connection was successful then this is set to the address on the\r\n     * local side of the socket.\r\n     * @return Newly generated id, or std::nullopt if the operation fails.\r\n     */\r\n    std::optional<SockMan::Id> ConnectAndMakeId(const std::variant<CService, StringHostIntPort>& to,\r\n                                                bool is_important,\r\n                                                std::optional<Proxy> proxy,\r\n                                                bool& proxy_failed,\r\n                                                CService& me)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex, !m_unused_i2p_sessions_mutex);\r\n\r\n    /**\r\n     * Destroy a given connection by closing its socket and release resources occupied by it.\r\n     * @param[in] id Connection to destroy.\r\n     * @return Whether the connection existed and its socket was closed by this call.\r\n     */\r\n    bool CloseConnection(Id id)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Try to send some data over the given connection.\r\n     * @param[in] id Identifier of the connection.\r\n     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\r\n     * @param[in] will_send_more Used as an optimization if the caller knows that they will\r\n     * be sending more data soon after this call.\r\n     * @param[out] errmsg If <0 is returned then this will contain a human readable message\r\n     * explaining the error.\r\n     * @retval >=0 The number of bytes actually sent.\r\n     * @retval <0 A permanent error has occurred.\r\n     */\r\n    ssize_t SendBytes(Id id,\r\n                      std::span<const unsigned char> data,\r\n                      bool will_send_more,\r\n                      std::string& errmsg) const\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Stop listening by closing all listening sockets.\r\n     */\r\n    void StopListening();\r\n\r\n    //\r\n    // Pure virtual functions must be implemented by children classes.\r\n    //\r\n\r\n    /**\r\n     * Be notified when a new connection has been accepted.\r\n     * @param[in] id Id of the newly accepted connection.\r\n     * @param[in] me The address and port at our side of the connection.\r\n     * @param[in] them The address and port at the peer's side of the connection.\r\n     * @retval true The new connection was accepted at the higher level.\r\n     * @retval false The connection was refused at the higher level, so the\r\n     * associated socket and id should be discarded by `SockMan`.\r\n     */\r\n    virtual bool EventNewConnectionAccepted(Id id,\r\n                                            const CService& me,\r\n                                            const CService& them) = 0;\r\n\r\n    /**\r\n     * Called when the socket is ready to send data and `ShouldTryToSend()` has\r\n     * returned true. This is where the higher level code serializes its messages\r\n     * and calls `SockMan::SendBytes()`.\r\n     * @param[in] id Id of the connection whose socket is ready to send.\r\n     * @param[out] cancel_recv Should always be set upon return and if it is true,\r\n     * then the next attempt to receive data from that connection will be omitted.\r\n     */\r\n    virtual void EventReadyToSend(Id id, bool& cancel_recv) = 0;\r\n\r\n    /**\r\n     * Called when new data has been received.\r\n     * @param[in] id Connection for which the data arrived.\r\n     * @param[in] data Received data.\r\n     */\r\n    virtual void EventGotData(Id id, std::span<const uint8_t> data) = 0;\r\n\r\n    /**\r\n     * Called when the remote peer has sent an EOF on the socket. This is a graceful\r\n     * close of their writing side, we can still send and they will receive, if it\r\n     * makes sense at the application level.\r\n     * @param[in] id Connection whose socket got EOF.\r\n     */\r\n    virtual void EventGotEOF(Id id) = 0;\r\n\r\n    /**\r\n     * Called when we get an irrecoverable error trying to read from a socket.\r\n     * @param[in] id Connection whose socket got an error.\r\n     * @param[in] errmsg Message describing the error.\r\n     */\r\n    virtual void EventGotPermanentReadError(Id id, const std::string& errmsg) = 0;\r\n};\r\n```\r\n\r\nResolves: https://github.com/bitcoin/bitcoin/issues/30694\r\n\r\n---\r\n\r\nReview hint: this PR moves some code around, so reviewers may find this helpful: `git show --color-moved --color-moved-ws=allow-indentation-change`.",
     "labels": [],
     "created_at": "2024-09-27T07:57:10Z",
-    "updated_at": "2025-06-12T14:31:52Z",
+    "updated_at": "2025-06-13T09:42:04Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "ad03db6366c92c406268f911dd1863af724764da",
+    "merge_commit_sha": "a2883febbe71368e2115a74468127c9a19792ef3",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -172,8 +172,8 @@
         "homepage": "https://bitcoin.org/en/download",
         "language": "C++",
         "forks_count": 1,
-        "stargazers_count": 6,
-        "watchers_count": 6,
+        "stargazers_count": 7,
+        "watchers_count": 7,
         "size": 258369,
         "default_branch": "master",
         "open_issues_count": 2,
@@ -189,7 +189,7 @@
         "visibility": "public",
         "pushed_at": "2025-06-11T15:09:03Z",
         "created_at": "2018-02-07T11:52:47Z",
-        "updated_at": "2025-06-11T14:42:17Z",
+        "updated_at": "2025-06-13T05:21:35Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -306,12 +306,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37354,
-        "stargazers_count": 84109,
-        "watchers_count": 84109,
-        "size": 283877,
+        "forks_count": 37364,
+        "stargazers_count": 84121,
+        "watchers_count": 84121,
+        "size": 283834,
         "default_branch": "master",
-        "open_issues_count": 750,
+        "open_issues_count": 754,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -328,9 +328,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-06-11T22:08:35Z",
+        "pushed_at": "2025-06-13T08:37:44Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-06-12T12:55:43Z",
+        "updated_at": "2025-06-13T08:37:58Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -360,7 +360,7 @@
     "deletions": 732,
     "changed_files": 20,
     "commits": 17,
-    "review_comments": 171,
+    "review_comments": 172,
     "comments": 47
   },
   "events": [
@@ -6850,6 +6850,42 @@
         "name": "CI failed",
         "color": "cccccc"
       }
+    },
+    {
+      "event": "reviewed",
+      "id": 2924089877,
+      "node_id": "PRR_kwDOABII586uShIV",
+      "url": null,
+      "actor": null,
+      "commit_id": "a8fcd8385e1ca382378ef0450c742ec714f67e99",
+      "commit_url": null,
+      "created_at": null,
+      "author_association": "CONTRIBUTOR",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2924089877",
+      "submitted_at": "2025-06-13T09:42:04Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
     }
   ],
   "comments": [
@@ -15861,6 +15897,59 @@
       "start_side": null,
       "line": 236,
       "original_line": 236,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2144631899",
+      "pull_request_review_id": 2924089877,
+      "id": 2144631899,
+      "node_id": "PRRC_kwDOABII585_1Hxb",
+      "diff_hunk": "@@ -0,0 +1,463 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://opensource.org/license/mit/.\n+\n+#ifndef BITCOIN_COMMON_SOCKMAN_H\n+#define BITCOIN_COMMON_SOCKMAN_H\n+\n+#include <i2p.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <util/fs.h>\n+#include <util/sock.h>\n+#include <util/translation.h>\n+\n+#include <atomic>\n+#include <memory>\n+#include <optional>\n+#include <queue>\n+#include <span>\n+#include <thread>\n+#include <variant>\n+#include <vector>\n+\n+/**\n+ * A socket manager class which handles socket operations.\n+ * To use this class, inherit from it and implement the pure virtual methods.\n+ * Handled operations:\n+ * - binding and listening on sockets\n+ * - starting of necessary threads to process socket operations\n+ * - accepting incoming connections\n+ * - making outbound connections\n+ * - closing connections\n+ * - waiting for IO readiness on sockets and doing send/recv accordingly\n+ */\n+class SockMan\n+{\n+public:\n+    /**\n+     * Each connection is assigned an unique id of this type.\n+     */\n+    using Id = int64_t;\n+\n+    /**\n+     * Possible status changes that can be passed to `EventI2PStatus()`.\n+     */\n+    enum class I2PStatus : uint8_t {\n+        /// The listen succeeded and we are now listening for incoming I2P connections.\n+        START_LISTENING,\n+\n+        /// The listen failed and now we are not listening (even if START_LISTENING was signaled before).\n+        STOP_LISTENING,\n+    };\n+\n+    virtual ~SockMan() = default;\n+\n+    //\n+    // Non-virtual functions, to be reused by children classes.\n+    //\n+\n+    /**\n+     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\n+     * Should be called before `StartSocketsThreads()`.\n+     * @param[in] to Where to bind.\n+     * @param[out] err_msg Error string if an error occurs.\n+     * @retval true Success.\n+     * @retval false Failure, `err_msg` will be set.\n+     */\n+    bool BindAndStartListening(const CService& to, bilingual_str& err_msg);\n+\n+    /**\n+     * Options to influence `StartSocketsThreads()`.\n+     */\n+    struct Options {\n+        std::string_view socket_handler_thread_name;\n+\n+        struct I2P {\n+            explicit I2P(const fs::path& file, const Proxy& proxy, std::string_view accept_thread_name)\n+                : private_key_file{file},\n+                  sam_proxy{proxy},\n+                  accept_thread_name{accept_thread_name}\n+            {}\n+\n+            const fs::path private_key_file;\n+            const Proxy sam_proxy;\n+            const std::string_view accept_thread_name;\n+        };\n+\n+        /**\n+         * I2P options. If set then a thread will be started that will accept incoming I2P connections.\n+         */\n+        std::optional<I2P> i2p;\n+    };\n+\n+    /**\n+     * Start the necessary threads for sockets IO.\n+     */\n+    void StartSocketsThreads(const Options& options);\n+\n+    /**\n+     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\n+     */\n+    void JoinSocketsThreads();\n+\n+    /**\n+     * A more readable std::tuple<std::string, uint16_t> for host and port.\n+     */\n+    struct StringHostIntPort {\n+        const std::string& host;\n+        uint16_t port;\n+    };\n+\n+    /**\n+     * Make an outbound connection, save the socket internally and return a newly generated connection id.\n+     * @param[in] to The address to connect to, either as CService or a host as string and port as\n+     * an integer, if the later is used, then `proxy` must be valid.\n+     * @param[in] is_important If true, then log failures with higher severity.\n+     * @param[in] proxy Proxy to connect through, if set.\n+     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\n+     * proxy, then it will be set to true.\n+     * @param[out] me If the connection was successful then this is set to the address on the\n+     * local side of the socket.\n+     * @return Newly generated id, or std::nullopt if the operation fails.\n+     */\n+    std::optional<SockMan::Id> ConnectAndMakeId(const std::variant<CService, StringHostIntPort>& to,\n+                                                bool is_important,\n+                                                std::optional<Proxy> proxy,\n+                                                bool& proxy_failed,\n+                                                CService& me)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex, !m_unused_i2p_sessions_mutex);\n+\n+    /**\n+     * Destroy a given connection by closing its socket and release resources occupied by it.\n+     * @param[in] id Connection to destroy.\n+     * @return Whether the connection existed and its socket was closed by this call.\n+     */\n+    bool CloseConnection(Id id)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Try to send some data over the given connection.\n+     * @param[in] id Identifier of the connection.\n+     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\n+     * @param[in] will_send_more Used as an optimization if the caller knows that they will\n+     * be sending more data soon after this call.\n+     * @param[out] errmsg If <0 is returned then this will contain a human readable message\n+     * explaining the error.\n+     * @retval >=0 The number of bytes actually sent.\n+     * @retval <0 A permanent error has occurred.\n+     */\n+    ssize_t SendBytes(Id id,\n+                      std::span<const unsigned char> data,\n+                      bool will_send_more,\n+                      std::string& errmsg) const\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Stop listening by closing all listening sockets.\n+     */\n+    void StopListening();\n+\n+    /**\n+     * This is signaled when network activity should cease.\n+     * A pointer to it is saved in `m_i2p_sam_session`, so make sure that\n+     * the lifetime of `interruptNet` is not shorter than\n+     * the lifetime of `m_i2p_sam_session`.\n+     */\n+    CThreadInterrupt interruptNet;\n+\n+protected:\n+\n+    /**\n+     * During some tests mocked sockets are created outside of `SockMan`, make it\n+     * possible to add those so that send/recv can be exercised.\n+     * @param[in] id Connection id to add.\n+     * @param[in,out] sock Socket to associate with the added connection.\n+     */\n+    void TestOnlyAddExistentConnection(Id id, std::unique_ptr<Sock>&& sock)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+private:\n+\n+    /**\n+     * Cap on the size of `m_unused_i2p_sessions`, to ensure it does not\n+     * unexpectedly use too much memory.\n+     */\n+    static constexpr size_t MAX_UNUSED_I2P_SESSIONS_SIZE{10};\n+\n+    //\n+    // Pure virtual functions must be implemented by children classes.\n+    //\n+\n+    /**\n+     * Be notified when a new connection has been accepted.\n+     * @param[in] id Id of the newly accepted connection.\n+     * @param[in] me The address and port at our side of the connection.\n+     * @param[in] them The address and port at the peer's side of the connection.\n+     * @retval true The new connection was accepted at the higher level.\n+     * @retval false The connection was refused at the higher level, so the\n+     * associated socket and id should be discarded by `SockMan`.\n+     */\n+    virtual bool EventNewConnectionAccepted(Id id,\n+                                            const CService& me,\n+                                            const CService& them) = 0;\n+\n+    /**\n+     * Called when the socket is ready to send data and `ShouldTryToSend()` has\n+     * returned true. This is where the higher level code serializes its messages\n+     * and calls `SockMan::SendBytes()`.\n+     * @param[in] id Id of the connection whose socket is ready to send.\n+     * @param[out] cancel_recv Should always be set upon return and if it is true,\n+     * then the next attempt to receive data from that connection will be omitted.\n+     */\n+    virtual void EventReadyToSend(Id id, bool& cancel_recv) = 0;\n+\n+    /**\n+     * Called when new data has been received.\n+     * @param[in] id Connection for which the data arrived.\n+     * @param[in] data Received data.\n+     */\n+    virtual void EventGotData(Id id, std::span<const uint8_t> data) = 0;\n+\n+    /**\n+     * Called when the remote peer has sent an EOF on the socket. This is a graceful\n+     * close of their writing side, we can still send and they will receive, if it\n+     * makes sense at the application level.\n+     * @param[in] id Connection whose socket got EOF.\n+     */\n+    virtual void EventGotEOF(Id id) = 0;\n+\n+    /**\n+     * Called when we get an irrecoverable error trying to read from a socket.\n+     * @param[in] id Connection whose socket got an error.\n+     * @param[in] errmsg Message describing the error.\n+     */\n+    virtual void EventGotPermanentReadError(Id id, const std::string& errmsg) = 0;\n+\n+    //\n+    // Non-pure virtual functions can be overridden by children classes or left\n+    // alone to use the default implementation from SockMan.\n+    //\n+\n+    /**\n+     * Can be used to temporarily pause sends on a connection.\n+     * SockMan would only call EventReadyToSend() if this returns true.\n+     * The implementation in SockMan always returns true.\n+     * @param[in] id Connection for which to confirm or omit the next call to EventReadyToSend().\n+     */\n+    virtual bool ShouldTryToSend(Id id) const;\n+\n+    /**\n+     * SockMan would only call Recv() on a connection's socket if this returns true.\n+     * Can be used to temporarily pause receives on a connection.\n+     * The implementation in SockMan always returns true.\n+     * @param[in] id Connection for which to confirm or omit the next receive.\n+     */\n+    virtual bool ShouldTryToRecv(Id id) const;\n+\n+    /**\n+     * SockMan has completed the current send+recv iteration for a given connection.\n+     * It will do another send+recv for this connection after processing all other connections.\n+     * Can be used to execute periodic tasks for a given connection.\n+     * The implementation in SockMan does nothing.\n+     * @param[in] id Connection for which send+recv has been done.\n+     */\n+    virtual void EventIOLoopCompletedForOne(Id id);\n+\n+    /**\n+     * SockMan has completed send+recv for all connections.\n+     * Can be used to execute periodic tasks for all connections, like closing\n+     * connections due to higher level logic.\n+     * The implementation in SockMan does nothing.\n+     */\n+    virtual void EventIOLoopCompletedForAll();\n+\n+    /**\n+     * Be notified of a change in the state of the I2P connectivity.\n+     * The default behavior, implemented by `SockMan`, is to ignore this event.\n+     * @param[in] addr The address we started or stopped listening on.\n+     * @param[in] new_status New status.\n+     */\n+    virtual void EventI2PStatus(const CService& addr, I2PStatus new_status);\n+\n+    /**\n+     * The sockets used by a connection - a data socket and an optional I2P session socket.\n+     */\n+    struct ConnectionSockets {\n+        explicit ConnectionSockets(std::unique_ptr<Sock>&& s)\n+            : sock{std::move(s)}\n+        {\n+        }\n+\n+        explicit ConnectionSockets(std::shared_ptr<Sock>&& s, std::unique_ptr<i2p::sam::Session>&& sess)\n+            : sock{std::move(s)},\n+              i2p_transient_session{std::move(sess)}\n+        {\n+        }\n+\n+        /**\n+         * Mutex that serializes the Send() and Recv() calls on `sock`.\n+         */\n+        Mutex mutex;\n+\n+        /**\n+         * Underlying socket.\n+         * `shared_ptr` (instead of `unique_ptr`) is used to avoid premature close of the\n+         * underlying file descriptor by one thread while another thread is poll(2)-ing\n+         * it for activity.\n+         * @see https://github.com/bitcoin/bitcoin/issues/21744 for details.\n+         */\n+        std::shared_ptr<Sock> sock;\n+\n+        /**\n+         * When transient I2P sessions are used, then each connection has its own session, otherwise\n+         * all connections use the session from `m_i2p_sam_session` and share the same I2P address.\n+         * I2P sessions involve a data/transport socket (in `sock`) and a control socket\n+         * (in `i2p_transient_session`). For transient sessions, once the data socket `sock` is\n+         * closed, the control socket is not going to be used anymore and would be just taking\n+         * resources. Storing it here makes its deletion together with `sock` automatic.\n+         */\n+        std::unique_ptr<i2p::sam::Session> i2p_transient_session;\n+    };\n+\n+    /**\n+     * Info about which socket has which event ready and its connection id.\n+     */\n+    struct IOReadiness {\n+        /**\n+         * Map of socket -> socket events. For example:\n+         * socket1 -> { requested = SEND|RECV, occurred = RECV }\n+         * socket2 -> { requested = SEND, occurred = SEND }\n+         */\n+        Sock::EventsPerSock events_per_sock;\n+\n+        /**\n+         * Map of socket -> connection id (in `m_connected`). For example\n+         * socket1 -> id=23\n+         * socket2 -> id=56\n+         */\n+        std::unordered_map<Sock::EventsPerSock::key_type,\n+                           SockMan::Id,\n+                           Sock::HashSharedPtrSock,\n+                           Sock::EqualSharedPtrSock>\n+            ids_per_sock;\n+    };\n+\n+    /**\n+     * Accept incoming I2P connections in a loop and call\n+     * `EventNewConnectionAccepted()` for each new connection.\n+     */\n+    void ThreadI2PAccept()\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Check connected and listening sockets for IO readiness and process them accordingly.\n+     */\n+    void ThreadSocketHandler()\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Accept a connection.\n+     * @param[in] listen_sock Socket on which to accept the connection.\n+     * @param[out] addr Address of the peer that was accepted.\n+     * @return Newly created socket for the accepted connection.\n+     */\n+    std::unique_ptr<Sock> AcceptConnection(const Sock& listen_sock, CService& addr);\n+\n+    /**\n+     * After a new socket with a peer has been created, configure its flags,\n+     * make a new connection id and call `EventNewConnectionAccepted()`.\n+     * @param[in] sock The newly created socket.\n+     * @param[in] me Address at our end of the connection.\n+     * @param[in] them Address of the new peer.\n+     */\n+    void NewSockAccepted(std::unique_ptr<Sock>&& sock, const CService& me, const CService& them)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Generate an id for a newly created connection.\n+     */\n+    Id GetNewId();\n+\n+    /**\n+     * Generate a collection of sockets to check for IO readiness.\n+     * @return Sockets to check for readiness plus an aux map to find the\n+     * corresponding connection id given a socket.\n+     */\n+    IOReadiness GenerateWaitSockets()\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Do the read/write for connected sockets that are ready for IO.\n+     * @param[in] io_readiness Which sockets are ready and their connection ids.\n+     */\n+    void SocketHandlerConnected(const IOReadiness& io_readiness)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Accept incoming connections, one from each read-ready listening socket.\n+     * @param[in] events_per_sock Sockets that are ready for IO.\n+     */\n+    void SocketHandlerListening(const Sock::EventsPerSock& events_per_sock)\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * Retrieve an entry from m_connected.\n+     * @param[in] id Connection id to search for.\n+     * @return ConnectionSockets for the given connection id or empty shared_ptr if not found.\n+     */\n+    std::shared_ptr<ConnectionSockets> GetConnectionSockets(Id id) const\n+        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\n+\n+    /**\n+     * The id to assign to the next created connection. Used to generate ids of connections.\n+     */\n+    std::atomic<Id> m_next_id{0};\n+\n+    /**\n+     * Thread that sends to and receives from sockets and accepts connections.\n+     */\n+    std::thread m_thread_socket_handler;\n+\n+    /**\n+     * Thread that accepts incoming I2P connections in a loop, can be stopped via `interruptNet`.\n+     */\n+    std::thread m_thread_i2p_accept;\n+\n+    /**\n+     * Mutex protecting m_i2p_sam_sessions.",
+      "path": "src/common/sockman.h",
+      "position": 428,
+      "original_position": 428,
+      "commit_id": "a8fcd8385e1ca382378ef0450c742ec714f67e99",
+      "original_commit_id": "a8fcd8385e1ca382378ef0450c742ec714f67e99",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "\r\n    Mutex protecting m_i2p_sam_sessions. -> Mutex protecting m_unused_i2p_sessions. [The mutex m_unused_i2p_sessions_mutex protects m_unused_i2p_sessions, not m_i2p_sam_session.]\r\n",
+      "created_at": "2025-06-13T09:42:04Z",
+      "updated_at": "2025-06-13T09:42:04Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#discussion_r2144631899",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2144631899"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30988"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 428,
+      "original_line": 428,
       "side": "RIGHT"
     }
   ]
