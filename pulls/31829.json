@@ -87,7 +87,7 @@
       "updated_at": "2025-06-26T13:21:14Z"
     },
     "created_at": "2025-02-09T21:14:45Z",
-    "updated_at": "2025-06-26T19:28:56Z",
+    "updated_at": "2025-06-26T20:38:43Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -372,7 +372,7 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37419,
+        "forks_count": 37421,
         "stargazers_count": 84318,
         "watchers_count": 84318,
         "size": 284456,
@@ -426,7 +426,7 @@
     "deletions": 878,
     "changed_files": 22,
     "commits": 18,
-    "review_comments": 344,
+    "review_comments": 346,
     "comments": 42
   },
   "events": [
@@ -25419,6 +25419,112 @@
       "start_side": null,
       "line": 358,
       "original_line": 359,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2169883496",
+      "pull_request_review_id": 2963444939,
+      "id": 2169883496,
+      "node_id": "PRRC_kwDOABII586BVcto",
+      "diff_hunk": "@@ -83,373 +177,481 @@ class TxOrphanageImpl final : public TxOrphanage {\n     void AddChildrenToWorkSet(const CTransaction& tx, FastRandomContext& rng) override;\n     bool HaveTxToReconsider(NodeId peer) override;\n     std::vector<CTransactionRef> GetChildrenFromSamePeer(const CTransactionRef& parent, NodeId nodeid) const override;\n-    size_t Size() const override { return m_orphans.size(); }\n+    size_t Size() const override { return m_unique_orphans; }\n     std::vector<OrphanTxBase> GetOrphanTransactions() const override;\n-    int64_t TotalOrphanUsage() const override { return m_total_orphan_usage; }\n-    int64_t UsageByPeer(NodeId peer) const override;\n+    TxOrphanage::Usage TotalOrphanUsage() const override;\n     void SanityCheck() const override;\n };\n \n-bool TxOrphanageImpl::AddTx(const CTransactionRef& tx, NodeId peer)\n+template<typename Tag>\n+void TxOrphanageImpl::Erase(Iter<Tag> it)\n {\n-    const Txid& hash = tx->GetHash();\n-    const Wtxid& wtxid = tx->GetWitnessHash();\n-    if (auto it{m_orphans.find(wtxid)}; it != m_orphans.end()) {\n-        AddAnnouncer(wtxid, peer);\n-        // No new orphan entry was created. An announcer may have been added.\n-        return false;\n+    // Update m_peer_orphanage_info and clean up entries if they point to an empty struct.\n+    // This means peers that are not storing any orphans do not have an entry in\n+    // m_peer_orphanage_info (they can be added back later if they announce another orphan) and\n+    // ensures disconnected peers are not tracked forever.\n+    auto peer_it = m_peer_orphanage_info.find(it->m_announcer);\n+    Assume(peer_it != m_peer_orphanage_info.end());\n+    if (peer_it->second.Subtract(*it)) m_peer_orphanage_info.erase(peer_it);\n+\n+    if (IsUnique(m_orphans.project<ByWtxid>(it))) {\n+        m_unique_orphans -= 1;\n+        m_unique_orphan_bytes -= it->GetUsage();\n+\n+        // Remove references in m_outpoint_to_orphan_it\n+        const auto& wtxid{it->m_tx->GetWitnessHash()};\n+        for (const auto& input : it->m_tx->vin) {\n+            auto it_prev = m_outpoint_to_orphan_it.find(input.prevout);\n+            if (it_prev != m_outpoint_to_orphan_it.end()) {\n+                it_prev->second.erase(wtxid);\n+                // Clean up keys if they point to an empty set.\n+                if (it_prev->second.empty()) {\n+                    m_outpoint_to_orphan_it.erase(it_prev);\n+                }\n+            }\n+        }\n     }\n+    m_orphans.get<Tag>().erase(it);\n+}\n \n-    // Ignore big transactions, to avoid a\n-    // send-big-orphans memory exhaustion attack. If a peer has a legitimate\n-    // large transaction with a missing parent then we assume\n-    // it will rebroadcast it later, after the parent transaction(s)\n-    // have been mined or received.\n-    // 100 orphans, each of which is at most 100,000 bytes big is\n-    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):\n-    unsigned int sz = GetTransactionWeight(*tx);\n-    if (sz > MAX_STANDARD_TX_WEIGHT)\n-    {\n-        LogDebug(BCLog::TXPACKAGES, \"ignoring large orphan tx (size: %u, txid: %s, wtxid: %s)\\n\", sz, hash.ToString(), wtxid.ToString());\n+bool TxOrphanageImpl::IsUnique(Iter<ByWtxid> it) const\n+{\n+    // Iterators ByWtxid are sorted by wtxid, so check if neighboring elements have the same wtxid.\n+    auto& index = m_orphans.get<ByWtxid>();\n+    if (it == index.end()) return false;\n+    if (std::next(it) != index.end() && std::next(it)->m_tx->GetWitnessHash() == it->m_tx->GetWitnessHash()) return false;\n+    if (it != index.begin() && std::prev(it)->m_tx->GetWitnessHash() == it->m_tx->GetWitnessHash()) return false;\n+    return true;\n+}\n+\n+TxOrphanage::Usage TxOrphanageImpl::UsageByPeer(NodeId peer) const\n+{\n+    auto it = m_peer_orphanage_info.find(peer);\n+    return it == m_peer_orphanage_info.end() ? 0 : it->second.m_total_usage;\n+}\n+\n+/** Number of announcements. Ones for the same wtxid are not de-duplicated, use CountUniqueOrphans() instead. */\n+TxOrphanage::Count TxOrphanageImpl::CountAnnouncements() const { return m_orphans.size(); }\n+\n+/** Total number of bytes used by orphans, de-duplicated by wtxid. */\n+TxOrphanage::Usage TxOrphanageImpl::TotalOrphanUsage() const { return m_unique_orphan_bytes; }\n+\n+/** Number of unique orphans. */\n+TxOrphanage::Count TxOrphanageImpl::CountUniqueOrphans() const { return m_unique_orphans; }\n+\n+/** Number of orphans stored from this peer. */\n+TxOrphanage::Count TxOrphanageImpl::AnnouncementsFromPeer(NodeId peer) const {\n+    auto it = m_peer_orphanage_info.find(peer);\n+    return it == m_peer_orphanage_info.end() ? 0 : it->second.m_count_announcements;\n+}\n+\n+bool TxOrphanageImpl::AddTx(const CTransactionRef& tx, NodeId peer)\n+{\n+    const auto& wtxid{tx->GetWitnessHash()};\n+    const auto& txid{tx->GetHash()};\n+\n+    // Ignore transactions above max standard size to avoid a send-big-orphans memory exhaustion attack.\n+    TxOrphanage::Usage sz = GetTransactionWeight(*tx);\n+    if (sz > MAX_STANDARD_TX_WEIGHT) {\n+        LogDebug(BCLog::TXPACKAGES, \"ignoring large orphan tx (size: %u, txid: %s, wtxid: %s)\\n\", sz, txid.ToString(), wtxid.ToString());\n         return false;\n     }\n \n-    auto ret = m_orphans.emplace(wtxid, OrphanTx{{tx, {peer}}, Now<NodeSeconds>() + ORPHAN_TX_EXPIRE_TIME, m_orphan_list.size()});\n-    assert(ret.second);\n-    m_orphan_list.push_back(ret.first);\n-    for (const CTxIn& txin : tx->vin) {\n-        m_outpoint_to_orphan_it[txin.prevout].insert(ret.first);\n-    }\n-    m_total_orphan_usage += sz;\n-    m_total_announcements += 1;\n+    // We will return false if the tx already exists under a different peer.\n+    const bool brand_new{!HaveTx(wtxid)};\n+\n+    auto ret = m_orphans.get<ByWtxid>().emplace(tx, peer, m_current_sequence);\n+    // If the announcement (same wtxid, same peer) already exists, emplacement fails. Return false.\n+    if (!ret.second) return false;\n+\n+    ++m_current_sequence;\n     auto& peer_info = m_peer_orphanage_info.try_emplace(peer).first->second;\n-    peer_info.m_total_usage += sz;\n+    peer_info.Add(*ret.first);\n \n-    LogDebug(BCLog::TXPACKAGES, \"stored orphan tx %s (wtxid=%s), weight: %u (mapsz %u outsz %u)\\n\", hash.ToString(), wtxid.ToString(), sz,\n-             m_orphans.size(), m_outpoint_to_orphan_it.size());\n-    return true;\n+    // Add links in m_outpoint_to_orphan_it\n+    if (brand_new) {\n+        for (const auto& input : tx->vin) {\n+            auto& wtxids_for_prevout = m_outpoint_to_orphan_it.try_emplace(input.prevout).first->second;\n+            wtxids_for_prevout.emplace(wtxid);\n+        }\n+\n+        m_unique_orphans += 1;\n+        m_unique_orphan_bytes += ret.first->GetUsage();\n+\n+        LogDebug(BCLog::TXPACKAGES, \"stored orphan tx %s (wtxid=%s), weight: %u (mapsz %u outsz %u)\\n\",\n+                    txid.ToString(), wtxid.ToString(), sz, m_orphans.size(), m_outpoint_to_orphan_it.size());\n+        Assume(IsUnique(ret.first));\n+    } else {\n+        LogDebug(BCLog::TXPACKAGES, \"added peer=%d as announcer of orphan tx %s (wtxid=%s)\\n\",\n+                    peer, txid.ToString(), wtxid.ToString());\n+        Assume(!IsUnique(ret.first));\n+    }\n+    return brand_new;\n }\n \n bool TxOrphanageImpl::AddAnnouncer(const Wtxid& wtxid, NodeId peer)",
+      "path": "src/node/txorphanage.cpp",
+      "position": 291,
+      "original_position": 356,
+      "commit_id": "4020d4b6e08255c3c9e4a76069c1170aa381ef1f",
+      "original_commit_id": "5992831c920f3c0c2cd28a355910bb0c00e0f888",
+      "in_reply_to_id": 2169508690,
+      "user": {
+        "login": "instagibbs",
+        "id": 5767891,
+        "node_id": "MDQ6VXNlcjU3Njc4OTE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5767891?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/instagibbs",
+        "html_url": "https://github.com/instagibbs",
+        "followers_url": "https://api.github.com/users/instagibbs/followers",
+        "following_url": "https://api.github.com/users/instagibbs/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/instagibbs/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/instagibbs/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/instagibbs/subscriptions",
+        "organizations_url": "https://api.github.com/users/instagibbs/orgs",
+        "repos_url": "https://api.github.com/users/instagibbs/repos",
+        "events_url": "https://api.github.com/users/instagibbs/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/instagibbs/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Is exposing LimitOrphans even worth it vs calling it internally when we add a tx/announcement?",
+      "created_at": "2025-06-26T20:04:41Z",
+      "updated_at": "2025-06-26T20:04:42Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#discussion_r2169883496",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2169883496"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 291,
+      "original_line": 292,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2169961484",
+      "pull_request_review_id": 2963569318,
+      "id": 2169961484,
+      "node_id": "PRRC_kwDOABII586BVvwM",
+      "diff_hunk": "@@ -83,373 +177,481 @@ class TxOrphanageImpl final : public TxOrphanage {\n     void AddChildrenToWorkSet(const CTransaction& tx, FastRandomContext& rng) override;\n     bool HaveTxToReconsider(NodeId peer) override;\n     std::vector<CTransactionRef> GetChildrenFromSamePeer(const CTransactionRef& parent, NodeId nodeid) const override;\n-    size_t Size() const override { return m_orphans.size(); }\n+    size_t Size() const override { return m_unique_orphans; }\n     std::vector<OrphanTxBase> GetOrphanTransactions() const override;\n-    int64_t TotalOrphanUsage() const override { return m_total_orphan_usage; }\n-    int64_t UsageByPeer(NodeId peer) const override;\n+    TxOrphanage::Usage TotalOrphanUsage() const override;\n     void SanityCheck() const override;\n };\n \n-bool TxOrphanageImpl::AddTx(const CTransactionRef& tx, NodeId peer)\n+template<typename Tag>\n+void TxOrphanageImpl::Erase(Iter<Tag> it)\n {\n-    const Txid& hash = tx->GetHash();\n-    const Wtxid& wtxid = tx->GetWitnessHash();\n-    if (auto it{m_orphans.find(wtxid)}; it != m_orphans.end()) {\n-        AddAnnouncer(wtxid, peer);\n-        // No new orphan entry was created. An announcer may have been added.\n-        return false;\n+    // Update m_peer_orphanage_info and clean up entries if they point to an empty struct.\n+    // This means peers that are not storing any orphans do not have an entry in\n+    // m_peer_orphanage_info (they can be added back later if they announce another orphan) and\n+    // ensures disconnected peers are not tracked forever.\n+    auto peer_it = m_peer_orphanage_info.find(it->m_announcer);\n+    Assume(peer_it != m_peer_orphanage_info.end());\n+    if (peer_it->second.Subtract(*it)) m_peer_orphanage_info.erase(peer_it);\n+\n+    if (IsUnique(m_orphans.project<ByWtxid>(it))) {\n+        m_unique_orphans -= 1;\n+        m_unique_orphan_bytes -= it->GetUsage();\n+\n+        // Remove references in m_outpoint_to_orphan_it\n+        const auto& wtxid{it->m_tx->GetWitnessHash()};\n+        for (const auto& input : it->m_tx->vin) {\n+            auto it_prev = m_outpoint_to_orphan_it.find(input.prevout);\n+            if (it_prev != m_outpoint_to_orphan_it.end()) {\n+                it_prev->second.erase(wtxid);\n+                // Clean up keys if they point to an empty set.\n+                if (it_prev->second.empty()) {\n+                    m_outpoint_to_orphan_it.erase(it_prev);\n+                }\n+            }\n+        }\n     }\n+    m_orphans.get<Tag>().erase(it);\n+}\n \n-    // Ignore big transactions, to avoid a\n-    // send-big-orphans memory exhaustion attack. If a peer has a legitimate\n-    // large transaction with a missing parent then we assume\n-    // it will rebroadcast it later, after the parent transaction(s)\n-    // have been mined or received.\n-    // 100 orphans, each of which is at most 100,000 bytes big is\n-    // at most 10 megabytes of orphans and somewhat more byprev index (in the worst case):\n-    unsigned int sz = GetTransactionWeight(*tx);\n-    if (sz > MAX_STANDARD_TX_WEIGHT)\n-    {\n-        LogDebug(BCLog::TXPACKAGES, \"ignoring large orphan tx (size: %u, txid: %s, wtxid: %s)\\n\", sz, hash.ToString(), wtxid.ToString());\n+bool TxOrphanageImpl::IsUnique(Iter<ByWtxid> it) const\n+{\n+    // Iterators ByWtxid are sorted by wtxid, so check if neighboring elements have the same wtxid.\n+    auto& index = m_orphans.get<ByWtxid>();\n+    if (it == index.end()) return false;\n+    if (std::next(it) != index.end() && std::next(it)->m_tx->GetWitnessHash() == it->m_tx->GetWitnessHash()) return false;\n+    if (it != index.begin() && std::prev(it)->m_tx->GetWitnessHash() == it->m_tx->GetWitnessHash()) return false;\n+    return true;\n+}\n+\n+TxOrphanage::Usage TxOrphanageImpl::UsageByPeer(NodeId peer) const\n+{\n+    auto it = m_peer_orphanage_info.find(peer);\n+    return it == m_peer_orphanage_info.end() ? 0 : it->second.m_total_usage;\n+}\n+\n+/** Number of announcements. Ones for the same wtxid are not de-duplicated, use CountUniqueOrphans() instead. */\n+TxOrphanage::Count TxOrphanageImpl::CountAnnouncements() const { return m_orphans.size(); }\n+\n+/** Total number of bytes used by orphans, de-duplicated by wtxid. */\n+TxOrphanage::Usage TxOrphanageImpl::TotalOrphanUsage() const { return m_unique_orphan_bytes; }\n+\n+/** Number of unique orphans. */\n+TxOrphanage::Count TxOrphanageImpl::CountUniqueOrphans() const { return m_unique_orphans; }\n+\n+/** Number of orphans stored from this peer. */\n+TxOrphanage::Count TxOrphanageImpl::AnnouncementsFromPeer(NodeId peer) const {\n+    auto it = m_peer_orphanage_info.find(peer);\n+    return it == m_peer_orphanage_info.end() ? 0 : it->second.m_count_announcements;\n+}\n+\n+bool TxOrphanageImpl::AddTx(const CTransactionRef& tx, NodeId peer)\n+{\n+    const auto& wtxid{tx->GetWitnessHash()};\n+    const auto& txid{tx->GetHash()};\n+\n+    // Ignore transactions above max standard size to avoid a send-big-orphans memory exhaustion attack.\n+    TxOrphanage::Usage sz = GetTransactionWeight(*tx);\n+    if (sz > MAX_STANDARD_TX_WEIGHT) {\n+        LogDebug(BCLog::TXPACKAGES, \"ignoring large orphan tx (size: %u, txid: %s, wtxid: %s)\\n\", sz, txid.ToString(), wtxid.ToString());\n         return false;\n     }\n \n-    auto ret = m_orphans.emplace(wtxid, OrphanTx{{tx, {peer}}, Now<NodeSeconds>() + ORPHAN_TX_EXPIRE_TIME, m_orphan_list.size()});\n-    assert(ret.second);\n-    m_orphan_list.push_back(ret.first);\n-    for (const CTxIn& txin : tx->vin) {\n-        m_outpoint_to_orphan_it[txin.prevout].insert(ret.first);\n-    }\n-    m_total_orphan_usage += sz;\n-    m_total_announcements += 1;\n+    // We will return false if the tx already exists under a different peer.\n+    const bool brand_new{!HaveTx(wtxid)};\n+\n+    auto ret = m_orphans.get<ByWtxid>().emplace(tx, peer, m_current_sequence);\n+    // If the announcement (same wtxid, same peer) already exists, emplacement fails. Return false.\n+    if (!ret.second) return false;\n+\n+    ++m_current_sequence;\n     auto& peer_info = m_peer_orphanage_info.try_emplace(peer).first->second;\n-    peer_info.m_total_usage += sz;\n+    peer_info.Add(*ret.first);\n \n-    LogDebug(BCLog::TXPACKAGES, \"stored orphan tx %s (wtxid=%s), weight: %u (mapsz %u outsz %u)\\n\", hash.ToString(), wtxid.ToString(), sz,\n-             m_orphans.size(), m_outpoint_to_orphan_it.size());\n-    return true;\n+    // Add links in m_outpoint_to_orphan_it\n+    if (brand_new) {\n+        for (const auto& input : tx->vin) {\n+            auto& wtxids_for_prevout = m_outpoint_to_orphan_it.try_emplace(input.prevout).first->second;\n+            wtxids_for_prevout.emplace(wtxid);\n+        }\n+\n+        m_unique_orphans += 1;\n+        m_unique_orphan_bytes += ret.first->GetUsage();\n+\n+        LogDebug(BCLog::TXPACKAGES, \"stored orphan tx %s (wtxid=%s), weight: %u (mapsz %u outsz %u)\\n\",\n+                    txid.ToString(), wtxid.ToString(), sz, m_orphans.size(), m_outpoint_to_orphan_it.size());\n+        Assume(IsUnique(ret.first));\n+    } else {\n+        LogDebug(BCLog::TXPACKAGES, \"added peer=%d as announcer of orphan tx %s (wtxid=%s)\\n\",\n+                    peer, txid.ToString(), wtxid.ToString());\n+        Assume(!IsUnique(ret.first));\n+    }\n+    return brand_new;\n }\n \n bool TxOrphanageImpl::AddAnnouncer(const Wtxid& wtxid, NodeId peer)",
+      "path": "src/node/txorphanage.cpp",
+      "position": 291,
+      "original_position": 356,
+      "commit_id": "4020d4b6e08255c3c9e4a76069c1170aa381ef1f",
+      "original_commit_id": "5992831c920f3c0c2cd28a355910bb0c00e0f888",
+      "in_reply_to_id": 2169508690,
+      "user": {
+        "login": "mzumsande",
+        "id": 48763452,
+        "node_id": "MDQ6VXNlcjQ4NzYzNDUy",
+        "avatar_url": "https://avatars.githubusercontent.com/u/48763452?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/mzumsande",
+        "html_url": "https://github.com/mzumsande",
+        "followers_url": "https://api.github.com/users/mzumsande/followers",
+        "following_url": "https://api.github.com/users/mzumsande/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/mzumsande/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/mzumsande/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/mzumsande/subscriptions",
+        "organizations_url": "https://api.github.com/users/mzumsande/orgs",
+        "repos_url": "https://api.github.com/users/mzumsande/repos",
+        "events_url": "https://api.github.com/users/mzumsande/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/mzumsande/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Calling it just internally makes sense to me.",
+      "created_at": "2025-06-26T20:38:43Z",
+      "updated_at": "2025-06-26T20:38:43Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31829#discussion_r2169961484",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2169961484"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31829"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 291,
+      "original_line": 292,
       "side": "RIGHT"
     }
   ]
