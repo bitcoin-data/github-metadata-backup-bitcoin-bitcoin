@@ -42,11 +42,11 @@
     "body": "To improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- INV/TX --------> tx-recipient (if we take the last commit: fixup!)\r\ntx-sender <--- GETDATA/TX ----< tx-recipient (if we take the last commit: fixup!)\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to a few (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>How to test this?</summary>\r\n\r\nThank you, @stratospher and @andrewtoth!\r\n\r\nStart `bitcoind` with `-privatebroadcast=1 -debug=privatebroadcast`.\r\n\r\nCreate a wallet and get a new address, go to the Signet faucet and request some coins to that address:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" createwallet test\r\nbuild/bin/bitcoin-cli -chain=\"signet\" getnewaddress\r\n```\r\n\r\nGet a new address for the test transaction recipient:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" loadwallet test\r\nnew_address=$(build/bin/bitcoin-cli -chain=\"signet\" getnewaddress)\r\n```\r\n\r\nCreate the transaction:\r\n```bash\r\n# Option 1: `createrawtransaction` and `signrawtransactionwithwallet`:\r\n\r\ntxid=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .txid')\r\nvout=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .vout')\r\necho \"txid: $txid\"\r\necho \"vout: $vout\"\r\n\r\ntx=$(build/bin/bitcoin-cli -chain=\"signet\" createrawtransaction \"[{\\\"txid\\\": \\\"$txid\\\", \\\"vout\\\": $vout}]\" \"[{\\\"$new_address\\\": 0.00001000}]\" 0 false)\r\necho \"tx: $tx\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" signrawtransactionwithwallet \"$tx\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n\r\n# OR Option 2: `walletcreatefundedpsbt` and `walletprocesspsbt`:\r\n# This makes it not have to worry about inputs and also automatically sends back change to the wallet.\r\n# Start `bitcoind` with `-fallbackfee=0.00003000` for instance for 3 sat/vbyte fee.\r\n\r\npsbt=$(build/bin/bitcoin-cli -chain=\"signet\" walletcreatefundedpsbt \"[]\" \"[{\\\"$new_address\\\": 0.00001000}]\" | jq -r '.psbt')\r\necho \"psbt: $psbt\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" walletprocesspsbt \"$psbt\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n```\r\n\r\nFinally, send the transaction:\r\n```bash\r\nraw_tx=$(build/bin/bitcoin-cli -chain=\"signet\" sendrawtransaction \"$signed_tx\")\r\necho \"raw_tx: $raw_tx\"\r\n```\r\n\r\n</details>\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: support overriding the proxy selection in ConnectNode()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvement:\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n* Add an intermediate step that sends `INV` message and waits for a request for the transaction. If reviewers like this, then I will squash it into the relevant commit, or otherwise drop it:\r\n  * `fixup! net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n\r\n</details>\r\n\r\n---\r\n\r\n**This PR would close the following issues:**\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\nhttps://github.com/bitcoin/bitcoin/issues/32235 Tor: TX circuit isolation\r\n\r\n**Issues that are related, but (maybe?) not to be closed by this PR:**\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n* Consider periodically sending transactions that did not originate from the node as decoy, discussed [here](https://github.com/bitcoin/bitcoin/pull/29415#discussion_r2035414972).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
     "labels": [],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2025-06-27T07:18:51Z",
+    "updated_at": "2025-06-30T19:07:25Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "53f248da99db8765c2e26413a32104b621126934",
+    "merge_commit_sha": "49879cdabc66ce8d0677e3ddf91ea7aef8454795",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -348,12 +348,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37424,
-        "stargazers_count": 84328,
-        "watchers_count": 84328,
-        "size": 284456,
+        "forks_count": 37454,
+        "stargazers_count": 84370,
+        "watchers_count": 84370,
+        "size": 284587,
         "default_branch": "master",
-        "open_issues_count": 747,
+        "open_issues_count": 749,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -370,9 +370,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-06-26T16:33:26Z",
+        "pushed_at": "2025-06-30T17:47:15Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-06-27T07:38:08Z",
+        "updated_at": "2025-06-30T17:47:25Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -402,7 +402,7 @@
     "deletions": 166,
     "changed_files": 33,
     "commits": 15,
-    "review_comments": 336,
+    "review_comments": 337,
     "comments": 108
   },
   "events": [
@@ -14536,6 +14536,43 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-2948341713",
       "submitted_at": "2025-06-22T21:15:48Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+    },
+    {
+      "event": "reviewed",
+      "id": 2972293733,
+      "node_id": "PRR_kwDOABII586xKZpl",
+      "url": null,
+      "actor": null,
+      "commit_id": "4a873c2a67fd33111da97ce675aee7994b99546c",
+      "commit_url": null,
+      "created_at": null,
+      "author_association": "MEMBER",
+      "body": "I was experimenting with privacy on Bitcoin core and see this work.\r\nKudos 🎉  and thanks for your work to improve privacy\r\n\r\nGreat summary by @kdmukai \r\n\r\nDid some manual tests on signet using the script provided; it was smooth on the happy path\r\n<details> \r\n<summary>See logs</summary>\r\n\r\n```terminal\r\n2025-06-30T17:06:38Z [privatebroadcast:info] P2P handshake completed, sending INV for txid=fdb1884dd42d940c3edd786487e45311a2d5f2328cf7349fa4ad5f29f5449c96, wtxid=862c319f69d047db646a375b2287a511614c246e4956ead1d715d6d492ea1c80, peer=12\r\n2025-06-30T17:06:40Z Saw new header hash=0000000b9db2e9016363a6869d25691acef5ccdb94216c1683dee955dcc8ff4f height=258554 peer=4\r\n2025-06-30T17:06:42Z UpdateTip: new best=0000000b9db2e9016363a6869d25691acef5ccdb94216c1683dee955dcc8ff4f height=258554 version=0x20000000 log2_work=42.262158 tx=21879263 date='2025-06-30T17:06:01Z' progress=1.000000 cache=5.1MiB(25884txo)\r\n2025-06-30T17:06:43Z New private-broadcast v1 peer connected: version: 70016, blocks=258554, peer=14\r\n2025-06-30T17:06:43Z [privatebroadcast:info] P2P handshake completed, sending INV for txid=fdb1884dd42d940c3edd786487e45311a2d5f2328cf7349fa4ad5f29f5449c96, wtxid=862c319f69d047db646a375b2287a511614c246e4956ead1d715d6d492ea1c80, peer=14\r\n2025-06-30T17:06:43Z New private-broadcast v2 peer connected: version: 70016, blocks=258554, peer=13\r\n2025-06-30T17:06:43Z [privatebroadcast:info] P2P handshake completed, sending INV for txid=fdb1884dd42d940c3edd786487e45311a2d5f2328cf7349fa4ad5f29f5449c96, wtxid=862c319f69d047db646a375b2287a511614c246e4956ead1d715d6d492ea1c80, peer=13\r\n2025-06-30T17:06:43Z [privatebroadcast:info] Got a PONG (the transaction will probably reach the network), marking for disconnect, peer=12\r\n2025-06-30T17:06:48Z [privatebroadcast:info] Got a PONG (the transaction will probably reach the network), marking for disconnect, peer=13\r\n2025-06-30T17:06:48Z [privatebroadcast:info] Got a PONG (the transaction will probably reach the network), marking for disconnect, peer=14\r\n2025-06-30T17:06:49Z [privatebroadcast:info] Received our privately broadcast transaction (txid=fdb1884dd42d940c3edd786487e45311a2d5f2328cf7349fa4ad5f29f5449c96) from the network from peer=7; stopping private broadcast attempt\r\n```\r\n</details>\r\n\r\n\r\nI've noticed an issue and have two questions on approach.\r\n\r\n**_Issue_**: I think there is a bug in `BroadcastTransaction` whereby if you pass 0 as the value of `maxfeerate` the transaction won't be broadcasted because  you combine maxfee check and test accept check when we want want private broadcast. \r\n\r\n<details> \r\n<summary>Should fail with this modified bash script</summary>\r\n\r\n```terminal\r\n#!/bin/bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" loadwallet test\r\n\r\nnew_address=$(build/bin/bitcoin-cli -chain=\"signet\" getnewaddress)\r\npsbt=$(build/bin/bitcoin-cli -chain=\"signet\" walletcreatefundedpsbt \"[]\" \"[{\\\"$new_address\\\": 0.00001}]\" | jq -r '.psbt')\r\necho \"psbt: $psbt\"\r\n\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" walletprocesspsbt $psbt | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n\r\nraw_tx=$(build/bin/bitcoin-cli -chain=\"signet\" sendrawtransaction $signed_tx 0)\r\necho \"raw_tx: $raw_tx\"\r\n```\r\n</details>\r\n\r\n```\r\nerror code: -25\r\nerror message:\r\nmax fee exceeded\r\n```\r\nThe fix is simple i.e is to just separate them or something like that.\r\n\r\n\r\n<details> \r\n<summary>see diff</summary>\r\n\r\n```diff\r\ndiff --git a/src/node/transaction.cpp b/src/node/transaction.cpp\r\nindex 0c4f37e4714..9cd9fde1000 100644\r\n--- a/src/node/transaction.cpp\r\n+++ b/src/node/transaction.cpp\r\n@@ -74,13 +74,27 @@ TransactionError BroadcastTransaction(NodeContext& node,\r\n             wtxid = mempool_tx->GetWitnessHash();\r\n         } else {\r\n             // Transaction is not already in the mempool.\r\n-            if (max_tx_fee > 0 || broadcast_method == NO_MEMPOOL_PRIVATE_BROADCAST) {\r\n+            std::optional<CAmount> base_fee;\r\n+            if (broadcast_method == NO_MEMPOOL_PRIVATE_BROADCAST) {\r\n                 // First, call ATMP with test_accept and check the fee. If ATMP\r\n                 // fails here, return error immediately.\r\n-                const MempoolAcceptResult result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n+                const auto result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n                 if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {\r\n                     return HandleATMPError(result.m_state, err_string);\r\n-                } else if (result.m_base_fees.value() > max_tx_fee) {\r\n+                }\r\n+                base_fee = result.m_base_fees.value();\r\n+            }\r\n+\r\n+            if (max_tx_fee > 0) {\r\n+                // Only call ProcessTransaction if we did not call it before\r\n+                if (!base_fee) {\r\n+                    const auto result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n+                    if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {\r\n+                        return HandleATMPError(result.m_state, err_string);\r\n+                    }\r\n+                    base_fee = result.m_base_fees.value();\r\n+                }\r\n+                if (base_fee > max_tx_fee) {\r\n                     return TransactionError::MAX_FEE_EXCEEDED;\r\n                 }\r\n             }\r\n```\r\n</details>\r\n\r\n**_Questions_**\r\n\r\n1. Why is this only on `sendrawtransaction`, could also be implemented on the experimental `submitpackage`  RPC to ensure no contradiction in approach and also 1p1c package relay is a thing now. Correct me if I am not wrong they currently contradict base on the decision not to add the txs to the mempool, and in `submitpackage` adding to the mempool before broadcasting is a requirement that must be satisfied although I think you can bye-pass that limitiation easily by passing `test-accept` as  `false` the `ProcessNewPackage` call and then remove the check  that tx must exist in mempool before braodcasting to peers.\r\n\r\nI've try implementing it and it works\r\n<details> \r\n<summary>see diff</summary>\r\n\r\n```diff\r\ndiff --git a/src/node/transaction.cpp b/src/node/transaction.cpp\r\nindex 0c4f37e4714..9cd9fde1000 100644\r\n--- a/src/node/transaction.cpp\r\n+++ b/src/node/transaction.cpp\r\n@@ -74,13 +74,27 @@ TransactionError BroadcastTransaction(NodeContext& node,\r\n             wtxid = mempool_tx->GetWitnessHash();\r\n         } else {\r\n             // Transaction is not already in the mempool.\r\n-            if (max_tx_fee > 0 || broadcast_method == NO_MEMPOOL_PRIVATE_BROADCAST) {\r\n+            std::optional<CAmount> base_fee;\r\n+            if (broadcast_method == NO_MEMPOOL_PRIVATE_BROADCAST) {\r\n                 // First, call ATMP with test_accept and check the fee. If ATMP\r\n                 // fails here, return error immediately.\r\n-                const MempoolAcceptResult result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n+                const auto result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n                 if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {\r\n                     return HandleATMPError(result.m_state, err_string);\r\n-                } else if (result.m_base_fees.value() > max_tx_fee) {\r\n+                }\r\n+                base_fee = result.m_base_fees.value();\r\n+            }\r\n+\r\n+            if (max_tx_fee > 0) {\r\n+                // Only call ProcessTransaction if we did not call it before\r\n+                if (!base_fee) {\r\n+                    const auto result = node.chainman->ProcessTransaction(tx, /*test_accept=*/ true);\r\n+                    if (result.m_result_type != MempoolAcceptResult::ResultType::VALID) {\r\n+                        return HandleATMPError(result.m_state, err_string);\r\n+                    }\r\n+                    base_fee = result.m_base_fees.value();\r\n+                }\r\n+                if (base_fee > max_tx_fee) {\r\n                     return TransactionError::MAX_FEE_EXCEEDED;\r\n                 }\r\n             }\r\ndiff --git a/src/rpc/mempool.cpp b/src/rpc/mempool.cpp\r\nindex 4fd78d732f1..f9c1b130665 100644\r\n--- a/src/rpc/mempool.cpp\r\n+++ b/src/rpc/mempool.cpp\r\n@@ -1053,10 +1053,23 @@ static RPCHelpMan submitpackage()\r\n                 throw JSONRPCTransactionError(TransactionError::INVALID_PACKAGE, \"package topology disallowed. not child-with-parents or parents depend on each other.\");\r\n             }\r\n \r\n+            const bool private_broadcast_enabled{gArgs.GetBoolArg(\"-privatebroadcast\", DEFAULT_PRIVATE_BROADCAST)};\r\n+            if (private_broadcast_enabled &&\r\n+                !g_reachable_nets.Contains(NET_ONION) &&\r\n+                !g_reachable_nets.Contains(NET_I2P)) {\r\n+                throw JSONRPCError(RPC_MISC_ERROR,\r\n+                                   \"-privatebroadcast is enabled, but none of the Tor or I2P networks is \"\r\n+                                   \"reachable. Maybe the location of the Tor proxy couldn't be retrieved \"\r\n+                                   \"from the Tor daemon at startup. Check whether the Tor daemon is running \"\r\n+                                   \"and that -torcontrol, -torpassword and -i2psam are configured properly.\");\r\n+            }\r\n+            const auto method = private_broadcast_enabled ? node::NO_MEMPOOL_PRIVATE_BROADCAST\r\n+                                                          : node::ADD_TO_MEMPOOL_AND_BROADCAST_TO_ALL;\r\n+\r\n             NodeContext& node = EnsureAnyNodeContext(request.context);\r\n             CTxMemPool& mempool = EnsureMemPool(node);\r\n             Chainstate& chainstate = EnsureChainman(node).ActiveChainstate();\r\n-            const auto package_result = WITH_LOCK(::cs_main, return ProcessNewPackage(chainstate, mempool, txns, /*test_accept=*/ false, client_maxfeerate));\r\n+            const auto package_result = WITH_LOCK(::cs_main, return ProcessNewPackage(chainstate, mempool, txns, /*test_accept=*/ private_broadcast_enabled, client_maxfeerate));\r\n \r\n             std::string package_msg = \"success\";\r\n \r\n@@ -1066,9 +1079,9 @@ static RPCHelpMan submitpackage()\r\n                 {\r\n                     // Belt-and-suspenders check; everything should be successful here\r\n                     CHECK_NONFATAL(package_result.m_tx_results.size() == txns.size());\r\n-                    for (const auto& tx : txns) {\r\n-                        CHECK_NONFATAL(mempool.exists(GenTxid::Txid(tx->GetHash())));\r\n-                    }\r\n+                    // for (const auto& tx : txns) {\r\n+                    //     CHECK_NONFATAL(mempool.exists(GenTxid::Txid(tx->GetHash())));\r\n+                    // }\r\n                     break;\r\n                 }\r\n                 case PackageValidationResult::PCKG_MEMPOOL_ERROR:\r\n@@ -1091,17 +1104,15 @@ static RPCHelpMan submitpackage()\r\n             size_t num_broadcast{0};\r\n             for (const auto& tx : txns) {\r\n                 // We don't want to re-submit the txn for validation in BroadcastTransaction\r\n-                if (!mempool.exists(GenTxid::Txid(tx->GetHash()))) {\r\n+                if (!private_broadcast_enabled && !mempool.exists(GenTxid::Txid(tx->GetHash()))) {\r\n                     continue;\r\n                 }\r\n-\r\n-                // We do not expect an error here; we are only broadcasting things already/still in mempool\r\n                 std::string err_string;\r\n                 const auto err = BroadcastTransaction(node,\r\n                                                       tx,\r\n                                                       err_string,\r\n                                                       /*max_tx_fee=*/0,\r\n-                                                      node::ADD_TO_MEMPOOL_AND_BROADCAST_TO_ALL,\r\n+                                                      method,\r\n                                                       /*wait_callback=*/true);\r\n                 if (err != TransactionError::OK) {\r\n                     throw JSONRPCTransactionError(err,\r\n```\r\n\r\n</details>\r\n\r\n However I am still not confident on this diff that is the consistency with when `test accept` is  either `false` or `true` since test accept has some limitations see #32160 \r\n\r\n\r\n2. How does this approach compare to running a node with `-onlynet=tor` and `onlynet=i2p`? Because I thought that  I can achieve the privacy that this PR provided by doing that?\r\nOr if conservative you can have two nodes one via tor/i2p and another via clearnet and only using my tor node from personal transactions submissions.\r\n\r\nSide question: I see this is opt-in, do we plan to enable this by default; if yes did we have intuition theoretically on the impact on the whole network in terms of tx propagation speed?",
+      "user": {
+        "login": "ismaelsadeeq",
+        "id": 48946461,
+        "node_id": "MDQ6VXNlcjQ4OTQ2NDYx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/48946461?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ismaelsadeeq",
+        "html_url": "https://github.com/ismaelsadeeq",
+        "followers_url": "https://api.github.com/users/ismaelsadeeq/followers",
+        "following_url": "https://api.github.com/users/ismaelsadeeq/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ismaelsadeeq/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ismaelsadeeq/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ismaelsadeeq/subscriptions",
+        "organizations_url": "https://api.github.com/users/ismaelsadeeq/orgs",
+        "repos_url": "https://api.github.com/users/ismaelsadeeq/repos",
+        "events_url": "https://api.github.com/users/ismaelsadeeq/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-2972293733",
+      "submitted_at": "2025-06-30T19:07:25Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
     }
@@ -32347,6 +32384,59 @@
       "start_side": null,
       "line": 318,
       "original_line": 318,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2175685307",
+      "pull_request_review_id": 2972293733,
+      "id": 2175685307,
+      "node_id": "PRRC_kwDOABII586BrlK7",
+      "diff_hunk": "@@ -43,11 +45,21 @@ static RPCHelpMan sendrawtransaction()\n {\n     return RPCHelpMan{\n         \"sendrawtransaction\",\n-        \"Submit a raw transaction (serialized, hex-encoded) to local node and network.\\n\"\n-        \"\\nThe transaction will be sent unconditionally to all peers, so using sendrawtransaction\\n\"\n-        \"for manual rebroadcast may degrade privacy by leaking the transaction's origin, as\\n\"\n-        \"nodes will normally not rebroadcast non-wallet transactions already in their mempool.\\n\"\n+        \"Submit a raw transaction (serialized, hex-encoded) to the network.\\n\"\n+\n+        \"\\nIf -privatebroadcast is disabled, then the transaction will be put into the\\n\"\n+        \"local mempool of the node and will be sent unconditionally to all currently\\n\"\n+        \"connected peers, so using sendrawtransaction for manual rebroadcast will degrade\\n\"\n+        \"privacy by leaking the transaction's origin, as nodes will normally not\\n\"\n+        \"rebroadcast non-wallet transactions already in their mempool.\\n\"\n+\n+        \"\\nIf -privatebroadcast is enabled, then the transaction will be sent only via\\n\"\n+        \"dedicated, short-lived connections to Tor or I2P peers or IPv4/IPv6 peers\\n\"\n+        \"through the Tor network. This conceals the transaction origin. The transaction\\n\"\n+        \"will only enter the local mempool when it is received back from the network.\\n\"",
+      "path": "src/rpc/mempool.cpp",
+      "position": 32,
+      "original_position": 32,
+      "commit_id": "4a873c2a67fd33111da97ce675aee7994b99546c",
+      "original_commit_id": "a4c4dd9138d3eca68d483c3a0ecb1e013659d485",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "ismaelsadeeq",
+        "id": 48946461,
+        "node_id": "MDQ6VXNlcjQ4OTQ2NDYx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/48946461?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ismaelsadeeq",
+        "html_url": "https://github.com/ismaelsadeeq",
+        "followers_url": "https://api.github.com/users/ismaelsadeeq/followers",
+        "following_url": "https://api.github.com/users/ismaelsadeeq/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ismaelsadeeq/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ismaelsadeeq/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ismaelsadeeq/subscriptions",
+        "organizations_url": "https://api.github.com/users/ismaelsadeeq/orgs",
+        "repos_url": "https://api.github.com/users/ismaelsadeeq/repos",
+        "events_url": "https://api.github.com/users/ismaelsadeeq/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "This should be in doc?",
+      "created_at": "2025-06-30T18:47:49Z",
+      "updated_at": "2025-06-30T19:07:25Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#discussion_r2175685307",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2175685307"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415"
+        }
+      },
+      "start_line": 50,
+      "original_start_line": 50,
+      "start_side": "RIGHT",
+      "line": 59,
+      "original_line": 59,
       "side": "RIGHT"
     }
   ]
