@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31868/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/31868/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/f4cb5591a46ea59381dbb2e2ef8422affd936e21",
     "number": 31868,
     "state": "open",
     "locked": false,
@@ -42,11 +42,11 @@
     "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n---\r\n\r\nThis PR is drafted until I remeasure everything after the recent merges and I need to find a way to simplify the 1 byte writes more nicely, I don't like all the specializations.\r\n\r\n---\r\n\r\n### Summary\r\n\r\nThis PR contain a few different optimization I found by IBD profiling, and via the newly added block seralization benchmarks. It also takes advantage of the recently merged [`std::span` changes](https://github.com/bitcoin/bitcoin/pull/31519) enabling propagating static extents.\r\n\r\nThe commits merge similar (de)serialization methods, and separates them internally with  `if constexpr` - similarly to how it has been [done here before](https://github.com/bitcoin/bitcoin/pull/28203). This enabled further `SizeComputer` optimizations as well.\r\n\r\n### Context\r\nOther than these, since single byte writes are used very often (used for every `(u)int8_t` or `std::byte` or `bool` and for every `VarInt`'s first byte which is also needed for every `(pre)Vector`), it makes sense to avoid the generalized serialization infrastructure that isn't needed:\r\n* `AutoFile` write doesn't need to allocate 4k buffer for a single byte now;\r\n* `VectorWriter` and `DataStream` avoids memcpy/insert calls;\r\n* `CSHA256::Write` can avoid `memcpy`.\r\n\r\n`DeserializeBlock` is dominated by the hash calculations so the optimizations barely affect it.\r\n\r\n### Measurements\r\n\r\n<details>\r\n<summary>C compiler ............................ AppleClang 16.0.0.16000026</summary>\r\n\r\n> Before:\r\n\r\n|            ns/block |             block/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|          195,610.62 |            5,112.20 |    0.3% |     11.00 | `SerializeBlock`\r\n|           12,061.83 |           82,906.19 |    0.1% |     11.01 | `SizeComputerBlock`\r\n\r\n> After:\r\n\r\n|            ns/block |             block/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|          174,569.19 |            5,728.39 |    0.6% |     10.89 | `SerializeBlock`\r\n|           10,241.16 |           97,645.21 |    0.0% |     11.00 | `SizeComputerBlock`\r\n\r\n</details>\r\n\r\n> `SerializeBlock` - ~12.% faster\r\n> `SizeComputerBlock` - ~17.7% faster\r\n\r\n-----\r\n\r\n\r\n<details>\r\n<summary>C++ compiler .......................... GNU 13.3.0</summary>\r\n\r\n> Before:\r\n\r\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|          867,857.55 |            1,152.26 |    0.0% |    8,015,883.90 |    3,116,099.08 |  2.572 |   1,517,035.87 |    0.5% |     10.81 | `SerializeBlock`\r\n|           30,928.27 |           32,332.88 |    0.0% |      221,683.03 |      111,055.84 |  1.996 |      53,037.03 |    0.8% |     11.03 | `SizeComputerBlock`\r\n\r\n> After:\r\n\r\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|          615,000.56 |            1,626.01 |    0.0% |    8,015,883.64 |    2,208,340.88 |  3.630 |   1,517,035.62 |    0.5% |     10.56 | `SerializeBlock`\r\n|           25,676.76 |           38,945.72 |    0.0% |      159,390.03 |       92,202.10 |  1.729 |      42,131.03 |    0.9% |     11.00 | `SizeComputerBlock`\r\n\r\n</details>\r\n\r\n> `SerializeBlock` - ~41.1% faster\r\n> `SizeComputerBlock` - ~20.4% faster\r\n\r\n----\r\n\r\nWhile this wasn't the main motivation for the change, IBD on Ubuntu/GCC on SSD with i9 indicates a 2% speedup as well:\r\n\r\n<details>\r\n<summary>Details</summary>\r\n\r\n```bash\r\nCOMMITS=\"05314bde0b06b820225f10c6529b5afae128ff81 1cd94ec2511874ec68b92db34ad7ec7d9534fed1\"; \\\r\nSTOP_HEIGHT=880000; DBCACHE=10000; \\\r\nC_COMPILER=gcc; CXX_COMPILER=g++; \\\r\nhyperfine \\\r\n--export-json \"/mnt/my_storage/ibd-${COMMITS// /-}-${STOP_HEIGHT}-${DBCACHE}-${C_COMPILER}.json\" \\\r\n--runs 3 \\\r\n--parameter-list COMMIT ${COMMITS// /,} \\\r\n--prepare \"killall bitcoind || true; rm -rf /mnt/my_storage/BitcoinData/*; git checkout {COMMIT}; git clean -fxd; git reset --hard; cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=$C_COMPILER -DCMAKE_CXX_COMPILER=$CXX_COMPILER && cmake --build build -j$(nproc) --target bitcoind && ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=1 -printtoconsole=0 || true\" \\\r\n--cleanup \"cp /mnt/my_storage/BitcoinData/debug.log /mnt/my_storage/logs/debug-{COMMIT}-$(date +%s).log || true\" \\\r\n\"COMPILER=$C_COMPILER COMMIT={COMMIT} ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=$STOP_HEIGHT -dbcache=$DBCACHE -prune=550 -printtoconsole=0\"\r\nBenchmark 1: COMPILER=gcc COMMIT=05314bde0b06b820225f10c6529b5afae128ff81 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=880000 -dbcache=10000 -prune=550 -printtoconsole=0\r\n  Time (mean ± σ):     33647.918 s ± 508.655 s    [User: 71503.409 s, System: 4404.899 s]\r\n  Range (min … max):   33283.439 s … 34229.026 s    3 runs\r\n \r\nBenchmark 2: COMPILER=gcc COMMIT=1cd94ec2511874ec68b92db34ad7ec7d9534fed1 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=880000 -dbcache=10000 -prune=550 -printtoconsole=0\r\n  Time (mean ± σ):     33062.491 s ± 183.335 s    [User: 71246.532 s, System: 4318.490 s]\r\n  Range (min … max):   32888.211 s … 33253.706 s    3 runs\r\n \r\nSummary\r\n  COMPILER=gcc COMMIT=1cd94ec2511874ec68b92db34ad7ec7d9534fed1 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=880000 -dbcache=10000 -prune=550 -printtoconsole=0 ran\r\n    1.02 ± 0.02 times faster than COMPILER=gcc COMMIT=05314bde0b06b820225f10c6529b5afae128ff81 ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=880000 -dbcache=10000 -prune=550 -printtoconsole=0\r\n```\r\n\r\n</details>",
     "labels": [],
     "created_at": "2025-02-14T16:48:23Z",
-    "updated_at": "2025-07-30T08:46:17Z",
+    "updated_at": "2025-08-01T01:33:04Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "040e6dad242eb9bc3f3bc655b59c432456ce5828",
+    "merge_commit_sha": "d3c6bb2c818204f5574a58298377a030dacfebc8",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -54,7 +54,7 @@
     "head": {
       "label": "l0rinc:lorinc/block-serialization-optimizations",
       "ref": "lorinc/block-serialization-optimizations",
-      "sha": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "sha": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -152,7 +152,7 @@
         "forks_count": 0,
         "stargazers_count": 1,
         "watchers_count": 1,
-        "size": 269706,
+        "size": 269691,
         "default_branch": "master",
         "open_issues_count": 4,
         "is_template": false,
@@ -165,7 +165,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-07-30T05:53:18Z",
+        "pushed_at": "2025-08-01T01:35:39Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2025-07-30T00:12:05Z",
         "allow_forking": true,
@@ -189,7 +189,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "00604296e178b13fb1a701a84deac1e20e15259d",
+      "sha": "8712e074bb54eea9ccc4d2009d2150279c9d17ec",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -284,12 +284,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37587,
-        "stargazers_count": 84800,
-        "watchers_count": 84800,
-        "size": 289698,
+        "forks_count": 37592,
+        "stargazers_count": 84834,
+        "watchers_count": 84834,
+        "size": 290021,
         "default_branch": "master",
-        "open_issues_count": 754,
+        "open_issues_count": 748,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -306,9 +306,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-07-29T18:40:31Z",
+        "pushed_at": "2025-07-31T23:13:39Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-07-30T08:37:17Z",
+        "updated_at": "2025-08-01T00:45:27Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -335,9 +335,9 @@
     "author_association": "CONTRIBUTOR",
     "draft": true,
     "additions": 234,
-    "deletions": 113,
-    "changed_files": 12,
-    "commits": 6,
+    "deletions": 98,
+    "changed_files": 11,
+    "commits": 5,
     "review_comments": 8,
     "comments": 13
   },
@@ -1945,246 +1945,6 @@
       }
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDA0MzFhNjkwYzNhNDk4YTFlNzI4YzlkZjM0YTEzMmFjMTYxNzdhMDQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0431a690c3a498a1e728c9df34a132ac16177a04",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/0431a690c3a498a1e728c9df34a132ac16177a04",
-      "tree": {
-        "sha": "a805932cb693de7311e921cf62089161c43608c2",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a805932cb693de7311e921cf62089161c43608c2"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/00604296e178b13fb1a701a84deac1e20e15259d",
-          "sha": "00604296e178b13fb1a701a84deac1e20e15259d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/00604296e178b13fb1a701a84deac1e20e15259d"
-        }
-      ],
-      "message": "cleanup: remove unused `ser_writedata16be` and `ser_readdata16be`",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-02-13T21:49:51Z"
-      },
-      "sha": "0431a690c3a498a1e728c9df34a132ac16177a04"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGI2NmZiYzExMGY4MTY4ODU4NmI2MmIxMmIzOTNhMWNlNDhlNTRmM2E",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b66fbc110f81688586b62b12b393a1ce48e54f3a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/b66fbc110f81688586b62b12b393a1ce48e54f3a",
-      "tree": {
-        "sha": "35eed6dbc1da90286a78a347b9ee0b724e0d9157",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/35eed6dbc1da90286a78a347b9ee0b724e0d9157"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0431a690c3a498a1e728c9df34a132ac16177a04",
-          "sha": "0431a690c3a498a1e728c9df34a132ac16177a04",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/0431a690c3a498a1e728c9df34a132ac16177a04"
-        }
-      ],
-      "message": "bench: measure block (size)serialization speed\n\nMeasure both full block serialization and size computation via `SizeComputer`.\n`SizeComputer` returns the exact final size of the serialized content without writing any bytes.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          195,610.62 |            5,112.20 |    0.3% |     11.00 | `SerializeBlock`\n|           12,061.83 |           82,906.19 |    0.1% |     11.01 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          867,857.55 |            1,152.26 |    0.0% |    8,015,883.90 |    3,116,099.08 |  2.572 |   1,517,035.87 |    0.5% |     10.81 | `SerializeBlock`\n|           30,928.27 |           32,332.88 |    0.0% |      221,683.03 |      111,055.84 |  1.996 |      53,037.03 |    0.8% |     11.03 | `SizeComputerBlock`",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2024-11-19T15:11:56Z"
-      },
-      "sha": "b66fbc110f81688586b62b12b393a1ce48e54f3a"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDlkZjMyMTVjZGZjYjMwMmE1MmExNmUyZjE4ZWU1OTZlZjMyNzYyYmQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9df3215cdfcb302a52a16e2f18ee596ef32762bd",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/9df3215cdfcb302a52a16e2f18ee596ef32762bd",
-      "tree": {
-        "sha": "04c94222bb3347f58350e931cb531c4e5fbcbade",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/04c94222bb3347f58350e931cb531c4e5fbcbade"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b66fbc110f81688586b62b12b393a1ce48e54f3a",
-          "sha": "b66fbc110f81688586b62b12b393a1ce48e54f3a",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/b66fbc110f81688586b62b12b393a1ce48e54f3a"
-        }
-      ],
-      "message": "refactor: reduce template bloat in primitive serialization\n\nMerged multiple template methods into single constexpr-delimited implementation to reduce template bloat (i.e. related functionality is grouped into a single method, but can be optimized because of C++20 constexpr conditions).\nThis unifies related methods that were only bound before by similar signatures - and enables `SizeComputer` optimizations later",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-01-17T13:29:33Z"
-      },
-      "sha": "9df3215cdfcb302a52a16e2f18ee596ef32762bd"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDdkYjI0YjA5N2UyYjVhOTFkNDVjM2UxODY1ZTk2NDM1NGNiMDFjNzQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7db24b097e2b5a91d45c3e1865e964354cb01c74",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7db24b097e2b5a91d45c3e1865e964354cb01c74",
-      "tree": {
-        "sha": "b139968912ae9a871d1d503c06752fbc418b5601",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/b139968912ae9a871d1d503c06752fbc418b5601"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9df3215cdfcb302a52a16e2f18ee596ef32762bd",
-          "sha": "9df3215cdfcb302a52a16e2f18ee596ef32762bd",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/9df3215cdfcb302a52a16e2f18ee596ef32762bd"
-        }
-      ],
-      "message": "refactor: add explicit static extent to spans",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-03-20T09:28:52Z"
-      },
-      "sha": "7db24b097e2b5a91d45c3e1865e964354cb01c74"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDAxYmJkZmYwYTQ2OGI1NDAyNGM4NDBhMmU5MmYzZTFhMTM4OGI5MTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/01bbdff0a468b54024c840a2e92f3e1a1388b919",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/01bbdff0a468b54024c840a2e92f3e1a1388b919",
-      "tree": {
-        "sha": "7ddb795f3fb833c2b4cddc167f42d74de5848ecd",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/7ddb795f3fb833c2b4cddc167f42d74de5848ecd"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7db24b097e2b5a91d45c3e1865e964354cb01c74",
-          "sha": "7db24b097e2b5a91d45c3e1865e964354cb01c74",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7db24b097e2b5a91d45c3e1865e964354cb01c74"
-        }
-      ],
-      "message": "optimization: merge `SizeComputer` specializations and add new overloads\n\nEndianness doesn’t affect final size, so skip it in `SizeComputer`.\nFold existing overloads into one implementation, short‑circuiting logic when only the serialized size is needed.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/src/bench/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          191,652.29 |            5,217.78 |    0.4% |     10.96 | `SerializeBlock`\n|           10,323.55 |           96,865.92 |    0.2% |     11.01 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          614,847.32 |            1,626.42 |    0.0% |    8,015,883.64 |    2,207,628.07 |  3.631 |   1,517,035.62 |    0.5% |     10.56 | `SerializeBlock`\n|           26,020.31 |           38,431.52 |    0.0% |      159,390.03 |       93,438.33 |  1.706 |      42,131.03 |    0.9% |     11.00 | `SizeComputerBlock`",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-02-14T12:54:57Z"
-      },
-      "sha": "01bbdff0a468b54024c840a2e92f3e1a1388b919"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGE4NGYxMmU5MGE5OWYwMmQxODA4YTRkNDliNWIwMzcyNDhjMjVlZjM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a84f12e90a99f02d1808a4d49b5b037248c25ef3",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a84f12e90a99f02d1808a4d49b5b037248c25ef3",
-      "tree": {
-        "sha": "964c854a0ccc27585d504fc2afc5ba5cefb21873",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/964c854a0ccc27585d504fc2afc5ba5cefb21873"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/01bbdff0a468b54024c840a2e92f3e1a1388b919",
-          "sha": "01bbdff0a468b54024c840a2e92f3e1a1388b919",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/01bbdff0a468b54024c840a2e92f3e1a1388b919"
-        }
-      ],
-      "message": "optimization: add single byte writes\n\nSingle byte writes are used very often (used for every (u)int8_t or std::byte or bool and for every VarInt's first byte which is also needed for every (pre)Vector).\nIt makes sense to avoid the generalized serialization infrastructure that isn't needed:\n* AutoFile write doesn't need to allocate 4k buffer for a single byte now;\n* `VectorWriter` and `DataStream` avoids memcpy/insert calls.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          174,569.19 |            5,728.39 |    0.6% |     10.89 | `SerializeBlock`\n|           10,241.16 |           97,645.21 |    0.0% |     11.00 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          615,000.56 |            1,626.01 |    0.0% |    8,015,883.64 |    2,208,340.88 |  3.630 |   1,517,035.62 |    0.5% |     10.56 | `SerializeBlock`\n|           25,676.76 |           38,945.72 |    0.0% |      159,390.03 |       92,202.10 |  1.729 |      42,131.03 |    0.9% |     11.00 | `SizeComputerBlock`",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-07-29T23:25:47Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2025-03-09T20:33:36Z"
-      },
-      "sha": "a84f12e90a99f02d1808a4d49b5b037248c25ef3"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 18888450780,
       "node_id": "HRFPE_lADOABII586qIG0RzwAAAARl1uLc",
@@ -2337,6 +2097,266 @@
         "name": "CI failed",
         "color": "cccccc"
       }
+    },
+    {
+      "event": "referenced",
+      "id": 18928173120,
+      "node_id": "REFE_lADOABII586qIG0RzwAAAARoNQBA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/18928173120",
+      "actor": {
+        "login": "achow101",
+        "id": 3782274,
+        "node_id": "MDQ6VXNlcjM3ODIyNzQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/3782274?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/achow101",
+        "html_url": "https://github.com/achow101",
+        "followers_url": "https://api.github.com/users/achow101/followers",
+        "following_url": "https://api.github.com/users/achow101/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/achow101/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/achow101/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/achow101/subscriptions",
+        "organizations_url": "https://api.github.com/users/achow101/orgs",
+        "repos_url": "https://api.github.com/users/achow101/repos",
+        "events_url": "https://api.github.com/users/achow101/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/achow101/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "8712e074bb54eea9ccc4d2009d2150279c9d17ec",
+      "commit_url": "https://api.github.com/repos/bitcoin/bitcoin/commits/8712e074bb54eea9ccc4d2009d2150279c9d17ec",
+      "created_at": "2025-07-31T23:13:40Z"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGU0YmY2ZTVmYWRmYjQwMjc2YTcwYzFiODY3Njk0MDU5Y2NiODM5YWI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e4bf6e5fadfb40276a70c1b867694059ccb839ab",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e4bf6e5fadfb40276a70c1b867694059ccb839ab",
+      "tree": {
+        "sha": "c89fb24776aa15a3b5fb815058626a0be09268da",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c89fb24776aa15a3b5fb815058626a0be09268da"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8712e074bb54eea9ccc4d2009d2150279c9d17ec",
+          "sha": "8712e074bb54eea9ccc4d2009d2150279c9d17ec",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/8712e074bb54eea9ccc4d2009d2150279c9d17ec"
+        }
+      ],
+      "message": "bench: measure block (size)serialization speed\n\nMeasure both full block serialization and size computation via `SizeComputer`.\n`SizeComputer` returns the exact final size of the serialized content without writing any bytes.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          195,610.62 |            5,112.20 |    0.3% |     11.00 | `SerializeBlock`\n|           12,061.83 |           82,906.19 |    0.1% |     11.01 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          867,857.55 |            1,152.26 |    0.0% |    8,015,883.90 |    3,116,099.08 |  2.572 |   1,517,035.87 |    0.5% |     10.81 | `SerializeBlock`\n|           30,928.27 |           32,332.88 |    0.0% |      221,683.03 |      111,055.84 |  1.996 |      53,037.03 |    0.8% |     11.03 | `SizeComputerBlock`",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-08-01T01:32:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2024-11-19T15:11:56Z"
+      },
+      "sha": "e4bf6e5fadfb40276a70c1b867694059ccb839ab"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDgwMzk3YzBjN2IxNWYzNGVmNTM2YzFmZTQyZGI2NjAzMTNlYWU2YTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/80397c0c7b15f34ef536c1fe42db660313eae6a9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/80397c0c7b15f34ef536c1fe42db660313eae6a9",
+      "tree": {
+        "sha": "34943b1268d0f55289bb4b046a3c52145183104f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/34943b1268d0f55289bb4b046a3c52145183104f"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e4bf6e5fadfb40276a70c1b867694059ccb839ab",
+          "sha": "e4bf6e5fadfb40276a70c1b867694059ccb839ab",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e4bf6e5fadfb40276a70c1b867694059ccb839ab"
+        }
+      ],
+      "message": "refactor: reduce template bloat in primitive serialization\n\nMerged multiple template methods into single constexpr-delimited implementation to reduce template bloat (i.e. related functionality is grouped into a single method, but can be optimized because of C++20 constexpr conditions).\nThis unifies related methods that were only bound before by similar signatures - and enables `SizeComputer` optimizations later",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-08-01T01:32:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-01-17T13:29:33Z"
+      },
+      "sha": "80397c0c7b15f34ef536c1fe42db660313eae6a9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGY3NWE0OTRhNGI4OWIzODkyNDgzZTBlNzgyYTU0OGRhMDk2OWE1ZmI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f75a494a4b89b3892483e0e782a548da0969a5fb",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/f75a494a4b89b3892483e0e782a548da0969a5fb",
+      "tree": {
+        "sha": "d7ff2150a7138338f7bfe18f1fac36b3a85225b1",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d7ff2150a7138338f7bfe18f1fac36b3a85225b1"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/80397c0c7b15f34ef536c1fe42db660313eae6a9",
+          "sha": "80397c0c7b15f34ef536c1fe42db660313eae6a9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/80397c0c7b15f34ef536c1fe42db660313eae6a9"
+        }
+      ],
+      "message": "refactor: add explicit static extent to spans",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-08-01T01:32:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-03-20T09:28:52Z"
+      },
+      "sha": "f75a494a4b89b3892483e0e782a548da0969a5fb"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDRiODA1NjgwODFhNDc5MDQ0NjU2M2IwODc4MDI3NzRlZmI3NTUxYzQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b80568081a4790446563b087802774efb7551c4",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4b80568081a4790446563b087802774efb7551c4",
+      "tree": {
+        "sha": "276fc91174664a7df2e59cc85eee28fbd874c477",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/276fc91174664a7df2e59cc85eee28fbd874c477"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f75a494a4b89b3892483e0e782a548da0969a5fb",
+          "sha": "f75a494a4b89b3892483e0e782a548da0969a5fb",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/f75a494a4b89b3892483e0e782a548da0969a5fb"
+        }
+      ],
+      "message": "optimization: merge `SizeComputer` specializations and add new overloads\n\nEndianness doesn’t affect final size, so skip it in `SizeComputer`.\nFold existing overloads into one implementation, short‑circuiting logic when only the serialized size is needed.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/src/bench/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          191,652.29 |            5,217.78 |    0.4% |     10.96 | `SerializeBlock`\n|           10,323.55 |           96,865.92 |    0.2% |     11.01 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          614,847.32 |            1,626.42 |    0.0% |    8,015,883.64 |    2,207,628.07 |  3.631 |   1,517,035.62 |    0.5% |     10.56 | `SerializeBlock`\n|           26,020.31 |           38,431.52 |    0.0% |      159,390.03 |       93,438.33 |  1.706 |      42,131.03 |    0.9% |     11.00 | `SizeComputerBlock`",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-08-01T01:32:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-02-14T12:54:57Z"
+      },
+      "sha": "4b80568081a4790446563b087802774efb7551c4"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGY0Y2I1NTkxYTQ2ZWE1OTM4MWRiYjJlMmVmODQyMmFmZmQ5MzZlMjE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f4cb5591a46ea59381dbb2e2ef8422affd936e21",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/f4cb5591a46ea59381dbb2e2ef8422affd936e21",
+      "tree": {
+        "sha": "47e492ff9c5316f0d89c376745d54b0b43f135df",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/47e492ff9c5316f0d89c376745d54b0b43f135df"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b80568081a4790446563b087802774efb7551c4",
+          "sha": "4b80568081a4790446563b087802774efb7551c4",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/4b80568081a4790446563b087802774efb7551c4"
+        }
+      ],
+      "message": "optimization: add single byte writes\n\nSingle byte writes are used very often (used for every (u)int8_t or std::byte or bool and for every VarInt's first byte which is also needed for every (pre)Vector).\nIt makes sense to avoid the generalized serialization infrastructure that isn't needed:\n* AutoFile write doesn't need to allocate 4k buffer for a single byte now;\n* `VectorWriter` and `DataStream` avoids memcpy/insert calls.\n\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='SizeComputerBlock|SerializeBlock' --min-time=10000\n\n> C compiler ............................ AppleClang 16.0.0.16000026\n\n|            ns/block |             block/s |    err% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------:|:----------\n|          174,569.19 |            5,728.39 |    0.6% |     10.89 | `SerializeBlock`\n|           10,241.16 |           97,645.21 |    0.0% |     11.00 | `SizeComputerBlock`\n\n> C++ compiler .......................... GNU 13.3.0\n\n|            ns/block |             block/s |    err% |       ins/block |       cyc/block |    IPC |      bra/block |   miss% |     total | benchmark\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\n|          615,000.56 |            1,626.01 |    0.0% |    8,015,883.64 |    2,208,340.88 |  3.630 |   1,517,035.62 |    0.5% |     10.56 | `SerializeBlock`\n|           25,676.76 |           38,945.72 |    0.0% |      159,390.03 |       92,202.10 |  1.729 |      42,131.03 |    0.9% |     11.00 | `SizeComputerBlock`",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-08-01T01:32:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2025-03-09T20:33:36Z"
+      },
+      "sha": "f4cb5591a46ea59381dbb2e2ef8422affd936e21"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 18929507554,
+      "node_id": "HRFPE_lADOABII586qIG0RzwAAAARoSVzi",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/18929507554",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/f4cb5591a46ea59381dbb2e2ef8422affd936e21",
+      "created_at": "2025-08-01T01:33:04Z"
     }
   ],
   "comments": [
@@ -2349,7 +2369,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 4,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "2d8a85cea7a370e6eabc012f5a4290e3563cb155",
       "in_reply_to_id": null,
       "user": {
@@ -2402,7 +2422,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 4,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "2d8a85cea7a370e6eabc012f5a4290e3563cb155",
       "in_reply_to_id": 1956480589,
       "user": {
@@ -2455,7 +2475,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 4,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "2d8a85cea7a370e6eabc012f5a4290e3563cb155",
       "in_reply_to_id": 1956480589,
       "user": {
@@ -2508,7 +2528,7 @@
       "path": "src/streams.h",
       "position": null,
       "original_position": 4,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "2d8a85cea7a370e6eabc012f5a4290e3563cb155",
       "in_reply_to_id": 1956480589,
       "user": {
@@ -2559,9 +2579,9 @@
       "node_id": "PRRC_kwDOABII5856Gj7H",
       "diff_hunk": "@@ -241,38 +241,47 @@ const Out& AsBase(const In& x)\n template<class T>\n concept CharNotInt8 = std::same_as<T, char> && !std::same_as<T, int8_t>;\n \n+template <typename T>\n+concept ByteOrIntegral = std::is_same_v<T, std::byte> ||\n+    (std::is_integral_v<T> && !std::is_same_v<T, char>);\n+\n template <typename Stream, CharNotInt8 V> void Serialize(Stream&, V) = delete; // char serialization forbidden. Use uint8_t or int8_t\n-template <typename Stream> void Serialize(Stream& s, std::byte a) { ser_writedata8(s, uint8_t(a)); }\n-template<typename Stream> inline void Serialize(Stream& s, int8_t a  ) { ser_writedata8(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint8_t a ) { ser_writedata8(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int16_t a ) { ser_writedata16(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint16_t a) { ser_writedata16(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int32_t a ) { ser_writedata32(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint32_t a) { ser_writedata32(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int64_t a ) { ser_writedata64(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint64_t a) { ser_writedata64(s, a); }\n+template <typename Stream, ByteOrIntegral T> void Serialize(Stream& s, T a)\n+{\n+    if constexpr (sizeof(T) == 1) {\n+        ser_writedata8(s, static_cast<uint8_t>(a));   // (u)int8_t or std::byte or bool",
       "path": "src/serialize.h",
-      "position": 128,
+      "position": 117,
       "original_position": 21,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "c9a69f9088340df88017752e1016670141b6ad74",
       "in_reply_to_id": null,
       "user": {
@@ -2614,7 +2634,7 @@
       "path": "src/serialize.h",
       "position": 9,
       "original_position": 9,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "2c136648ddaf8083a2f511d9ec2db2b78b37ef44",
       "in_reply_to_id": null,
       "user": {
@@ -2667,7 +2687,7 @@
       "path": "src/crypto/sha256.cpp",
       "position": 4,
       "original_position": 4,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "5317366a83d4fb4fc0db85beeafef9b2ac0fa495",
       "in_reply_to_id": null,
       "user": {
@@ -2718,9 +2738,9 @@
       "node_id": "PRRC_kwDOABII5856JNI9",
       "diff_hunk": "@@ -241,38 +241,47 @@ const Out& AsBase(const In& x)\n template<class T>\n concept CharNotInt8 = std::same_as<T, char> && !std::same_as<T, int8_t>;\n \n+template <typename T>\n+concept ByteOrIntegral = std::is_same_v<T, std::byte> ||\n+    (std::is_integral_v<T> && !std::is_same_v<T, char>);\n+\n template <typename Stream, CharNotInt8 V> void Serialize(Stream&, V) = delete; // char serialization forbidden. Use uint8_t or int8_t\n-template <typename Stream> void Serialize(Stream& s, std::byte a) { ser_writedata8(s, uint8_t(a)); }\n-template<typename Stream> inline void Serialize(Stream& s, int8_t a  ) { ser_writedata8(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint8_t a ) { ser_writedata8(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int16_t a ) { ser_writedata16(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint16_t a) { ser_writedata16(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int32_t a ) { ser_writedata32(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint32_t a) { ser_writedata32(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, int64_t a ) { ser_writedata64(s, a); }\n-template<typename Stream> inline void Serialize(Stream& s, uint64_t a) { ser_writedata64(s, a); }\n+template <typename Stream, ByteOrIntegral T> void Serialize(Stream& s, T a)\n+{\n+    if constexpr (sizeof(T) == 1) {\n+        ser_writedata8(s, static_cast<uint8_t>(a));   // (u)int8_t or std::byte or bool",
       "path": "src/serialize.h",
-      "position": 128,
+      "position": 117,
       "original_position": 21,
-      "commit_id": "a84f12e90a99f02d1808a4d49b5b037248c25ef3",
+      "commit_id": "f4cb5591a46ea59381dbb2e2ef8422affd936e21",
       "original_commit_id": "c9a69f9088340df88017752e1016670141b6ad74",
       "in_reply_to_id": 2048540359,
       "user": {
