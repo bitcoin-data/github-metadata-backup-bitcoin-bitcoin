@@ -42,7 +42,7 @@
     "body": "### Draft for now - comments are welcome\r\n\r\n* Should we repurpose the existing `-blocksxor` arg instead?\r\n* Would multithreading help enough to justify the extra complexity, given the current IO-bound profile?\r\n* Should we split `ObfuscateBlocks` out of init? I have split it into many local lambdas, but we may want to find better home for those methods...\r\n* Which additional scenarios should we cover in testing (resume mid-run, explicit 16-hex key path, large datadirs, pruned)?\r\n* Can we safely assume the extra memory and disk space is available? Should we use smaller read buffers?\r\n* Release notes, translations?\r\n* Given user concern about what they store on disk, should we consider including this in v30?\r\n\r\n-----\r\n\r\n### Context\r\n\r\nRecent discussions highlighted that many nodes which synced before Bitcoin Core v28 have their block and undo files stored effectively in the clear (zero XOR key). This patch adds\r\na simple, resumable maintenance tool to obfuscate previously raw block files, rotate an existing key to a fresh random one, or de-obfuscate (set key to zero) if consciously chosen,\r\nall without requiring resync. The operation can be cancelled and restarted safely.\r\n\r\n### Implementation\r\n\r\nThe new startup option `-reobfuscate-blocks[=VALUE]` accepts either 16 hex characters as an exact 8-byte XOR key (little-endian in-memory layout) or a boolean to generate a random\r\n64-bit key. e.g. `-reobfuscate-blocks=0000000000000000` sets the key to zero, effectively removing obfuscation.\r\n\r\nIf we detect unobfuscated blocks at start time we suggest this new option in a warning.\r\n\r\nAt startup, we iterate over all `(blk|rev)*.dat` files, read them with the old XOR key and write them back with the new key (`<name>.reobfuscated`). After successful write, we\r\nimmediately delete the old file. Once all files are staged, we rename them back and atomically swap `xor.dat.reobfuscated` → `xor.dat` and continue operation.\r\n\r\nWe log the old and new keys and print progress roughly per-percent as files complete (i.e. max 100 progress logs).\r\n\r\n### Constraints\r\n\r\n* Re-obfuscation resumes automatically (detected via `xor.dat.reobfuscated`) even without the flag. In worst-case a crash should only force us to redo previous work.\r\n* We need to load the whole blockfile in memory (~160MB peak memory usage) and write and extra blockfile.\r\n* Single-threaded, processing one file at a time to keep code simple and avoid complexity of interleaving renames and key swaps across threads.\r\n* Fast in practice with sequential read/modify/write per blockfile - after recent obfuscation vectorization, this path is very quick.\r\n\r\n### Performance\r\n\r\n| cpu                 | hdd/ssd | block count | size    | files  | time (min) | blocks/min |\r\n|---------------------|---------|-------------|---------|--------|------------|------------|\r\n| Apple M4 Max laptop | SSD     | ~909k       | ~707 GB | 9,982  | 6.2        | 146,612    |\r\n| Intel Core i9       | SSD     | ~909k       | ~725 GB | 10,238 | 23.1       | 39,351     |\r\n| Intel Core i7       | HDD     | ~909k       | ~720 GB | 10,156 | 208.7      | 4,356      |\r\n| Raspberry Pi 4B     | HDD     | ~738k       | ~601 GB | 8,511  | 1237       | 596        |\r\n\r\n----\r\n\r\nSimilar work:\r\n\r\n* https://github.com/bitcoin/bitcoin/pull/32451\r\n* https://github.com/andrewtoth/blocks-xor\r\n",
     "labels": [],
     "created_at": "2025-09-05T23:51:29Z",
-    "updated_at": "2025-09-11T05:49:50Z",
+    "updated_at": "2025-09-11T06:20:54Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -284,9 +284,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37772,
-        "stargazers_count": 85442,
-        "watchers_count": 85442,
+        "forks_count": 37773,
+        "stargazers_count": 85443,
+        "watchers_count": 85443,
         "size": 293494,
         "default_branch": "master",
         "open_issues_count": 772,
@@ -308,7 +308,7 @@
         "visibility": "public",
         "pushed_at": "2025-09-10T11:27:54Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-09-11T04:50:20Z",
+        "updated_at": "2025-09-11T06:57:22Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -338,7 +338,7 @@
     "deletions": 12,
     "changed_files": 11,
     "commits": 5,
-    "review_comments": 5,
+    "review_comments": 6,
     "comments": 3
   },
   "events": [
@@ -1251,6 +1251,59 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2338680285"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33324"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1346,
+      "original_line": 1346,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2338802041",
+      "pull_request_review_id": 3209087659,
+      "id": 2338802041,
+      "node_id": "PRRC_kwDOABII586LZ0l5",
+      "diff_hunk": "@@ -1268,6 +1268,134 @@ static std::optional<CService> CheckBindingConflicts(const CConnman::Options& co\n     return std::nullopt;\n }\n \n+static bool ObfuscateBlocks(\n+    const BlockManager& m_blockman,\n+    const util::SignalInterrupt& interrupt,\n+    std::string_view suffix,\n+    const fs::path& blocks_dir,\n+    const fs::path& xor_dat,\n+    const fs::path& xor_new,\n+    const std::span<const std::byte> requested_key)\n+{\n+    // Read all block and undo file names\n+    auto collect_undo_files{[&]() -> std::set<fs::path> {\n+        std::set<fs::path> files;\n+        while (true) {\n+            if (auto f{m_blockman.GetUndoPosFilename(FlatFilePos(files.size(), 0))}; fs::exists(f)) {\n+                files.insert(f);\n+            } else {\n+                break;\n+            }\n+        }\n+        return files;\n+    }};\n+    auto collect_block_files{[&]() -> std::set<fs::path> {\n+        std::set<fs::path> files;\n+        while (true) {\n+            if (auto f{m_blockman.GetBlockPosFilename(FlatFilePos(files.size(), 0))}; fs::exists(f)) {\n+                files.insert(f);\n+            } else {\n+                break;\n+            }\n+        }\n+        return files;\n+    }};\n+\n+    auto write_missing_key{[&](const fs::path& file, const std::array<std::byte, Obfuscation::KEY_SIZE>& default_bytes) -> bool {\n+        if (!fs::exists(file)) {\n+            AutoFile autofile{fsbridge::fopen(file, \"wb\")};\n+            autofile << default_bytes;\n+            if (!autofile.Commit() || autofile.fclose()) return false;\n+        }\n+        return true;\n+    }};\n+    auto read_key{[&](const fs::path& file) -> std::optional<Obfuscation> {\n+        std::array<std::byte, Obfuscation::KEY_SIZE> obfuscation{};\n+        AutoFile{fsbridge::fopen(file, \"rb\")} >> obfuscation;\n+        return Obfuscation{obfuscation};\n+    }};\n+\n+    // Create delta obfuscation key by combining the old ^ new so that we only have to iterate once\n+    auto create_delta_obfuscation{[&]() -> std::optional<Obfuscation> {\n+        // Ensure old key exists\n+        if (!write_missing_key(xor_dat, {})) return std::nullopt;\n+        const auto old_obfuscation{read_key(xor_dat)};\n+        LogInfo(\"[obfuscate] old key: %s\", old_obfuscation->HexKey());\n+\n+        // Prepare new key\n+        std::array<std::byte, Obfuscation::KEY_SIZE> new_bytes{};\n+        if (requested_key.size() == Obfuscation::KEY_SIZE) {\n+            std::copy_n(requested_key.begin(), Obfuscation::KEY_SIZE, new_bytes.begin());\n+        } else {\n+            FastRandomContext{}.fillrand(new_bytes);\n+        }\n+        if (!write_missing_key(xor_new, new_bytes)) return std::nullopt;\n+        const auto new_obfuscation{read_key(xor_new)};\n+        LogInfo(\"[obfuscate] new key: %s\", new_obfuscation->HexKey());\n+\n+        // Combine keys\n+        std::array<std::byte, Obfuscation::KEY_SIZE> delta_bytes{};\n+        (*old_obfuscation)(delta_bytes);\n+        (*new_obfuscation)(delta_bytes);\n+        return Obfuscation{delta_bytes};\n+    }};\n+\n+    auto migrate_single_blockfile{[&](const fs::path& file, const Obfuscation& delta_obfuscation, std::vector<std::byte>& buf) -> bool {\n+        AutoFile old_blocks{fsbridge::fopen(file, \"rb\"), delta_obfuscation}; // deobfuscate & reobfuscate with a single combined key\n+        buf.resize(fs::file_size(file)); // reuse buffer\n+        old_blocks.read(buf);",
+      "path": "src/init.cpp",
+      "position": 79,
+      "original_position": 79,
+      "commit_id": "aa587f3740e39214d99da3fc44ce2878a0f4e32d",
+      "original_commit_id": "aa587f3740e39214d99da3fc44ce2878a0f4e32d",
+      "in_reply_to_id": 2338622414,
+      "user": {
+        "login": "ajtowns",
+        "id": 127186,
+        "node_id": "MDQ6VXNlcjEyNzE4Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/127186?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ajtowns",
+        "html_url": "https://github.com/ajtowns",
+        "followers_url": "https://api.github.com/users/ajtowns/followers",
+        "following_url": "https://api.github.com/users/ajtowns/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ajtowns/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ajtowns/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ajtowns/subscriptions",
+        "organizations_url": "https://api.github.com/users/ajtowns/orgs",
+        "repos_url": "https://api.github.com/users/ajtowns/repos",
+        "events_url": "https://api.github.com/users/ajtowns/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ajtowns/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "I don't think buffered readers is the right thing (that's for when you want to process small amounts of data while still reading it from the file in large chunks), and trying the above didn't seem particularly slow to me.\r\n\r\nI guess it could be simplified a bit to:\r\n\r\n```c++\r\nbuf.resize(2 * MAX_BLOCK_SERIALIZED_SIZE);\r\nwhile (true) {\r\n    size_t size = old_blocks.detail_fread(buf);\r\n    if (size == 0) break;\r\n    new_blocks.write_buffer(std::span(buf, 0, size));\r\n}\r\n```",
+      "created_at": "2025-09-11T06:20:54Z",
+      "updated_at": "2025-09-11T06:20:54Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33324#discussion_r2338802041",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2338802041"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33324"
