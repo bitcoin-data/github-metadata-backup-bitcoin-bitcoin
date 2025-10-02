@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/29415/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/b01d6df464e495ff323adaf9178ad55facce3478",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/21efe8fa8207b72c8953572b5b009394bbe580a6",
     "number": 29415,
     "state": "open",
     "locked": false,
@@ -40,22 +40,13 @@
       "patch_url": null
     },
     "body": "_Parts of this PR are isolated in independent smaller PRs to ease review:_\r\n\r\n* [ ] _https://github.com/bitcoin/bitcoin/pull/33454_\r\n\r\n---\r\n\r\nTo improve privacy, broadcast locally submitted transactions (from the `sendrawtransaction` RPC) to the P2P network only via Tor or I2P short-lived connections, or to IPv4/IPv6 peers but through the Tor network.\r\n\r\n* Introduce a new connection type for private broadcast of transactions with the following properties:\r\n  * started whenever there are local transactions to be sent\r\n  * opened to Tor or I2P peers or IPv4/IPv6 via the Tor proxy\r\n  * opened regardless of max connections limits\r\n  * after handshake is completed one local transaction is pushed to the peer, `PING` is sent and after receiving `PONG` the connection is closed\r\n  * ignore all incoming messages after handshake is completed (except `PONG`)\r\n\r\n* Broadcast transactions submitted via `sendrawtransaction` using this new mechanism, to a few peers. Keep doing this until we receive back this transaction from one of our ordinary peers (this takes about 1 second on mainnet).\r\n\r\n* The transaction is stored in peerman and does not enter the mempool.\r\n\r\n* Once we get an `INV` from one of our ordinary peers, then the normal flow executes: we request the transaction with `GETDATA`, receive it with a `TX` message, put it in our mempool and broadcast it to all our existent connections (as if we see it for the first time).\r\n\r\n* After we receive the full transaction as a `TX` message, in reply to our `GETDATA` request, only then consider the transaction has propagated through the network and remove it from the storage in peerman, ending the private broadcast attempts.\r\n\r\nThe messages exchange should look like this:\r\n\r\n```\r\ntx-sender >--- connect -------> tx-recipient\r\ntx-sender >--- VERSION -------> tx-recipient (dummy VERSION with no revealing data)\r\ntx-sender <--- VERSION -------< tx-recipient\r\ntx-sender <--- WTXIDRELAY ----< tx-recipient (maybe)\r\ntx-sender <--- SENDADDRV2 ----< tx-recipient (maybe)\r\ntx-sender <--- SENDTXRCNCL ---< tx-recipient (maybe)\r\ntx-sender <--- VERACK --------< tx-recipient\r\ntx-sender >--- VERACK --------> tx-recipient\r\ntx-sender >--- INV/TX --------> tx-recipient\r\ntx-sender <--- GETDATA/TX ----< tx-recipient\r\ntx-sender >--- TX ------------> tx-recipient\r\ntx-sender >--- PING ----------> tx-recipient\r\ntx-sender <--- PONG ----------< tx-recipient\r\ntx-sender disconnects\r\n```\r\n\r\nWhenever a new transaction is received from `sendrawtransaction` RPC, the node will send it to a few (`NUM_PRIVATE_BROADCAST_PER_TX`) recipients right away. If after 10-15 mins we still have not heard anything about the transaction from the network, then it will be sent to 1 more peer (see `PeerManagerImpl::ReattemptPrivateBroadcast()`).\r\n\r\nA few considerations:\r\n* The short-lived private broadcast connections are very cheap and fast wrt network traffic. It is expected that some of those peers could blackhole the transaction. Just one honest/proper peer is enough for successful propagation.\r\n* The peers that receive the transaction could deduce that this is initial transaction broadcast from the transaction originator. This is ok, they can't identify the sender.\r\n\r\n---\r\n\r\n<details>\r\n<summary>How to test this?</summary>\r\n\r\nThank you, @stratospher and @andrewtoth!\r\n\r\nStart `bitcoind` with `-privatebroadcast=1 -debug=privatebroadcast`.\r\n\r\nCreate a wallet and get a new address, go to the Signet faucet and request some coins to that address:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" createwallet test\r\nbuild/bin/bitcoin-cli -chain=\"signet\" getnewaddress\r\n```\r\n\r\nGet a new address for the test transaction recipient:\r\n```bash\r\nbuild/bin/bitcoin-cli -chain=\"signet\" loadwallet test\r\nnew_address=$(build/bin/bitcoin-cli -chain=\"signet\" getnewaddress)\r\n```\r\n\r\nCreate the transaction:\r\n```bash\r\n# Option 1: `createrawtransaction` and `signrawtransactionwithwallet`:\r\n\r\ntxid=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .txid')\r\nvout=$(build/bin/bitcoin-cli -chain=\"signet\" listunspent | jq -r '.[0] | .vout')\r\necho \"txid: $txid\"\r\necho \"vout: $vout\"\r\n\r\ntx=$(build/bin/bitcoin-cli -chain=\"signet\" createrawtransaction \"[{\\\"txid\\\": \\\"$txid\\\", \\\"vout\\\": $vout}]\" \"[{\\\"$new_address\\\": 0.00001000}]\" 0 false)\r\necho \"tx: $tx\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" signrawtransactionwithwallet \"$tx\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n\r\n# OR Option 2: `walletcreatefundedpsbt` and `walletprocesspsbt`:\r\n# This makes it not have to worry about inputs and also automatically sends back change to the wallet.\r\n# Start `bitcoind` with `-fallbackfee=0.00003000` for instance for 3 sat/vbyte fee.\r\n\r\npsbt=$(build/bin/bitcoin-cli -chain=\"signet\" walletcreatefundedpsbt \"[]\" \"[{\\\"$new_address\\\": 0.00001000}]\" | jq -r '.psbt')\r\necho \"psbt: $psbt\"\r\n\r\nsigned_tx=$(build/bin/bitcoin-cli -chain=\"signet\" walletprocesspsbt \"$psbt\" | jq -r '.hex')\r\necho \"signed_tx: $signed_tx\"\r\n```\r\n\r\nFinally, send the transaction:\r\n```bash\r\nraw_tx=$(build/bin/bitcoin-cli -chain=\"signet\" sendrawtransaction \"$signed_tx\")\r\necho \"raw_tx: $raw_tx\"\r\n```\r\n\r\n</details>\r\n\r\n---\r\n\r\n<details>\r\n<summary>High-level explanation of the commits</summary>\r\n\r\n* New logging category and config option to enable private broadcast\r\n  * `log: introduce a new category for private broadcast`\r\n  * `init: introduce a new option to enable/disable private broadcast`\r\n\r\n* Implement the private broadcast connection handling on the `CConnman` side:\r\n  * `net: introduce a new connection type for private broadcast`\r\n  * `net: support overriding the proxy selection in ConnectNode()`\r\n  * `net: implement opening PRIVATE_BROADCAST connections`\r\n\r\n* Prepare `BroadcastTransaction()` for private broadcast requests:\r\n  * `net_processing: rename RelayTransaction to better describe what it does`\r\n  * `node: change a tx-relay on/off flag to a tri-state`\r\n  * `net_processing: store transactions for private broadcast in PeerManager`\r\n\r\n* Implement the private broadcast connection handling on the `PeerManager` side:\r\n  * `net_processing: reorder the code that handles the VERSION message`\r\n  * `net_processing: handle ConnectionType::PRIVATE_BROADCAST connections`\r\n  * `net_processing: stop private broadcast of a transaction after round-trip`\r\n  * `net_processing: retry private broadcast`\r\n\r\n* Engage the new functionality from `sendrawtransaction`:\r\n  * `rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON`\r\n\r\n* Independent test framework improvement:\r\n  * `test: move create_malleated_version() to messages.py for reuse`\r\n\r\n* New functional test that exercies some of the new code:\r\n  * `test: add functional test for local tx relay`\r\n\r\n</details>\r\n\r\n---\r\n\r\n**This PR would close the following issues:**\r\nhttps://github.com/bitcoin/bitcoin/issues/3828 Clients leak IPs if they are recipients of a transaction\r\nhttps://github.com/bitcoin/bitcoin/issues/14692 Can't configure bitocoind to only send tx via Tor but receive clearnet transactions\r\nhttps://github.com/bitcoin/bitcoin/issues/19042 Tor-only transaction broadcast onlynet=onion alternative\r\nhttps://github.com/bitcoin/bitcoin/issues/24557 Option for receive events with all networks, but send transactions and/or blocks only with anonymous network[s]?\r\nhttps://github.com/bitcoin/bitcoin/issues/25450 Ability to broadcast wallet transactions only via dedicated oneshot Tor connections\r\nhttps://github.com/bitcoin/bitcoin/issues/32235 Tor: TX circuit isolation\r\n\r\n**Issues that are related, but (maybe?) not to be closed by this PR:**\r\nhttps://github.com/bitcoin/bitcoin/issues/21876 Broadcast a transaction to specific nodes\r\nhttps://github.com/bitcoin/bitcoin/issues/28636 new RPC: sendrawtransactiontopeer\r\n\r\n---\r\n\r\nFurther extensions:\r\n* Have the wallet do the private broadcast as well, https://github.com/bitcoin/bitcoin/issues/11887 would have to be resolved.\r\n* Have the `submitpackage` RPC do the private broadcast as well, [draft diff in the comment below](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-2972293733), thanks @ismaelsadeeq!\r\n* Add some stats via RPC, so that the user can better monitor what is going on during and after the broadcast. Currently this can be done via the debug log, but that is not convenient.\r\n* Make the private broadcast storage, currently in peerman, persistent over node restarts.\r\n* Add (optional) random delay before starting to broadcast the transaction in order to avoid correlating unrelated transactions based on the time when they were broadcast. Suggested independently of this PR [here](https://github.com/bitcoin/bitcoin/issues/30471).\r\n* Consider periodically sending transactions that did not originate from the node as decoy, discussed [here](https://github.com/bitcoin/bitcoin/pull/29415#discussion_r2035414972).\r\n* Consider waiting for peer's FEEFILTER message and if the transaction that was sent to the peer is below that threshold, then assume the peer is going to drop it. Then use this knowledge to retry more aggressively with another peer, instead of the current 10 min. See [comment below](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3258611648).\r\n\r\n---\r\n\r\n_A previous incarnation of this can be found at https://github.com/bitcoin/bitcoin/pull/27509. It puts the transaction in the mempool and (tries to) hide it from the outside observers. This turned out to be too error prone or maybe even impossible._\r\n",
-    "labels": [
-      {
-        "id": 955867938,
-        "node_id": "MDU6TGFiZWw5NTU4Njc5Mzg=",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20rebase",
-        "name": "Needs rebase",
-        "description": "",
-        "color": "cccccc",
-        "default": false
-      }
-    ],
+    "labels": [],
     "created_at": "2024-02-09T13:39:10Z",
-    "updated_at": "2025-10-01T21:47:13Z",
-    "mergeable": false,
-    "mergeable_state": "dirty",
+    "updated_at": "2025-10-02T10:31:24Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
     "merged": false,
+    "merge_commit_sha": "e8aff9fe5a5ab5c4941d5979f5f08f567f9bbcf6",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -144,11 +135,11 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": false,
+    "rebaseable": true,
     "head": {
       "label": "vasild:private_broadcast",
       "ref": "private_broadcast",
-      "sha": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "sha": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "user": {
         "login": "vasild",
         "id": 266751,
@@ -246,7 +237,7 @@
         "forks_count": 1,
         "stargazers_count": 7,
         "watchers_count": 7,
-        "size": 268552,
+        "size": 268535,
         "default_branch": "master",
         "open_issues_count": 2,
         "is_template": false,
@@ -259,9 +250,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-10-01T15:56:58Z",
+        "pushed_at": "2025-10-02T10:57:50Z",
         "created_at": "2018-02-07T11:52:47Z",
-        "updated_at": "2025-10-01T13:56:43Z",
+        "updated_at": "2025-10-02T06:36:17Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -283,7 +274,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "acc7f2a433b131597124ba0fbbe9952c4d36a872",
+      "sha": "75353a016357f3ed0d2178f8432dfe495df4aa62",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -378,12 +369,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37924,
-        "stargazers_count": 85804,
-        "watchers_count": 85804,
-        "size": 294325,
+        "forks_count": 37931,
+        "stargazers_count": 85813,
+        "watchers_count": 85813,
+        "size": 294352,
         "default_branch": "master",
-        "open_issues_count": 804,
+        "open_issues_count": 807,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -402,7 +393,7 @@
         "visibility": "public",
         "pushed_at": "2025-10-01T21:17:34Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-10-01T21:17:42Z",
+        "updated_at": "2025-10-02T09:48:01Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -465,9 +456,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2024-02-09T13:39:13Z",
-      "updated_at": "2025-10-01T15:57:48Z",
+      "updated_at": "2025-10-02T10:05:56Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/29415.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [zzzi2p](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2025920443), [nothingmuch](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-1984991157), [jonatack](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2905206387), [kdmukai](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2956071169), [kevkevinpal](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2972766537), [RandyMcMillan](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3172916955) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2203472829), [mzumsande](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-2932613802), [andrewtoth](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3315093703) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#33454](https://github.com/bitcoin/bitcoin/pull/33454) (net: support overriding the proxy selection in ConnectNode() by vasild)\n* [#33300](https://github.com/bitcoin/bitcoin/pull/33300) (fuzz: compact block harness by Crypt-iQ)\n* [#33191](https://github.com/bitcoin/bitcoin/pull/33191) (net: Provide block templates to peers on request by ajtowns)\n* [#32747](https://github.com/bitcoin/bitcoin/pull/32747) (Introduce SockMan (\"lite\"): low-level socket handling for HTTP by pinheadmz)\n* [#32394](https://github.com/bitcoin/bitcoin/pull/32394) (net: make m_nodes_mutex non-recursive by vasild)\n* [#32326](https://github.com/bitcoin/bitcoin/pull/32326) (net: improve the interface around FindNode() and avoid a recursive mutex lock by vasild)\n* [#32065](https://github.com/bitcoin/bitcoin/pull/32065) (i2p: make a time gap between creating transient sessions and using them by vasild)\n* [#32015](https://github.com/bitcoin/bitcoin/pull/32015) (net: replace manual reference counting of CNode with shared_ptr by vasild)\n* [#30595](https://github.com/bitcoin/bitcoin/pull/30595) (kernel: Introduce initial C header API by TheCharlatan)\n* [#30277](https://github.com/bitcoin/bitcoin/pull/30277) ([DO NOT MERGE] Erlay: bandwidth-efficient transaction relay protocol (Full implementation) by sr-gi)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29278](https://github.com/bitcoin/bitcoin/pull/29278) (Wallet:  Add `maxfeerate` wallet startup option by ismaelsadeeq)\n* [#28690](https://github.com/bitcoin/bitcoin/pull/28690) (build: Introduce internal kernel library by TheCharlatan)\n* [#28584](https://github.com/bitcoin/bitcoin/pull/28584) (Fuzz: extend CConnman tests by vasild)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n* [#27865](https://github.com/bitcoin/bitcoin/pull/27865) (wallet: Track no-longer-spendable TXOs separately by achow101)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\nPossible typos and grammar issues:\n\n- for a transaction be sent -> for a transaction to be sent [missing \"to\" makes the phrase ungrammatical]\n- we  consider -> we consider [double space between \"we\" and \"consider\"]\n- and/if how to broadcast it -> and/or how to broadcast it [\"and/if\" is unclear; \"and/or\" or \"and if/how\" is grammatical]\n- mimick -> mimic [spelling error]\n\n<sup>drahtbot_id_5_m</sup>\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/29415.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [zzzi2p](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2025920443), [nothingmuch](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-1984991157), [jonatack](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2905206387), [kdmukai](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2956071169), [kevkevinpal](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2972766537), [RandyMcMillan](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3172916955) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-2203472829), [mzumsande](https://github.com/bitcoin/bitcoin/pull/29415#pullrequestreview-2932613802), [andrewtoth](https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3315093703) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#33454](https://github.com/bitcoin/bitcoin/pull/33454) (net: support overriding the proxy selection in ConnectNode() by vasild)\n* [#33300](https://github.com/bitcoin/bitcoin/pull/33300) (fuzz: compact block harness by Crypt-iQ)\n* [#33191](https://github.com/bitcoin/bitcoin/pull/33191) (net: Provide block templates to peers on request by ajtowns)\n* [#32747](https://github.com/bitcoin/bitcoin/pull/32747) (Introduce SockMan (\"lite\"): low-level socket handling for HTTP by pinheadmz)\n* [#32394](https://github.com/bitcoin/bitcoin/pull/32394) (net: make m_nodes_mutex non-recursive by vasild)\n* [#32326](https://github.com/bitcoin/bitcoin/pull/32326) (net: improve the interface around FindNode() and avoid a recursive mutex lock by vasild)\n* [#32065](https://github.com/bitcoin/bitcoin/pull/32065) (i2p: make a time gap between creating transient sessions and using them by vasild)\n* [#32015](https://github.com/bitcoin/bitcoin/pull/32015) (net: replace manual reference counting of CNode with shared_ptr by vasild)\n* [#30595](https://github.com/bitcoin/bitcoin/pull/30595) (kernel: Introduce initial C header API by TheCharlatan)\n* [#30277](https://github.com/bitcoin/bitcoin/pull/30277) ([DO NOT MERGE] Erlay: bandwidth-efficient transaction relay protocol (Full implementation) by sr-gi)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29278](https://github.com/bitcoin/bitcoin/pull/29278) (Wallet:  Add `maxfeerate` wallet startup option by ismaelsadeeq)\n* [#28690](https://github.com/bitcoin/bitcoin/pull/28690) (build: Introduce internal kernel library by TheCharlatan)\n* [#28584](https://github.com/bitcoin/bitcoin/pull/28584) (Fuzz: extend CConnman tests by vasild)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n* [#27865](https://github.com/bitcoin/bitcoin/pull/27865) (wallet: Track no-longer-spendable TXOs separately by achow101)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\nPossible typos and grammar issues:\n\n- for a transaction be sent -> for a transaction to be sent [missing \"to\" makes the sentence ungrammatical and harder to parse]\n- mimick -> mimic [spelling error; \"mimic\" is the correct verb]\n- p2p_port(self.num_nodes (which is 2)) -> p2p_port(self.num_nodes) (which is 2) [mismatched parentheses in the comment makes it confusing to read]\n\n<sup>drahtbot_id_5_m</sup>\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -16444,126 +16435,6 @@
       }
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQxNjg2YmQ4ZGNiNDI1MjliM2MxMDZjYzBjZjRhNWFmNDRkNzRhMWQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d",
-      "tree": {
-        "sha": "4d945e526499bb30b03dd89e3b3f5fe0a3104443",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4d945e526499bb30b03dd89e3b3f5fe0a3104443"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 4d945e526499bb30b03dd89e3b3f5fe0a3104443\nparent acc7f2a433b131597124ba0fbbe9952c4d36a872\nauthor Vasil Dimov <vd@FreeBSD.org> 1702556461 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759327526 +0200\n\nlog: introduce a new category for private broadcast\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdNSYACgkQVN8G9ktV\ny78FNCAAq8l8HZ/qQP6/9cQHjLXJ43d0yNUN/BkHSew1X+GWGUO9sTVOoU+nw6vu\nQXGdnYttVMmyRicNowBnnDnoDq1F1eS+8mK7wvLTA8SVTJrqLbberQLkiUHrymZO\nbEmfvSsHr3l0Qog0O9jfwB8zY6bbrVTZ54y9dxTSivgOHH6DcSSQN5Jrcbnul/VC\nhW06kuj2phdKBzN+Zsx4jDQt7ulVyAKEf7qkPfNxv00RqM7/3Da3/bWJPClrpNi7\nAmOll1g4k0IWLhvPMuuDKxE2B61WenGSDHbW57eT3V910WqAV4wDAENv9DkXDg7d\nUl2PTfSrQUQifcixuTbziZ8rdHifhudGmKwnN7OwX4FImpB69u3ngQ9eCMyHEzkp\n2TnL99wsXEuCBzlwBoLx826nZv/ZIIT2K/JI1gBuIwD//zchlfiDqCJRKKM1nlL6\n8+hQro7NH7Z3IxP8vsNVkQfTxWC2Sh5aEdrJvaMqjK9Sg48tEw25zMKGlHNcLHWr\ncQLCsGCr05H47I438wFflEJ7MdoWTm+gIF1UIrf9CDEJzngr6vMOCQyoPGiJ6KxC\nFRRyg/aMjQpoBT9K6BmYUOsqVkCc5N2LWipGdo+9beUYZUiwHnBATp3yQinT3jAh\nVq4hwMd2XyJDrBPK6bgd31JFKES3LHG+xp9Ce+43AcJtl929t0eq1A7WDSh6u3lQ\na0YIcJ8CJmsQw82aglN+6EWgOW2F8UvztVHnCT96keTFAA5N6yhk9a/1QjLOdUdg\n4lWfcp6LOtqxgPGKxCdGUFvXO4Vq7FXh6FzvAwhtLf72lGad3YJt68rJ+HUalXfd\ntC8rWV0moseAnI24uw/lbOjbw44Xdkk2zVhJ98dSFgKc3XanYQgbHSGLLIK6kLg4\nDk73KeF2Gn9Vl0mhp8oXGadq0vJR34+3nleU4i5rmcFIC7d9NIFOgOVU3aiiR+zw\nFbnVw1kWrGL1tscItNLqPn5wZcLPE+wgbN02huvawaFZbphbUY3qscoUtEp31LfZ\nuz0m9ODW3/jCI5Vm6JbBhR2avCE4GL17FuYF+8sYEGn1HMfGXQIxmCyeD9Pbx1Xz\nQjJeB4DNOP4pvHAcMXFQF78XeLQhaygzi7vAWFfZSw4KACSQSYCGFeSBYylnXtoD\njwNud4TKeLqe0p7TZ6FlZxi8c2gY0cAHCVqvMJH8DFhrxmHfe2BQHP2ClJLQMucl\nwE0auw2IUwXUNC1GroM9eaqrSliNIIg57qk2ghQEAbz8UYAh6HiUr6LxwZyxjH8C\n+gn/6xyD8HqBVxmstEOW6A5KasoKXvu0ahKH3p8lMJereHLCCiMHmgMIM+SQsT2k\nZkd/zjfL/tIs33ERp0jUNal00TbbPQ==\n=sLuk\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/acc7f2a433b131597124ba0fbbe9952c4d36a872",
-          "sha": "acc7f2a433b131597124ba0fbbe9952c4d36a872",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/acc7f2a433b131597124ba0fbbe9952c4d36a872"
-        }
-      ],
-      "message": "log: introduce a new category for private broadcast",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T14:05:26Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-12-14T12:21:01Z"
-      },
-      "sha": "d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDNkMTFiZDYzMTBiNDMyYWZkNmE0N2Y5YzA3OWYxYjdjNmUzOGEzNmE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3d11bd6310b432afd6a47f9c079f1b7c6e38a36a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/3d11bd6310b432afd6a47f9c079f1b7c6e38a36a",
-      "tree": {
-        "sha": "138e8e27628371d759a2f529fb68c2f75f01f9bc",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/138e8e27628371d759a2f529fb68c2f75f01f9bc"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 138e8e27628371d759a2f529fb68c2f75f01f9bc\nparent d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d\nauthor Vasil Dimov <vd@FreeBSD.org> 1702559465 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759327529 +0200\n\ninit: introduce a new option to enable/disable private broadcast\n\nCo-authored-by: brunoerg <brunoely.gc@gmail.com>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdNSoACgkQVN8G9ktV\ny79geh/8DfKuq4D0dKxId13JNUyc1MxKUFxdFWxv+vkbpxoYXGGofZgVdpYgiUwE\nUyftmXpCroXXfmr5TkFVxMkEG4WNI/Atel28bA/jelNors05mMrvYHwLGNOPIo2c\nBqcprmDJp+NlSQfLddw+h12wOb++MH8Pq0hAn+XS5zYTWO5Ak8d6MFJyHZ9FxcFn\nS3imnkYoNasUcaT7LPNKZzXcl7GAEJdOZXyqNORBIUkHB1/QeiQhnczSRzZcEFiV\nYoNVQ5pc3aQuNvzYxCMILzU3Te224ja/x5D8BwW7rTQsSe8Qe9wILocVktERD5/L\nv1kO9QQP6KTIRnhDp0J+/jxAu1zWsZq9K/M7s/IkvyW+1x4Gz5O8QaQTahbjeCpj\nm/MUK998TP/mfrMY1mLH0/NXEU7Mix65R4ZdM7luD5Bu7RfybYlwp1VzoRMso9hC\nPpJt0hObGlqQDlLeiD9n0zimKnH0GtQJ0BpDWoD5hp6aBtz2WKy1P8V2PYGDSD4t\nC3hK7lhYZaCnLP+su/unShWJSgcT5nNc4ZiGpFp8Kv+4fD5PvUu/xI6IUkklNLW3\nRNNLzK8nDwwt7DBso50ADlpDHSwp2PnGMzTNdooNbZfvYXuu3prEK+OKP7+nxVR+\nvmNcWiqbpKe2KbXeXP+lhAiQply9xZyw+J8XHN7qMXPPy9tDce+1eWR3BAJOKE/1\nZiI8ln6DWB0vC8edfM8U8mKrbJzBfkfcB1JRX2K8iUVYVx36VKMLwqU1S71du7/r\nUq07Ta8RSDsxkftvfNqwubHf6oNZr3AMm4riIN35gR5KiaQihT965f7ijDvm3o6P\nQvlBOoP35xYEVwGJXLHIU3HguMvx0H0Re5oWDA7mPdQXtgNCDGaU0y+1F+IhUeUw\nMTz/2ewCrs2EOZdBJTZe0OiZCE8BUETnVy1IF76oyQd0EU3RfZfenTsQslO/xnxF\n4JlesFwbdHYWVk7KokdVFHAuRpOEczj0uXGG1xWX3ajIwiu7ki0DwolgMSwE52Ch\n7QfkdDcZPGM6vZdFZYaOpfQwUB1h2AdLnUmTvv7rNzCDk4QI9w/JgB4FzJFKqPZI\n7dYl0jVvhO++Z7tJXo9CbyyybAr2U1gF2vKlh9UmYISLBQmMyU7KB2b7Qd+4R9AN\nHK2GRt7Oe5wvtSNnVht3htXID+MYMHBqXhRM8q8o+4AY5N4hB7+/fe2pGV+VCbXZ\nKaPTBZbzlmXpbNo3BDHo5cc9Kz9trJV5+hbv2moCsoy0maE0SwQ1WHPA05pMo6nZ\nRF53fClOPrDEz6IUYMDa9ITlHIni0OZ1CYDZbyFM/PzIRyhQ6EfZBK+7x/e3p6yM\nQJr/mnzfkbOqtcb4OMsTx0tR/U2FmA==\n=ZTtC\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d",
-          "sha": "d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d1686bd8dcb42529b3c106cc0cf4a5af44d74a1d"
-        }
-      ],
-      "message": "init: introduce a new option to enable/disable private broadcast\n\nCo-authored-by: brunoerg <brunoely.gc@gmail.com>",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T14:05:29Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-12-14T13:11:05Z"
-      },
-      "sha": "3d11bd6310b432afd6a47f9c079f1b7c6e38a36a"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDg1NjQxNzc5MWMzNDliMjA5YjdkMjA0MzY1ZDZmODY2NGJhNmM4YTE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/856417791c349b209b7d204365d6f8664ba6c8a1",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/856417791c349b209b7d204365d6f8664ba6c8a1",
-      "tree": {
-        "sha": "6c36bc3fd777fcc0fc477eea4ba150f615de1e18",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6c36bc3fd777fcc0fc477eea4ba150f615de1e18"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 6c36bc3fd777fcc0fc477eea4ba150f615de1e18\nparent 3d11bd6310b432afd6a47f9c079f1b7c6e38a36a\nauthor Vasil Dimov <vd@FreeBSD.org> 1702560848 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759327530 +0200\n\nnet: introduce a new connection type for private broadcast\n\nWe will open a short-lived connection to a random Tor or I2P peer,\nsend our transaction to that peer and close the connection.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdNSsACgkQVN8G9ktV\ny79XjB//XueKZsPAfkNacUCK0YYwxh0Xqd4aPnIPYOGAUoM6z/t5GUUoY1Ep1VXB\nZbLU0HkNvlMPg2Sc7B0JtBPgZ9r0Ie9hkivRUV2s4DqNKGCEJRnmVPLW1XF2d4OA\nCwYN+undJ+I5Uym4v0bOkrgtQNbQX5ZcNS4xP5XeRg2mtAo4c1Xnd3N2H1Plhibi\nu9fgg0kznZcNXebt/RLIPsVydYCKwyw41cbc7zLlT7GNJ26VpMy39Qbk2rxbkUoD\nvzRe83wdI0tsZN4iG8CunCoZNei6aIEjLT7GBXMtStgTZ7S6cFZ7fGodtz5tfAOM\n0XMSOrii6bPcAU22oVJEnXQPDC2Ua5HOXdUqj+G6OeZfrbRQPvYl/V3XqHQf1iQe\nGlNztdJrw+X4bEgvtZoJmdm4VrnTh4nQOitrPdXYK5Tl9wJA1COHkI6B5gfJGaVL\neITjF5IUAQomlq3hZOlBtQIwf97GlTqwO3gJiY8XGuwq9SZI48z0z0vFPQ+aoAUd\nlgk4Bv64d4mByxBpoh1oPnbeikw4qjnS5rCbP1h0VXcvqGdYM5IglTOBOa+NBhBQ\nuC7c3H9jJF0Z1PrPlV5+xYU8/L0DEo9qWdDt09ID+PdgUeUvF3YvmdcLntX39STo\n/h6KFHDxNNRMUY7y3S1f72/fxllvzjoZfz2oENRRn5A/9aGY8x6xred7gRKHCs+y\nn0/3w19gL/QGkCSHbs23rtlNn3cK3HIrqR7npqUrDx3jIa7vPVcb3ZPd6CfxyhQI\ngFJGPGizz5+dnBul7lKeILSvhxl4ko+kLh0LkCi/aeRkrOxHcweV20Jq80IbpYlW\naI8yORJXF0adHaFOMdlVjMXLitOjbTnP3540dhEJ1abGd8XvHGza6QVR+c7IhNs/\nl9gE8kLkFrpuHZ5PBTgWtcbhN4s6f4t+uj6lyI/nCSRK8Qj0kUc5higFqqwO55n4\niUF4ZXIF1DVon5WzJnrndXh6OUxJbSfWAa3aR/Yyzl9bS4QH1i4yCIfIy5gR4IJ7\nGWoh+1xnUK0ITRsCselQiyHKyw8btgaHuiTwATm0hLPlhZ2CAq87hON1lkbTbn4b\nvOjEKMh7oeQZVBmRvlVAUu3bHS0jHMadRLYDIBa06f6dgf+kix0Nb+O3PJAuYt9c\nHMdDDeX4GdIWqgmks+cCpC7NLge7D4PsMlONSpXV6lQW14dt4UcCh3MonFAvsKjR\n28ZhEm7tgGg6QSi4xtdM/DagMNlEvXTR5l8jKL9fh9sjH5+nrXPijyBob/0r1wR7\n6Y3Og6Hp/H6JT4cGR61boMuQNwbQd1vRXp1tdyzlDLOKssn+yUU2pctljBK8lxZm\nQeKSdQc1hFolxnSuKLhQmWMmBj0GXg==\n=Zub4\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3d11bd6310b432afd6a47f9c079f1b7c6e38a36a",
-          "sha": "3d11bd6310b432afd6a47f9c079f1b7c6e38a36a",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/3d11bd6310b432afd6a47f9c079f1b7c6e38a36a"
-        }
-      ],
-      "message": "net: introduce a new connection type for private broadcast\n\nWe will open a short-lived connection to a random Tor or I2P peer,\nsend our transaction to that peer and close the connection.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T14:05:30Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-12-14T13:34:08Z"
-      },
-      "sha": "856417791c349b209b7d204365d6f8664ba6c8a1"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 20035903838,
       "node_id": "HRFPE_lADOABII585-yiT2zwAAAASqO6Fe",
@@ -16682,486 +16553,6 @@
         "name": "Needs rebase",
         "color": "cccccc"
       }
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDI2MjlhNmVmYWNhZGJjNGVlMjExNDU2NWUxMWQ2MWM1ZWEzMGJjNGQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2629a6efacadbc4ee2114565e11d61c5ea30bc4d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2629a6efacadbc4ee2114565e11d61c5ea30bc4d",
-      "tree": {
-        "sha": "8e26db88376a4c931534ea4b17f99c1dd8efb874",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8e26db88376a4c931534ea4b17f99c1dd8efb874"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 8e26db88376a4c931534ea4b17f99c1dd8efb874\nparent 856417791c349b209b7d204365d6f8664ba6c8a1\nauthor Vasil Dimov <vd@FreeBSD.org> 1743525095 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759333931 +0200\n\nnet: support overriding the proxy selection in ConnectNode()\n\nNormally `ConnectNode()` would choose whether to use a proxy and which\none. Make it possible to override this from the callers and same for\n`OpenNetworkConnection()` - pass down the proxy to `ConnectNode()`.\n\nDocument both functions.\n\nThis is useful if we want to open connections to IPv4 or IPv6 peers\nthrough the Tor SOCKS5 proxy.\n\nAlso have `OpenNetworkConnection()` return whether the connection\nsucceeded or not. This can be used when the caller needs to keep track\nof how many (successful) connections were opened.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTiwACgkQVN8G9ktV\ny7/hrB/9Fypd/ErG5JiC5XkkFnJI9LenHFBBun+g20RSNFBiSb1rnXVMcng2IeDi\nwsoddnIk0le4JCr0DigowqZd/cqaYyg4+cOvxhJ/3uSmIEuiKP8vWK+qWmfcs+N2\nE1J+vbpGo5d1dX7y6SYgUsi2XvxT0xIavDeVE8liisUK1B/8cCF40mzThbWkiBpC\ntpOXZ5JCH1a3ZQNlWQ9mvO1MhU+gyfqiQJohArEug7U4BVS0GPduxT3Pe2woM3DG\n/NPILMDJeNX/ex14potibn/Vgmr/g1kWZqndYJbPRfbPGaYGb/ALrWgPQoJHKfHC\n0+TdGwQZRr+0+Z8WGidhBwNzTc+Lw5VLkqAGbpxYxn7OcefY2VPgmt1slwGaO7I1\nwOqxSlRIvQ6P/fd+APP3DMWuAU73snSaGie1n8Uugy1i1GjXmrbg7jdrCjWWW7Wn\nrR6FYTN4cfUpGA/MAecYE/SlBziUPuIRowgYbG2c3sLPVd52IS5aoDTf+2Tkzsa2\npYvM0c3u3GP8ADZ8uiszgmC1pafV5mLC36e0sDtXizYhmO5PZWzz47OQeBoTG7pI\nIaNj1kRudnoFbXzEh2whH368LCvz+HbxFblr4DK74Gvi3foYw9Bm8B7KVRHULBJT\nanrkG4rwF275MZnxrCSDA7z3EfnMUgIYsiwA8/OC4J9ps+zgyWzNRVACrehFG1mG\nNuK/a6S+WrkJYJNy/qj3JhQOLw8zsKM9lu/kCP8YB06oKAM2rxdIwP/2qiuVmOa/\nUA5EiIH0RXIdfa2JryqfijVpwSAEbL+DRcYJ+pnX0+ndntkBl4d0x4nsuA5js2gx\n7rN07VWhWberm8V1oBIEQBcHArAmWfeDP2E44rtHejdStO92zyXBdWgi5VejQdWQ\ntOXnsKVgFWllzPESNGOijC/nx8DUTQHNsNXHLzFQ48g9Z02BHJS5UKKGN66qY4tM\ngvh9EAfiU4D8D3b5ZzvyzAc4gpXwgwBZCZcwkSbpwyxcSdExN+w5RoHUiYOQZdwL\nf5UiZLhtL1kVZFuhJTYsN/5aw0RRPJHhEr/7iH4WpmtSXW8U8wyRPaMTUjPlIefN\nfSL43Tfi8fj80wtmSbMzijqGrLoQwqv5EpfLQGU3v0hQ5kWsVGH8DihHA/0I9Mfv\nE4kpzOiaYtfQxw+VlhnIbCy1HKw3qI1VaOgpjWRXmoNv93rNb0CNS5hbdZWX1UpC\n7YRhpT2QVXlJUYO+JzutwcvOSSem9jPJqqI5YdelsRSO9Wx/2AhI4saCaeRSXL2j\nulKZqzbTvGS8umLDMhBjYqpA7fiApzh8cTSF0+gBeEdWbVHIHT4n4PI70z1/fogj\nWpT5NNtQNCG+w85M8bgQZPkTgAtDyA==\n=Qxs7\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/856417791c349b209b7d204365d6f8664ba6c8a1",
-          "sha": "856417791c349b209b7d204365d6f8664ba6c8a1",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/856417791c349b209b7d204365d6f8664ba6c8a1"
-        }
-      ],
-      "message": "net: support overriding the proxy selection in ConnectNode()\n\nNormally `ConnectNode()` would choose whether to use a proxy and which\none. Make it possible to override this from the callers and same for\n`OpenNetworkConnection()` - pass down the proxy to `ConnectNode()`.\n\nDocument both functions.\n\nThis is useful if we want to open connections to IPv4 or IPv6 peers\nthrough the Tor SOCKS5 proxy.\n\nAlso have `OpenNetworkConnection()` return whether the connection\nsucceeded or not. This can be used when the caller needs to keep track\nof how many (successful) connections were opened.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:52:11Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-04-01T16:31:35Z"
-      },
-      "sha": "2629a6efacadbc4ee2114565e11d61c5ea30bc4d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDAwOGYzOGRjZjUwMWE3OWYxOTUyNjkyZGM0ODkxOGRkNWEyZWI1NWY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/008f38dcf501a79f1952692dc48918dd5a2eb55f",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/008f38dcf501a79f1952692dc48918dd5a2eb55f",
-      "tree": {
-        "sha": "c9bfa187d73dbe5d019211d3eb5da3faf9eb6ae7",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c9bfa187d73dbe5d019211d3eb5da3faf9eb6ae7"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree c9bfa187d73dbe5d019211d3eb5da3faf9eb6ae7\nparent 2629a6efacadbc4ee2114565e11d61c5ea30bc4d\nauthor Vasil Dimov <vd@FreeBSD.org> 1743566861 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334171 +0200\n\nnet: implement opening PRIVATE_BROADCAST connections\n\nImplement opening `ConnectionType::PRIVATE_BROADCAST` connections with\nthe following properties:\n* Only to Tor or I2P (or IPv4/IPv6 through the Tor proxy, if provided)\n* Open such connections only when requested and don't maintain N opened\n  connections of this type.\n* Since this is substantially different than what\n  `OpenNetworkConnection()` does, open the private broadcast connections\n  from a different thread instead of modifying `OpenNetworkConnection()`\n  to also open those types of connections.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTxwACgkQVN8G9ktV\ny79u6x//Xt1rNAqPiQN/cLGihpz/1l8N4mKp8VIPleyNUHmhlZ783yng/NzM3xbf\n+Gre1N7Roa+Y+n3fZ9eRGeGphcnt45WTjkworvuYjXyjujfhXuepoKRViC5t4vbK\nLiemIjehRUexMs0STNJtYJ3Z5B2JWIW3gW0QSRQW6QFUpIR0tF8RGozZ4tEJhMKG\nl319MnhTnrT5nBHhl97U42G1VBfInIXbbeq+nKq1SXaV0n+HHG/bEHIpM978lntl\ngIbt9ZdCBreTRJw6TjmoWKzZV5ZHZoBV7BFSbbXblx30nxYkKHUkOSsOqZpqDuIx\n0pmFOTIWcYfbTXdm75dEwGlY1bV82IZVW6JiCnW/qv73UlEMii1zUy3ttWY/VNZQ\n0BF3iOuSvQ438wJlSi6Ytp8VVpi9ltFo2luXxAmUVq3ppR4FnFaiYRojEPOuM4r5\ntfNFA6eeXPvUHQwCc7f8NduMouchdma4f5e1ZBSP+sqhwwSy5daG6icieGr2z6Xm\nUX1ySKApHpagAFHQnZDJ+moRYpkMJtggb7SxE8S9B0JaQOlj/9fF6oeDU1v1DWao\nLWUeoe5eeOEH6yRvfu/PX7N317vKMmdQwivROO7NLDRpvV01QEp9L6hK8zr9sgXa\n8UJgLB4Vpy4GocIs/vEmbg/jDh4MW8N0piwQY+bbV4NKL5m299UxgkwTvxwG2LeW\nlwRUFKURn0/u4naAr8frrwc68LUKphaIzzfiNHPIIKgpKMS5i5EoByfXMomlfw5s\nfQBCuVefkuwLV6xqVF3XUgznZEqs9sdjzUIEmlhiouBKLTKsG92XCI5ty93ob/4n\nI/O5YJp09GmA1cYExy9LLtV9KmsvZdawe843VhHAaeUsSTjzZAvsWHcK6wtJfWVV\nWBnlp6GqqPPUU2krpIO9uHT3lu/vK5v43M+V+pDbHPOFmX0n3TaCts+cNfWpkumA\nfq/6MNMFJQg4tZWzlw/Mo64UvbNdBEcCsdNa8+nFl8+sLPGNyZOO8fB7eDg0NiMw\nDCXnmuvm8Vh21YIAUq/SyrOAzV+tqmQJR+LiotY4dZIN+xXPkZQehK2FLQuHQACa\nPc+ScqNG7MxQ2D2rKd79DVDOaOhL42V0c3rJ+JSdUc0sXTt85LQDNVFjdoOw5mBt\nOi+fvg1VxlwUfi6ixAtrq6K4DmNp3c7M4bZ8DybFH+PvDNbe7PKs4hMYKdpn4iyP\nfonuCIN2mM2TkcZK2kyDXfqSP90febLmQNYM7KwR8NuM5RddLi2nUH2BGoItFqro\nuEIrWEspQXIkndebupyPVwdG/JmYSpHfVqaTbjPXZWpkNzOPfZbzxkPlXwgaYexc\navkrh16mzCdQVEbWyV0eSA2DewS/lw==\n=8++G\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2629a6efacadbc4ee2114565e11d61c5ea30bc4d",
-          "sha": "2629a6efacadbc4ee2114565e11d61c5ea30bc4d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2629a6efacadbc4ee2114565e11d61c5ea30bc4d"
-        }
-      ],
-      "message": "net: implement opening PRIVATE_BROADCAST connections\n\nImplement opening `ConnectionType::PRIVATE_BROADCAST` connections with\nthe following properties:\n* Only to Tor or I2P (or IPv4/IPv6 through the Tor proxy, if provided)\n* Open such connections only when requested and don't maintain N opened\n  connections of this type.\n* Since this is substantially different than what\n  `OpenNetworkConnection()` does, open the private broadcast connections\n  from a different thread instead of modifying `OpenNetworkConnection()`\n  to also open those types of connections.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:11Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-04-02T04:07:41Z"
-      },
-      "sha": "008f38dcf501a79f1952692dc48918dd5a2eb55f"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDc1YWI0ZDJjYjIwMzQxMjEwZjFmYzlmZmUxOTYwMGM4M2U1NWEwZjE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/75ab4d2cb20341210f1fc9ffe19600c83e55a0f1",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/75ab4d2cb20341210f1fc9ffe19600c83e55a0f1",
-      "tree": {
-        "sha": "7f8817c971d93aff77cb88eb13bb7e9abce27c94",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/7f8817c971d93aff77cb88eb13bb7e9abce27c94"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 7f8817c971d93aff77cb88eb13bb7e9abce27c94\nparent 008f38dcf501a79f1952692dc48918dd5a2eb55f\nauthor Vasil Dimov <vd@FreeBSD.org> 1703082737 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334172 +0200\n\nnet_processing: rename RelayTransaction to better describe what it does\n\nRename `PeerManager::RelayTransaction()` to\n`PeerManager::ScheduleTxForBroadcastToAll()`. The transaction is not relayed\nwhen the method returns. It is only scheduled for broadcasting at a later\ntime. Also, there will be another method which only schedules for broadcast\nto Tor or I2P peers.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTxwACgkQVN8G9ktV\ny787aiAAmi3TAE9HiYgZv1IKKNYcY4y+WHTcPtOISz+tp4uQ9eJbrOywHVg+Y/bQ\nm0ec8y9hypA2h+xJnb1KJ5O34HxNWCEfLNwWLiPusvobjzT9kU4unAN0kII2IfMw\n+BMmr64nYBdS48mpZjdRNJTt+9Oz+HmWKrF5PDSGIfrcUJZeaJ2ji/JXXymUeAvy\nYeCBasEv7c7MFTwRikVq2Gf2f0f8MQ8XbIglNtnuVOcAcF/hWh2+dARLYnQOsSDH\ndqdbiESnF9aZLOp8sL/mbbUfVuuv33W0DqZMnDdb8AVyoP2LzcSgVHJvUtzihqCB\nt1FHwu2XJWekJ1i+F8xUV0mjrv8CqL85qF/SC73flx3PNijDKET2yXkbneqFZUzM\nhIwniJAK2R66tKx/c+4oORq/xJjnweDTgQAHmDqFjtmF5mIt6Wuk+PuHwAxn14R9\nK3ixb2gAJsy/SAGljysp0ddHTv9iooPx0m44bnyvYvGFc9RGwrxI17uJRW0Fm8Ss\nLVDVPVH8+85R1fSqI/gxK/Wp1JtvREzCDt2nZEDWNOU6rpCV+WDXCQw7a86UgezG\nn9lqt5y72ykWF4f4InwtPfRH+yXO3MgMpnStxMF9TjEPgG6OFErVBfGMU2DMa+1H\nD7gy9OKgNmMP5cS+wPnEufaNpKNqCjWXDvuTXuExh06YHmjQL4z5uDh1FRHXG1G2\nCfQxpjB2Ed8b/KW6tL70Qqh46c8McgsfMjNOo8vQ5vDJv2b7MN98Jmwfh88MXI8G\n//awlpOdvxQwh/v/CVwLRFFciSW76qzx6AV3YSY+Z9Skd0ygGHKTS7SwzfKTZKS4\nDgcbceimm++rs9RbgRIzQ5TchcLLDXoA9Y6tgo/EV+lj+RXwt5eTHmOmW5lYecXn\ntkvsqfDyOEUOCgwWAJQmKZVb06+uUUtY3G3ne90rWsqsSjy07FHJsTjuO9pwBzUy\nJjORV2D41t1Wro2uqxm7cO1c4lJpDITsa8WsKiBwzMY9Y6vXbDEMaPR93J1cOlo4\npC11loa3LF/Z/fg7kH47vyFO07cbTVDhMnzmwNX3f9ZmYCWDfY+x3UvT9Lw9NrvA\n7OtiUWeo/QP0GDsaWcoaNpdOCR/AvAQEAQu/6vkP3PqsZ7fywu7Iv3sRil5hLP+G\njbcDzXSwcx7naAGqZ9wKcXyMLzbre9aDxR+8AvHMOQStFXcNsAnoeeK2EqLbR5DI\nvxuVfgFvDEkScG81f/alWVa9oHIi524t7baeTeHnkN06XDCTKnzrpehFTXrZZiTr\n6R44HfVDBlgK+lT1rbaN9nB1oIIYNuuOhzHR89azbJ+1xEE0xbnxYAKg5J9L4Mm5\n7yciyKW1fxpts4sDOdfk4lpVqRjSoQ==\n=+F0K\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/008f38dcf501a79f1952692dc48918dd5a2eb55f",
-          "sha": "008f38dcf501a79f1952692dc48918dd5a2eb55f",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/008f38dcf501a79f1952692dc48918dd5a2eb55f"
-        }
-      ],
-      "message": "net_processing: rename RelayTransaction to better describe what it does\n\nRename `PeerManager::RelayTransaction()` to\n`PeerManager::ScheduleTxForBroadcastToAll()`. The transaction is not relayed\nwhen the method returns. It is only scheduled for broadcasting at a later\ntime. Also, there will be another method which only schedules for broadcast\nto Tor or I2P peers.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:12Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-12-20T14:32:17Z"
-      },
-      "sha": "75ab4d2cb20341210f1fc9ffe19600c83e55a0f1"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDlhODllYjQzNGNkNDE3M2U5ZmY1MjhiMDJhNzM4ZjI4MDcxNWQ3ZjQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9a89eb434cd4173e9ff528b02a738f280715d7f4",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/9a89eb434cd4173e9ff528b02a738f280715d7f4",
-      "tree": {
-        "sha": "f175fcd851b9ba8c0d5f77e4d7f66749bcca5598",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f175fcd851b9ba8c0d5f77e4d7f66749bcca5598"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree f175fcd851b9ba8c0d5f77e4d7f66749bcca5598\nparent 75ab4d2cb20341210f1fc9ffe19600c83e55a0f1\nauthor Vasil Dimov <vd@FreeBSD.org> 1706198790 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334172 +0200\n\nnode: change a tx-relay on/off flag to a tri-state\n\nPreviously the `bool relay` argument to `BroadcastTransaction()`\ndesignated:\n\n```\nrelay=true: add to the mempool and broadcast to all peers\nrelay=false: add to the mempool\n```\n\nExtend this with a third option to not add the transaction to the\nmempool and broadcast privately.\n\nThis is a non-functional change - the new third option is not handled\ninside `BroadcastTransaction()` and is not used by any of the callers.\n\nThe idea for the new `node/types.h` and the comments in it by Ryan.\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTx0ACgkQVN8G9ktV\ny7+fHR//a22oJZYx9EjgQYyeBM+7hFDhsFycLuxV6Y8/ujobQDkSlMLancnKY+xH\njjr84Im4IKskVYmKBqfncf8NjVk955qVfkcFABNiOutH77hpBoHNn0/BSHDhjwgd\n8ZRdc/AOX7Nk7SYvJt/YnNcRZowZJbeum+28+bmC+O1PsWhNJDzPCfGf/4Txc7BC\nHgNB0rsgnz13Ep6adV6aS1ihPfdSWz1KK+T/MrQxskQdkQGBz82zAY5OCyEWOEUS\noAMvqJ0FqpNC3KZZMm9FsafWQj/CYcruX+UjnifBj1J4EYKiQj2PRWCCz70Ba+bJ\nOpuEWbt0mI19fi+d4WjcYAd69SagRDCu12XeS1qGVADvQYW1Pd/wEsjUolKG8qIG\nZLSTeWFEXq7GfYqGiSJ/vQFrcKGK3Ci8hQXJmBNivoHwtx3fU27nq9Ma1JM6d7ZQ\ndwmRjgZOTp029Hi4KjChvvfJfMskshll6rMUD4sEhB5zVulrbFBqkZRq8ojZcv3G\nsGttsr8m7xODFFD1zGdtquVt0Yw/LzaWFhER6AWEnhsgCVZ9LPdUSXFFg2o2Sman\nBTBXNu+CJIdxku5rMERvpMWNEg1iZmjO1+1FFg311wUqMbzxIvEeHDGg2hX7heJJ\nVXU4i8maywz1EJshIEwgKdNBlwV2sTryqjPqU7D0/5EUK8+Zm3WmJ8Nt93r64eXf\n5RS+38AY3c7rEufWM4HUUDg34b0IQS3N3K+ukxHYJSe2GblaZA/QarJagP0pG5LK\nt+vbpZbldj5wEG+udRuBUu/VtM8+TQjTzxwQp38lhKhC+SNEAYB+L3/trTQ02jlg\nBYK9B3px7/LyA254ylgX6Q9jF1QcBqerI5Sz+KMnID7fBuMEr2A1WU0z508rIOZr\nH7Id4oj+AWqTcX2edunKgdab4WxE8sV+dmnR0Ut/cjPjoQo/QG7TvHZQnO/n2YVq\nB+vem6mQOCtR+eVkgyaS8YkAp8UTve8644NmfE8qVNVkqMrwjT8/5e9Xmoe61XpF\nG7RV4DEO4FFW6qzuBXsbQ+6q1L4Tj8dOKQLfEwSL0CeHFjsFXY42S2blUVjqtC6T\nbrTa5BLHXdRFUqv1WmG4dWJY7cGWe+YGtLBYzUsXkITGPsU/k+mKR1f3It2xKiQF\nNn74PlSotn//kQEWZlAUmeKqiriDJ4tXAm1k+Ncsxg5wbnXHg0nLnfmDmEViPNHl\nVVA1aEbGo42W0gZKjNbrGTe8lOG+bnH4JwEKDTtMYFUmBOG+sXqwKak2PQ5CrMcp\nWbVGadGGB23eKyaArCMCXkKOJtmId9aF6du8o0/tL/ZDid9qejHlcu4KuYzZ6Bke\nyOQy6boaSyXEBsPSRZ9W+URg/c3NLg==\n=2DAM\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/75ab4d2cb20341210f1fc9ffe19600c83e55a0f1",
-          "sha": "75ab4d2cb20341210f1fc9ffe19600c83e55a0f1",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/75ab4d2cb20341210f1fc9ffe19600c83e55a0f1"
-        }
-      ],
-      "message": "node: change a tx-relay on/off flag to a tri-state\n\nPreviously the `bool relay` argument to `BroadcastTransaction()`\ndesignated:\n\n```\nrelay=true: add to the mempool and broadcast to all peers\nrelay=false: add to the mempool\n```\n\nExtend this with a third option to not add the transaction to the\nmempool and broadcast privately.\n\nThis is a non-functional change - the new third option is not handled\ninside `BroadcastTransaction()` and is not used by any of the callers.\n\nThe idea for the new `node/types.h` and the comments in it by Ryan.\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:12Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-01-25T16:06:30Z"
-      },
-      "sha": "9a89eb434cd4173e9ff528b02a738f280715d7f4"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGNkM2UwZTZkMGUyMjUzMGQ0ZWEwMDc3YjU5NmI3NmVlYTk5NjJlMTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/cd3e0e6d0e22530d4ea0077b596b76eea9962e19",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/cd3e0e6d0e22530d4ea0077b596b76eea9962e19",
-      "tree": {
-        "sha": "81969a86b52515ee711842afc6171a04a0728906",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/81969a86b52515ee711842afc6171a04a0728906"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 81969a86b52515ee711842afc6171a04a0728906\nparent 9a89eb434cd4173e9ff528b02a738f280715d7f4\nauthor Vasil Dimov <vd@FreeBSD.org> 1706605284 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334173 +0200\n\nnet_processing: store transactions for private broadcast in PeerManager\n\nExtend `PeerManager` with a transaction storage and a new method\n`ScheduleTxForPrivateBroadcast()` which:\n* adds a transaction to that storage and\n* calls `CConnman::PrivateBroadcastAdd()` to open dedicated privacy\n  connections that will pick an entry from the transaction storage and\n  broadcast it.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTx0ACgkQVN8G9ktV\ny7+GEiAAiZmqykFjoYj0eYUTcU70vF0D2LtKoIyX/6GBl9XYa1w+MyHNeVLk7dI4\nwk1cR+mToPi8NZDWyh7kN9QpmC/IvdJIgOTaXa+f7XY5x72S71L1XRzTjdaqE5Vw\noI9iMBddNtdZ6Xj5zzz8qYHjwM5FZHT7PX6gyISV/1sAHE3tKsUjzdpJKI5L3IEX\nW9JPMHFNzXC4+VujOZsyCqHGzcK0lToLIl0L9kPFfB+2Al4hV8Wr5pqMN2X7cW7U\nuCn7gDA8/eE9I5DTNlQpY+wibZGgcqEU0OmcgsBVSBxdnHINV0wr770CAVz34VRK\ny8x81uPjn1V3j8qYoWKCcFlmKViW0chzgwo44kA0JcA6L8udHG8SAyFrd6sRBlkK\nI0nO+aDFbRtgGL0vfrEs8eYo28G18YDjf5sbMqWq6wGRWhH6Q9liPL3j1NnVfR/f\nC0vwM+zOQShlIbgTfmpr2UzHtCcAkmOCxVXHG8cf4ldX1e3CVchgSnbV88GG9QRY\nDiHsUXwOyCzwv9HMTMr2DhR0mxPxcANrVkFJx0glS3MzuT7sdwhSzUZzTJTlVXX0\nSIvN6Oq7vwDXbRvhHn8T+or7DPsriDTiajj9Br6k8vHA1LqMdQ5/XcRdTD966J7m\nwCzZrVbWp7cHRL9SrnpDpRM1WtUO1wX82qY3trCuLd7WOqOE5NIl4utilAY5AfJE\npoPC83Wy8CdBcQOoIYbe0bf+W/Y+Y9TZ1ZxmXr+7eS+CDh77Tg6xtmWnSVxANonw\ndZzgtaXXV4s/BZelr9+U0UirdkueUaQGWSRQq2bc4nEtRkGn453gv4MpBFI006g/\nbUYM1qzgARKOxegqx8VyFihOBxZp+XZZ7VT5hhgqxaXRva8C2BdfJfYOg+2moDHq\nEXC7e3jdj76Mrqa73jmyOhjNqm8RxcRDzqUuOO/U5VW2F058Xwij6boowk0OZdtV\nJdjAGNoHA9gAAE4Iya2t2FUWBEaq7syD1q7DU1ospW+2nM5Xv2sC+bHAIYJQl6jw\nfE/UJHHrapeUU8fiLhCJMn4AfKYwsKYztYQe6vsqra4R9e0gKXPdAYwHV2hzeWuY\nZlLzf3fQp0Jo1jH4PpkmDvj1UvAf7H9B0w0iiINYJ2dbAYDEker0AeQVhxoB9oKY\nMfX3egrKj9VigDAz4IAbPEeonB9FtC+EWbGd6pKAYQgveyw+3DlHCTW4Bu4jHoON\n5+VOFRn0V9EDlQpOpbXuSFI6XOh/UTXpLfUsJuW2D+JoDkWynHojOCrQELvazpyA\nGTUgCsV4F233NI9tHYoigmPqJ4i+1wFAysQ32n7oWugyBbqd0KWFrYgEEFvfIevu\nmjGdVR/WutJazSeJA7+1FwC1Xs7tng==\n=XQOL\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9a89eb434cd4173e9ff528b02a738f280715d7f4",
-          "sha": "9a89eb434cd4173e9ff528b02a738f280715d7f4",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/9a89eb434cd4173e9ff528b02a738f280715d7f4"
-        }
-      ],
-      "message": "net_processing: store transactions for private broadcast in PeerManager\n\nExtend `PeerManager` with a transaction storage and a new method\n`ScheduleTxForPrivateBroadcast()` which:\n* adds a transaction to that storage and\n* calls `CConnman::PrivateBroadcastAdd()` to open dedicated privacy\n  connections that will pick an entry from the transaction storage and\n  broadcast it.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:13Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-01-30T09:01:24Z"
-      },
-      "sha": "cd3e0e6d0e22530d4ea0077b596b76eea9962e19"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDJkNDRhOGM4YzFiM2I1ZDlmYWVkNzVjNzU0ZjQ3NzMxN2Q3NDA5NTM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2d44a8c8c1b3b5d9faed75c754f477317d740953",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2d44a8c8c1b3b5d9faed75c754f477317d740953",
-      "tree": {
-        "sha": "c9c79d4ebb5c9a538aa4fbedefea09cd9beeac5f",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c9c79d4ebb5c9a538aa4fbedefea09cd9beeac5f"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree c9c79d4ebb5c9a538aa4fbedefea09cd9beeac5f\nparent cd3e0e6d0e22530d4ea0077b596b76eea9962e19\nauthor Vasil Dimov <vd@FreeBSD.org> 1703161470 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334174 +0200\n\nnet_processing: reorder the code that handles the VERSION message\n\nChange the order in which code snippets are executed as a result of\nreceiving the `VERSION` message. Move the snippets that do\n`MakeAndPushMessage()` near the end. This will help with handling of\nprivate broadcast connections - they do not require any of that.\n\nThis is a non-functional change.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTx4ACgkQVN8G9ktV\ny7+cJR/7BEOTeVx5CJi9HkV1fEbgX4q+0fIDyee35QxpaUcHmR6tgeh7Mm3pqdq5\n6v/ELMUww0sYSCiQtVFwU+pgoDoDRQb81dG0BnIbFbrqWSFJiu1xjz8ksnl7ylTF\nJsWJDhotjMpYxws1VJVBbdwgfcVbOgfAypNjp6Tp37vLaunw5vDTr2cAWXO8/VT5\nYwVvZPf+j36bmYITvtMweH5fohjOPB/E4s1gbRhMw8PgLVfrA+sj0rCgvYpmrTBg\nTL9QhNIA7AejjGkQUtUP/+qOqOjX03Z6xFscQVU2G19ir8+7OwktRbqJs01D/37q\n43aDZnHouu0Ce5FQ4C2B2IsuLSNUnsgGbJhFYW52BdLOO5/aOVDZQ+9K/Yr/bw4M\nOu0bLbU67s/abp1WN2KjLa8pMBlIHMVe+sJlF78iGCjFKwCdsEVnKAbGmsV6y/4B\nEEdr5ZaxfnsgO+NX7vZFJFnWlAQ2s4bpl9VWdhll1dEUm6cfUlSmZlKakiWVPO6b\n8AxvE8UEMipNLmxGoLNc6827WFiJj13q2JgIYYX2tXfuLZEFlKY2DEGpr3/GXEQC\n2tX/0Pv3lgd9PpQgcN8Sn78kSIvgojXSw82LnMyJ8tZonR/Bds3v0KfFm4BK5y3f\nqgjx4dRfvLmB4MgEoEfOe3782jYb30nxeU9rWphovOYPKNlpkbmHaiKD55XypGdL\nTvjx8UGJ76D1YKq1RHRXw/A5BOFtqOVX5IwntU07XiQEkeWlfXIl6PEtWMx9guqf\nhnwlaBwl26XC2A0MPj0Zrcc7TznMsyt+oOD7xN538z5DlVclHtvbwKtgHZZQxyOt\nMrSOAGEO7Q56xIhg90sF1bMH20Pqr2o1PZ7gPZPu8nPBRStzzEPQGWcK4Ly3NMPj\nPKqR+8yHGFNJqkQYsSnFZByqRO2atIzKLsV78vpXq63JAOnQeQ609ItpW1YmpBl9\n9LlmBFKNRZ2nT5nTXHF6yyXBbbpdlh0jT/1xAlLfrinaqmumsNfyBYmEubz1ouJp\nCB+5sit/NdY5Sz7CjTIg+Lc25oEJhVEQZIJ159Un5N00tIc98In61Ww17NrF/9y7\nmN/EWc18Md+xPR/Ph5ftVQudjjavLzNJZAaf1zq1XLl+qLeY9SmV1BoE17nwjUBW\n3qSWDl4rBSW4Er/D+cYjYg+vc32d5qEHLv9Os66bhoPEcaCHgswqm0zk+dLy5vqz\nDOvoSIG/R7sYv1OhaVu/65b77GuYL5YiHXDVyUmOY+nGHNKy/o1gI730kbKOaymv\n+SX5X+D5OsvqNQaDz4WNzUK6MQ3XXzDK7P2d4xhxHNxOH0PyA5h0wNPJYk6R4h5i\n6yFB7bC/QxJpNQpxvCXtCMGAtLAK8A==\n=U/ST\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/cd3e0e6d0e22530d4ea0077b596b76eea9962e19",
-          "sha": "cd3e0e6d0e22530d4ea0077b596b76eea9962e19",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/cd3e0e6d0e22530d4ea0077b596b76eea9962e19"
-        }
-      ],
-      "message": "net_processing: reorder the code that handles the VERSION message\n\nChange the order in which code snippets are executed as a result of\nreceiving the `VERSION` message. Move the snippets that do\n`MakeAndPushMessage()` near the end. This will help with handling of\nprivate broadcast connections - they do not require any of that.\n\nThis is a non-functional change.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:14Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-12-21T12:24:30Z"
-      },
-      "sha": "2d44a8c8c1b3b5d9faed75c754f477317d740953"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGNhYTMwNjk3MWQwMTA2ZjZjMTRlOGM2MDFiNWJlZTI5MGYzODYwNjQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/caa306971d0106f6c14e8c601b5bee290f386064",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/caa306971d0106f6c14e8c601b5bee290f386064",
-      "tree": {
-        "sha": "a74947fbece249ff65559a2f0e47e2db39df7fae",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a74947fbece249ff65559a2f0e47e2db39df7fae"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree a74947fbece249ff65559a2f0e47e2db39df7fae\nparent 2d44a8c8c1b3b5d9faed75c754f477317d740953\nauthor Vasil Dimov <vd@FreeBSD.org> 1681911630 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334174 +0200\n\nnet_processing: handle ConnectionType::PRIVATE_BROADCAST connections\n\nFor connections of type `ConnectionType::PRIVATE_BROADCAST`:\n* After receiving VERACK, relay a transaction from the list of\n  transactions for private broadcast and disconnect\n* Don't process any messages after VERACK\n* Don't send any messages other than the minimum required for the\n  transaction relay\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTx8ACgkQVN8G9ktV\ny789OCAAjbMIVZRZioEBImr8Lq77HMMUOUfOdQFPo+Di+O85Sa0MsPLyZKKYQ8T3\nIu1ogdEu5OgOqfXezwHwiUZSEZHKOl5z/x6mzymnKxJMuFBO0bAIy+563LAoFJPG\n0pga6K10BxYF5qo/aSqD3fgDXCYXPZV/YaekxrdCYRTi8uFkxmR7biTpPkB140L7\nTETI9NOY40fnHJ/IXKIGBPPx4UgIQ0PlhTwOWG0EKjkkbkNIeEv0YLAWy6svTWTO\n1Vs07XNxGNIo5BkKg2zMctog02FoZwW1pkLnLJQUPyNqp8k0pLeiHfMRk3V762ok\nG7mSOXUG8hu1GxKZijB0Dnj/a7CPKeQbk0wiCMLMAwtuPIEJ/DXVwJ46SYZpxsLs\nZQdjsqEMD/4ubU9YV6nZQBCjIrN+IybCguYn9tCbSYDTFnPXi62mUuCSl6iww3zu\nvbxOJZHEktSBlKUzqr15aiEDoImAeiYX5s49NvIf4qCbEw9mXnCBQ9BiWu2ua6Y3\nVbaBdmjHQ559lBmdc28WRWGVlyrn9+hjRXTxPwCIP+R7uevMPgKVy5g4f0BX+DiE\ntgcALdJFb+k2KigvEyWXXifSqxmeO/eAJT8C4Zdcd9LiT0PqqSBk3Hi1ue8a+eU5\nYxlMqFu45l0bNGy3pF5xLjtIJV8C97aGDu+hM8LERVq+KzYBQKCGdHKwvL83B+Ag\nFTjOKPeBjdDyYFc4nOekVR+f2v795o9rtQTXc/eW9EIJUUEDCLKbku/rVhO6k/5X\nFhGvSfdmiX0indrW4LH2I6ouVjSNAWXXczvMVRx8pRB6j4zYA0iGjBzgBKI8jXHl\n/7V/s5z/PnY0lci1+hZtThSg38YiXki3JVbqbeLhn8emOvTHRHwy0lyGWGb4C6zs\nuq7fKJmffIbLuU4kirDMTdO52BcL1R29XDRFPALsaK+QjsZB1LsVFPW4kLKHfBpL\nk87+t5z0J14qxsszi9txmetpkNMXL1/8ZUg7+t3q8pMGODZp6Hh9JlLGcYyhCSJ7\n7TeLFYvWmKCIhAwcFZHre/qPQ1gSA0c98YSNg0KfT7XX2nbjGw1XgTmRvNMUYrt6\nnOdSK+j5JMtCfg93b5C8l1ga2SdBmrvMpI7C4SUEEm+sYgFmsR/A3dBYP0d2WjGG\nOR5tssHWHgVcjX6NnFl/8NPCdakntOP88WCTSfYKHlO/tHmrGgipI8I9NB9hGNtw\nErknPjIFUloxK3XweItop/O+oqq30lyuSOEetb4sCoHmuiYRONsSFq781bPNaVEd\nP16+NLlWPIXl6GtTIKCnMDZPPs+1a6Zgfs7PTZTGLp9eclJuVJ9198O3kPKMJnBo\n/YPhSHnBGOXJmM4x5ZvgSZHmQgszEQ==\n=dpzX\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2d44a8c8c1b3b5d9faed75c754f477317d740953",
-          "sha": "2d44a8c8c1b3b5d9faed75c754f477317d740953",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2d44a8c8c1b3b5d9faed75c754f477317d740953"
-        }
-      ],
-      "message": "net_processing: handle ConnectionType::PRIVATE_BROADCAST connections\n\nFor connections of type `ConnectionType::PRIVATE_BROADCAST`:\n* After receiving VERACK, relay a transaction from the list of\n  transactions for private broadcast and disconnect\n* Don't process any messages after VERACK\n* Don't send any messages other than the minimum required for the\n  transaction relay",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:14Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-04-19T13:40:30Z"
-      },
-      "sha": "caa306971d0106f6c14e8c601b5bee290f386064"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDk1NzQ3NjgwZGY3MjljZjRlYWY4ODI3ZjAzNDQ1ZDI0YTBjNzJlNzA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/95747680df729cf4eaf8827f03445d24a0c72e70",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/95747680df729cf4eaf8827f03445d24a0c72e70",
-      "tree": {
-        "sha": "94f4d758c7c8ea0bfc42a3354e00a3d915e8bda2",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/94f4d758c7c8ea0bfc42a3354e00a3d915e8bda2"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 94f4d758c7c8ea0bfc42a3354e00a3d915e8bda2\nparent caa306971d0106f6c14e8c601b5bee290f386064\nauthor Vasil Dimov <vd@FreeBSD.org> 1706637083 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334175 +0200\n\nnet_processing: stop private broadcast of a transaction after round-trip\n\nRemove the transaction from the list of transactions to broadcast after\nwe receive it from the network.\n\nOnly remove the transaction if it is the same as the one we sent: both\ntxid and wtxid match. Don't remove transactions that have the same txid\nand different wxtid. Such transactions show that some of the private\nbroadcast recipients malleated the witness and the transaction made it\nback to us. The witness could be either:\n* invalid, in which case the transaction will not be accepted in\n  anybody's pool; or\n* valid, in which case either the original or the malleated transaction\n  will make it to nodes' mempools and eventually be mined. Our response\n  is to keep broadcasting the original. If the malleated transaction\n  wins then we will eventually stop broadcasting the original when it\n  gets stale and gets removed from the \"to broadcast\" storage cause it\n  is not acceptable in our mempool.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTx8ACgkQVN8G9ktV\ny7+qZh/9EAKF3VmMePe5k0r6LxtdZfz1jz/K9n5IzG3JwiFVv1D8GP9YgGZiu+Xd\najyC6ZhYQlljDQbhj+c3QZ0Jgo3Dm5jrkkS/KNijY5ydkugZRWhk9jzKQOiQoftV\nLekdliHDH8DhPOohM3jHTfB6QOAFtOkatjYaYBDRuke6lF1s3Yuxb5BEYZj/0XI7\nM9wz9HCIP065M7KehQk4uOlJKLKlFWvoHJ8h6FN83emaEt6xCScqfNdCpLPbk05V\nyT35+9MoAGcM6zmYceDMQ8kZmR6WO8owtFG0TRkrxo74uzNtVEV6E9TAVaQUrmEr\nJN590TvFp7IvmCEdr0/066dDlWZuTI5qHhdWoF4ivkAC6HsNy1MOl38LMHoxCt4P\nYhXhn9gfD2is1mAxy0FxhKB89jOpvh7NNjWvyDT/2d+KH9En2NexxqEnvSG1CdSs\nHKYSSOiuHXLYUIelbBjnBVlTGnzj1CbyxNn2lbmeqvAjiU03u1RInpJaSUqjePsx\nG0KhZ7L9Es5lDQ0dCsPxLnpeqkBH/4wpv6HZDPQQzZ9ABPMZwIjN8W5XVz+g7zsb\nTv8uOFucBSm+31PMBxll9YZgx5S+tAAdF+jmT4Er4LBbtBxxXOpSrMxEbUV00ssB\nfP+u8UwrNfPGPKUoIk1pBaLRCoKgGOmGi3Ovy0Ls9k5p/fhgsncFHUzTGh9RvTME\n58PQlfjJCDWMmTXWmJuQVbDvP5Yy2y91csKATnbmrHt7Xm1V1Mdy+1SSVGBLW4vi\nb7aF+pLxzHNA6lzdrPJDZvKD5eZNdZfjM8yHEYPFK/tllbESFkBar6y3sKPVXtJ1\nnwDZSvMH36/FxFP65qxMnwjyPxxUQ4TTZ9G/kEPB/ccfB1tSdtLb19VC6bAhWXmK\n23YjCoS1zb4JPox8RBH1oi3dp0nVnDkW2dK4ARwAC3GPAPX8NLXJiEzb4oIk8mhs\nBypwfgHaqpvPP0IJHaTJmGEBbxq/wglWTPZjaPcvJG2ILY9FWibu3otLiQnEObKq\ny609GsrnnACZBhAbeOYg/nvArywi5RVm3vHYPHFJ8s+dahm64lMvYtKumrAO1gct\nFMmP8Rszl7D2YlC3np5KiGzu2BLOkGGojw3nCiaZaIsiSs/0On9/SEUXbAmW5veE\nSBQ9h29C3bS0qffV1dH68vYlPGwLsNRDAXHrtga1VEGRxj24GMEK1ZiVRRNN9xc1\n8VlEkNV78AJaaJbGm5WkEFJBZuQ+gsiO4sIaPyQVW2a2aMP20wz6ajq9YHAK7yrG\nbsL0JVPiyGIDrRWfqvVx5t7LKzt1zCYc8xRUg/SWWHWkAjWBE6T1cfFp8NsaKY8J\nz3/GreQ6GQcI2V4wXoYtgcNfXcicGg==\n=slXk\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/caa306971d0106f6c14e8c601b5bee290f386064",
-          "sha": "caa306971d0106f6c14e8c601b5bee290f386064",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/caa306971d0106f6c14e8c601b5bee290f386064"
-        }
-      ],
-      "message": "net_processing: stop private broadcast of a transaction after round-trip\n\nRemove the transaction from the list of transactions to broadcast after\nwe receive it from the network.\n\nOnly remove the transaction if it is the same as the one we sent: both\ntxid and wtxid match. Don't remove transactions that have the same txid\nand different wxtid. Such transactions show that some of the private\nbroadcast recipients malleated the witness and the transaction made it\nback to us. The witness could be either:\n* invalid, in which case the transaction will not be accepted in\n  anybody's pool; or\n* valid, in which case either the original or the malleated transaction\n  will make it to nodes' mempools and eventually be mined. Our response\n  is to keep broadcasting the original. If the malleated transaction\n  wins then we will eventually stop broadcasting the original when it\n  gets stale and gets removed from the \"to broadcast\" storage cause it\n  is not acceptable in our mempool.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:15Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-01-30T17:51:23Z"
-      },
-      "sha": "95747680df729cf4eaf8827f03445d24a0c72e70"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDY1OTRiM2Y0MGVkY2YyMDdhMjFiMDM1MTA4NmY0NDQ0MDhmMjQzOGU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6594b3f40edcf207a21b0351086f444408f2438e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/6594b3f40edcf207a21b0351086f444408f2438e",
-      "tree": {
-        "sha": "b7788664e5bc1fb43deebfa796214ba31bdbf8ca",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/b7788664e5bc1fb43deebfa796214ba31bdbf8ca"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree b7788664e5bc1fb43deebfa796214ba31bdbf8ca\nparent 95747680df729cf4eaf8827f03445d24a0c72e70\nauthor Vasil Dimov <vd@FreeBSD.org> 1706635523 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334176 +0200\n\nnet_processing: retry private broadcast\n\nPeriodically check for stale transactions in peerman and if found,\nreschedule new connections to be opened by connman for broadcasting\nthem.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTyAACgkQVN8G9ktV\ny7+7wR/8CbogfuKrEHsUcL8DrvSHwc8rzw9ieGZPyejgRzUNr1a7nB8v2br6ARoA\nA80rFRgELj4OJSAlo+lwOsHmGCDPCHQTLKaU93dipNBGDz4Agrg/dVtpaER8GHW4\nyXxJXKIHtCjOyKCRSd9hjoTmsN+54Aj6eIrMNUP37Zqcwh1dl45YPkwC7WQZmc0e\ngrO/MdaoWNMv4XvhEWLwA9Lr9YTL+RCfyV82kbkOjCEZLslqpraRjM0FpCGkZnI3\nslV/Q6OsUcEixS79rHoxtHWEiJfNkqxhNI+uFpu9npycFJ4u5gd2++ncckjByDZ1\n4gwuH0fzs9GG0TePV+pwIbwQtds26pKGCxskAbv91pOVVxysYXyp4oIRFkP6hVfT\n0NXBEV/m+fW/c9B1DDFn8FrdySW70fZc9sXIKYfYzleyTKFBxNxHHMd9cxx4GpDt\nvBhFlPPmexjlPb3HtR9Nw9LNLvcdpPhHfRCEIgQILhe/GsAvdBfxRceu+f3g3gNv\nYhlHheLXAv3sqXnUcc59BhpP9wAgvgNFLN9+ZYECaXgkJSfztJfY5XuN+C0sPZxU\n7CR61ySdW90mxh9i9LjgKeRc17vhcLJF2ePN6VvQr6GKPDt+UXTT1GHaeMnC28DW\nnDlkEXqw/YwQYvInBGLF88QmDKFrazvvzH5y3EcSEAHp14uXDcxVUhtNldIyWoeF\noXqgRbfWZPPWz1FHl3O0gX2V3NuwY6eVVQWBSgbJkwVqWnqNH6yqvivjCBKqul37\nynEXJENN2mQp934p8af2f0tvsUc9PAccDDPCjn1IXAaCsSsTeFBmxCUTQg+TuKV1\nCjtUbXWGInZ4aQuGWD/zWe4HCa6jqnOuY4yOMV7kUq/2938LAae/NCJ7kr+aSrm7\nDs7XwSNghGxerhURYfX3Q7T+C46T5m6YuUMLqamyCr6hGmwWL9gR9Z4PnqZiUCKz\nHo1ywX9VAnk724HSixianND6rDs6dObp2IflV9RdOfy+ZOoRUW07jJ6Ugic+Fs1r\n+vq/5Wbrkxa4XZOM5c5d5HWkxVZMEOWGBMjD7I1/XLWoEHAsn2t+rShyvvJapNkX\nFBh6wNizfkgHPIxzPaN0SEKW3qPI8e03MQXaiUuZ0r0X6yyl9E9KtRMGeXZvrtNu\nmdRDXXEBExh0XEhwMQz1iIoF4KXXxYhLy/4ktYy2udeU3qipHDSV56Dj/pMQs8Po\nEmf6r3d52as8EHkq0X73Vg77ZPcSls1GhUOhAo+ZGO+V3WypOWhjSZOHHybqysa7\nVof+9hyd0RXU25Nx4SkCcQwEIBY8iSNyFeMaR1QYOq11Qj42OLzmsWSx9dmRgq29\nFqGhvyWiZWaeJjW4Icwu4fXJOmBD9Q==\n=e4nK\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/95747680df729cf4eaf8827f03445d24a0c72e70",
-          "sha": "95747680df729cf4eaf8827f03445d24a0c72e70",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/95747680df729cf4eaf8827f03445d24a0c72e70"
-        }
-      ],
-      "message": "net_processing: retry private broadcast\n\nPeriodically check for stale transactions in peerman and if found,\nreschedule new connections to be opened by connman for broadcasting\nthem.",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:16Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-01-30T17:25:23Z"
-      },
-      "sha": "6594b3f40edcf207a21b0351086f444408f2438e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGE5ZTUwYTkzMzBlOTA4Y2RhODQ4NDRhZWZhZWI4MGY1ZGM1MzA2ODA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a9e50a9330e908cda84844aefaeb80f5dc530680",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a9e50a9330e908cda84844aefaeb80f5dc530680",
-      "tree": {
-        "sha": "3307b2f010ffe20b45e3ffa31fc5620a397cdf90",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3307b2f010ffe20b45e3ffa31fc5620a397cdf90"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 3307b2f010ffe20b45e3ffa31fc5620a397cdf90\nparent 6594b3f40edcf207a21b0351086f444408f2438e\nauthor Vasil Dimov <vd@FreeBSD.org> 1706800264 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334176 +0200\n\nrpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTyEACgkQVN8G9ktV\ny7+fSx//aStyR/H7zneklHASwkT9jHPZkX5CMQ73zc37A3yFvUQ2sKSp3IDK0yCm\nrqpJZRfpKzLgpphbss5e66KU2yyKdfFnrngGt6xb3aa64+whA5ua165eRWI3c+O2\nMkjDIHdkTNvAUNlSoGC9uIf8r7vQkwfuM7tlOnjc74pUZFwqpZ52LlnC8ssBTFCK\ncshItfmgkJktAbjrB4HShsL9pSDNTP5qxqsBwegleqlSB98lIKvcYDOYxNYuO9ek\nvPWHAQAw9xepdKNfYKIYuKsPgbDdHd3HRraZSWilnoupNeWhCsTf2eWiG53UmW+X\nxl4wBhJrQyTc9UYJYk3V40d4WY6ZEcML0pBbBFaoQzdF4rUSyuKaNRHogiNUzdqG\nR44uM9LbQMNBw4f7qJtaRJcQnzGAqvrlGCCq2FHHf13ju51sqZCsqHnQuevIhmYi\nK+CA2IpMYa+s1ntbxq7/sqSlq5Dvq5EQdzx2wStHfmImHvGw/A9fZ5h1AEsRAZf5\npsH2ICjX+viNN3SV9rs/kGgemw/Yao+TvWd4/4CTe7ONZycX2dje83YLJp+/1ogb\nAFOKXcA9pMpI3UGz5NwugmXiy5mSYSx8Cqnq+VAi/dehSV7RMnas6/ERyALpGPgx\nYFNpReoKhtB5DrBWbT0iBP2/LVb/KZy5pTCTaKDnk7SxDWaAxglhM/yXuPfid955\nfGfa1J5pId//PFMOVGjfhN6uw43CX7PwmPQ58PFaFnB0i1s0hn9a5H92fC0hGySt\nt/wV1vWpFV3qWCvzrgL/Y0VCXrl5GhTnBRVAqE7scIL0s72Ua1DNSXNuZqtVloYT\nX5Y3MdAIC+yfakhGIaHcpGtEkcgAYggOUm0wwJ7rc67/14l4v2D4bExqiZfGu3te\nZqYWeM9cQ4GV9yDeF0G/kL6t+eF1Tio/H/c9iVl7JWuS4vPcQ/xxzXGUSVnYupuZ\ny+g7TgrNviGoPd5d5xAt22MMBN2p2cwjWT3QkmHQG8blCnypQTmqZRzA2N8aFiwh\nhquMju/S+iBzPv5gRvI514mJSeAK+smNoYTmueaisM799hjHapKRuVv5bjF7pTrT\nSiwX/8+OflkNpsWeXJCZdrqNBVRXST2gufjlydE3H5heALsOdHtDenRrjC0qxaSf\nqSecGC43I61jnRkxoKgMqGCBEjJOCjiN8RPCU0jV1d/+EcRXJSGW/R+3ZgwXwY8G\n3DvAyFbEYXEspwG4gpHguTYHJ1YRFWeTYKX38b3vTVRCkZlNgX2y7oq4Gix5sRcK\ntsfTShDVG3OV9+1tm3cxgyQtnMgIBH2JkHRr19JqMWQUBL/xfCp2po1kLmeD5erQ\nYmBuu+hvzHBBQDHdM8o6UZB6120KHw==\n=+oh0\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6594b3f40edcf207a21b0351086f444408f2438e",
-          "sha": "6594b3f40edcf207a21b0351086f444408f2438e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/6594b3f40edcf207a21b0351086f444408f2438e"
-        }
-      ],
-      "message": "rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:16Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-02-01T15:11:04Z"
-      },
-      "sha": "a9e50a9330e908cda84844aefaeb80f5dc530680"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQwMjkwNmI1ZmEwNTIwNDFiYmYyZmYyY2NhMjExYzc2YzI0MzliMjY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d02906b5fa052041bbf2ff2cca211c76c2439b26",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d02906b5fa052041bbf2ff2cca211c76c2439b26",
-      "tree": {
-        "sha": "f03211a3cb52fa7ba396f32a9d9c9507a96c62c8",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f03211a3cb52fa7ba396f32a9d9c9507a96c62c8"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree f03211a3cb52fa7ba396f32a9d9c9507a96c62c8\nparent a9e50a9330e908cda84844aefaeb80f5dc530680\nauthor Vasil Dimov <vd@FreeBSD.org> 1722432152 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334177 +0200\n\ntest: move create_malleated_version() to messages.py for reuse\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTyEACgkQVN8G9ktV\ny7/hvR//bBKJRe4XGeUZk46HakM5KW1d1wf7874hzSN1Ge8Smxg4KUm6J7pTM5+z\n3xC5An20P9rpYE2RW0ypvbQwIAOgL8n4fMu7lQtEZq1ZRnfjfGenofM09LotfcJ1\n9+NZFwqtvZxsHU/SeYFkcK/HOr8ejluJqojdfivUXB0W5iIIsqy2rfuWF68S39AH\nUKsKzdO1C3BBUq26Vv4qEaEfCKKOAX1/xyvVNuP1WlO7iwRB0gN30J1+sZaof1M4\nccomxZlpv04LM75+jcL6O8KYd67Q8Lf4yhzKDBcqjl29upE++mmKiTonFDbZAWsU\nuGLwtailf52tAoPflEibeIv9QXYKKHnbKFdqLQp2Jy6jdSu1mR+1It0fmdLy9HJM\nePMURTfv5A8ZmqKZiUjnaAWZZMvnpFk66y5G3hjhcuW+502F4wkOdzjyvVLAHplV\nFu1R3x7HTVyx9XQNLsARNjL1h2kJnpVKhS10jttjH5yONHb2FMfjBuTX7M2vD7+5\nYF3MTd2vcDLQUVZdmayp8tfgWg9wb4WSHKv9awfm06qjfzOxyLfbBNI9qpTV7CZm\nH8GKNKdbdh9agwUrdFldota4pdFvtoqKi20xbfTKeFROKeqys3hFEwVmkTnEGLFf\n3hjySWpR9rzr9mv87AQGwhJOV0/AvW6uauKJV/sqDsVQpcFhELTVVu7cdWN8Wspx\nJspJJkaZcSZ0nDF8bm4z2Qc4GWIe/2ZJoSrUedXWo+sZpMVzfPf7usbAZ2Ah80Dt\nCZ30fNgrRZOVPMVKg2zKHCaSB9T5gKwMMMUIbGCPiMIrhXzXREMQCK4ik1eFZa08\ng35goWv8Bh5KkQDWW6IpJwh+nnlLKd8/OLLgisOf5far2VWLV+f1kKvF+KXLNVPK\ngBRA80fXry54zsmNGyElL+/6DGNDJA+IRvc/qLkjYKpBvSMWi0ENLnTM7GfA9Gbg\n1fBiBlYQdtrSfAGTfpLfcsvjlT5NSiQiNQA3Y2vpA9Mtm6obOARCs9DEl/BQyAGN\nR7df+fpmlcC7OrR4zCMn6t0y0pFHK8Xp23+4hEhnqLqYGjwjjpbZ/vY8Dv4kbXrp\nHmb40XTOA3O+1uN5+2H7ESbbtgKIh+Ttn3E+VTVArB/VLhEuH8+SZ86dpU+tc8ty\nrF35CawHrQKCrQlw6adKfajkP/0SrBIqZgSjYA48q79Zmh1cnzY8l7Ip51Jwofe3\n4sj5pCNcN25wuzEPcYKwTL9wsLcsL+iLjC/NBeqSBiz1xNYPBok9lz62SDXEaLIJ\nERVFKgmqouuBxPZUx884oIkF2YONqkWtUQM/nVOr5ADYcFadfEau6Rt4Mf5a1p+4\nPrf+/bZBSSbLXKZdlfSHfLqNh3GRJw==\n=BFmI\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a9e50a9330e908cda84844aefaeb80f5dc530680",
-          "sha": "a9e50a9330e908cda84844aefaeb80f5dc530680",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a9e50a9330e908cda84844aefaeb80f5dc530680"
-        }
-      ],
-      "message": "test: move create_malleated_version() to messages.py for reuse",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:17Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2024-07-31T13:22:32Z"
-      },
-      "sha": "d02906b5fa052041bbf2ff2cca211c76c2439b26"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGIwMWQ2ZGY0NjRlNDk1ZmYzMjNhZGFmOTE3OGFkNTVmYWNjZTM0Nzg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b01d6df464e495ff323adaf9178ad55facce3478",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/b01d6df464e495ff323adaf9178ad55facce3478",
-      "tree": {
-        "sha": "6a61028d5d81e87b9d2befe15f7abb8c62f7b4bf",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6a61028d5d81e87b9d2befe15f7abb8c62f7b4bf"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 6a61028d5d81e87b9d2befe15f7abb8c62f7b4bf\nparent d02906b5fa052041bbf2ff2cca211c76c2439b26\nauthor Vasil Dimov <vd@FreeBSD.org> 1684336789 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759334177 +0200\n\ntest: add functional test for private broadcast\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjdTyIACgkQVN8G9ktV\ny795tx/+KLF66lK72kJgrZ3NbDx+Njgg7pghJZSb2GYyTaSSDuQtGSrqQbkP1pQ7\nANxBm2cljKdZrHSTEqC6mF/BAVm6YM/5op40gcbQeaHDlnLhai2In339yE1t/z4T\nu3oXq8csKuT58ljihTQDbSTei9wGvb8V4sgbYIy8sWXtxVhH3Q1ZvQULVUFtUMBg\nhJb6mM39Uzb4UhPZw2x5z5grTndDaWFgzbvZql7lu4yEv1myOm1XnSoTm9PUXwZl\nPr9bw7DcAfBEaloebR6Y1kD3iLvb0eVgBVRqc1OA/ycNJBQv6HMMwxiq+ozbCZlW\n4srABVwqRqjs1FrYginwYtKvIFYSOG53EdVJ2wwBqCbqs5TIzQRI0URzBKT10yWn\nzFmVVi/oecH1eWFJ4CmddGXe5QKPlGgTte6ihhDtZCYRVO6gOnpO+aPOpGmxy8j7\nA8GMNVBw/EKmY2iIuHwAbn5nNSCnvDqYD2ijBWmO0Jdqg4MpHkKnXTbkSyXyZ8Qw\nG66TysLNTiraHnAG7ghVKrs5lYgfMbagTbuv7Os1QUsBt0pYMgP78MAlsBtWtnjp\n3l3itTG+Wucl4jI0IzbaIMt30rvggUt3Ybxcd3eEzerny5egksWqpRaNEbOTQAxf\nPKCo8H8skxtVXSfEyP2pu9n/tiYePf7svPbz2r/DYIqhP0QCRUT4CmBzppjsREJj\nQF00LzT6ig7LxwUKxSgw/ZvmMBXMnmz6oUXKi+l1vGeoAKJe3Ejr1xPW5sdAXOVq\ndvSrM6xjqxQxWRHbiECgcaTJGtqU9V9y25u+aQf3mTLg2Rlcqrpv8JWnDjK2e8Mj\nDeiqCWmTKvFT249b41xtKM81VwYrUqssV7zb/V6Gx48Uk0Lxr2hx53rq7WrCT/wh\nBwx0o77zPCEfmGT5NL08ZypDFXRJdugxKv62fgLZMAtcea2jL2rvKt9uI6nxTuzx\nQ2z8Fg2EMWWT9cB30gwST7jiFqRiOOKqQCPXuCeU6L3pzN453Tw17y8QrczqGeoV\niapDEIfjjukwCf6T2OxXtuCx0KSJoqPDbCBkU/LXkD2KT8BHKtXw+xH5/07uOZvy\nuN2dVs7oFpYtHvb79NEG2Q+ezOwIklaMPvFScsQtnLdagEB7R2Nj8VP6daWYWRCF\n9/mNoEbk+aeYxJzADMrUUiLLlMjYPHFWOmBCSiT6IIuEQZHDJjao9EioR0xDaCB7\nv7LP6g1t6xomIlaATh6LQytubWaNXX9fVwzNRt8r4NNRDj4DQtqhgw/NBK99oVAA\ngdxrBRg2vy7alNpntdDRNMl6it654IVfBhUFxg2ldNnhmMfTEn4Hz5xET6ZEake7\nHITnN/G3vhBEcQS10cjxHRUfUuwW2w==\n=WSIf\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d02906b5fa052041bbf2ff2cca211c76c2439b26",
-          "sha": "d02906b5fa052041bbf2ff2cca211c76c2439b26",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d02906b5fa052041bbf2ff2cca211c76c2439b26"
-        }
-      ],
-      "message": "test: add functional test for private broadcast",
-      "committer": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2025-10-01T15:56:17Z"
-      },
-      "author": {
-        "name": "Vasil Dimov",
-        "email": "vd@FreeBSD.org",
-        "date": "2023-05-17T15:19:49Z"
-      },
-      "sha": "b01d6df464e495ff323adaf9178ad55facce3478"
     },
     {
       "event": "head_ref_force_pushed",
@@ -17284,10 +16675,696 @@
       }
     },
     {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDVkMGMzYjI0Yjg0MDdjMjQ5NzM0MWRlYjc3MTY4MzVlNTAzODlmYTM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5d0c3b24b8407c2497341deb7716835e50389fa3",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5d0c3b24b8407c2497341deb7716835e50389fa3",
+      "tree": {
+        "sha": "f8e82ca32455fc402b5748186efd0788236925fb",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f8e82ca32455fc402b5748186efd0788236925fb"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree f8e82ca32455fc402b5748186efd0788236925fb\nparent 75353a016357f3ed0d2178f8432dfe495df4aa62\nauthor Vasil Dimov <vd@FreeBSD.org> 1702556461 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759396793 +0200\n\nlog: introduce a new category for private broadcast\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeQ7kACgkQVN8G9ktV\ny79kTyAAqf+8LbSRp1v/t2IAlPY6zknDVKuahiuQYQo6OKFK99CH5fYujY0XLRFA\n9Tc/P0me55nwEjWwQaLc7s1lsC/FkRY9rqx+3FBAkXwUo3+69oV7yqQPEp9SiDE2\nzjARvOzyO/w3ezNThnSeUO4sbByxAkksULvyJ9Pgr6FM8nLk29GLkKt7+DZuMo2I\nIEWeu0OxxGeE11Ub5y9jxx++v0946Y/ReW1EqFkYaEOEVe+hERGL+Uw4I3D8MgGy\n8sKpL1Gahs024CLkOQDjWcgwHmFa1JAR8T4IlAWbIuQt8vPLyVv2pKWPnyUB7ycI\nmi4b9pCqnAVk/g9Bf5NaoGC4hAmrxODec/jJ1w975rLE0qgWhUr6aHWGkb8lpL4Q\nAQ3M47HHlgp/OwZpt8qZzMZyeoaGoDJyuEL1R1mivvA0m8UagYD+g5UOaRuzgi+5\n90JyA4Ida0bbYCNgU9VttZZGt6EGY3wmu5EVkrhCPcqfc8AFVtxtAkf64AK4KDoY\n/T1w9lZk7e3i+Ih1tksGsL8JxYRjxJiM0W+OuhpfaIMOe06C5efZKNr/eFUkLZy2\nmZnm17ysjog0PrgBmlLBY+7Hpi/KtNmmkepo20H+/ZHw5PEZX2KgdnHkmFVgEjrt\np8UK3n/XuwdvR/nnm7AVWBrwYooCY+aNtD8hKrQtKJKHStvSqUrFA/PMg9VfNWlQ\nRyJdP1C2NMsf72aYJO7IBjDTBnaCEWce9OMUXc9sdvh7WhYrJC0QJ2jcRbfjad+M\nYpsiHhZVg2jjEg7sxmDe7ai3X9TL2IfvOBc/iSoB9tMgeBJzte/TYzz9tvPlFXSl\ngx3H3TMKYn5mlU+bIGQcRk++v+F5pVNTpIzBloML0uhhXQJf+S5AL/Y91n9KrQFq\nm2YeWRdv/9zP5wfXqQ2zLdT3w8h6RAWigRKTPnOb6gpfXz4/XzY8my4bv+zxCInI\na2kmmdTA4ssuUg38yA/32UVzwfbog3YbOEhYfgzG9tYfyVSkmrF+72br4JiF71Eb\nFuGAjeUUp0knC3dKluN1yY/JuHC64Pp7D1XHYBP9qzNBd695mIYHOwI2qOq1UeOL\nBiQCwQuptSfNbIXPoG2mT7R/AWRo2H08UotYSTICj6H8+VJPbdZb6JgqD57OAhZ2\nqFhSET0KI/2L8mNgWLs0xY3mBbRfgZVM7iRGfkwLHutNqv/+MDOadR2ampBmcClM\nf7XyUoGNfJfzrfdhlh+MKD1S5zCamp4CbnFaF8NUO83KWdZ7LMjEqpGL44jIT3Cj\nEkcY6twTQ44Ozkiouf0MoHfPhDr+lBdq3Ndp/cfsD3AjdsVh+FUbv6iqwUHoiFfB\nR3aQNDRRp8NvfJFesgWnkkbvnz9pWw==\n=+r9O\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/75353a016357f3ed0d2178f8432dfe495df4aa62",
+          "sha": "75353a016357f3ed0d2178f8432dfe495df4aa62",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/75353a016357f3ed0d2178f8432dfe495df4aa62"
+        }
+      ],
+      "message": "log: introduce a new category for private broadcast",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T09:19:53Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-12-14T12:21:01Z"
+      },
+      "sha": "5d0c3b24b8407c2497341deb7716835e50389fa3"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDUxZjcwMTJlMTI3ZDg1MDZmNjE0NmU3NTRhOTY0MTAzZGQxMDU1NGY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/51f7012e127d8506f6146e754a964103dd10554f",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/51f7012e127d8506f6146e754a964103dd10554f",
+      "tree": {
+        "sha": "41882a28495c04201984c890c4201cbbd6ee051d",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/41882a28495c04201984c890c4201cbbd6ee051d"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 41882a28495c04201984c890c4201cbbd6ee051d\nparent 5d0c3b24b8407c2497341deb7716835e50389fa3\nauthor Vasil Dimov <vd@FreeBSD.org> 1702559465 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759396793 +0200\n\ninit: introduce a new option to enable/disable private broadcast\n\nCo-authored-by: brunoerg <brunoely.gc@gmail.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeQ7oACgkQVN8G9ktV\ny79Jtx/+MyIG7UQkixC7Q3mJwyBlu35aU+a1/6b6vUuigVXCwpQy2iUjQk0hZgvQ\n2v3npeHhmiu98X/U0SsP4cmry2xD+ynOwOXbDyzrvb2YPgGABz4kSnMg8Eq6Ka4k\nesuHQDABTtIenwiPLZlmDLz5Z6m18H0ijtXNFpJ89yJeCBa1/qskz13BUrLsLn+y\n4GDXf1Osl3e6nvo27zpyWlcMznkA7bTleF5JcppiD/i23hbnaCBTo0xGX2cRXEr0\nrx+HLFF8BzTX9t2TaJwB433O6AomWyzxuqH6Rpz7ma9iT2DzvXpjOr0Vkn2jDvE4\nQpG/Y9un4WArXEo1gaBd8efcAhZNDFvzI2eWEYtUNFMi3hBIBJAIUu8pgoAJQwmr\n5NbSIRh4Rn58nqQ+jRvAV3hD+kZMKjR9Ix+N5+eA1ZTSHevlYEJ7Sf4aFW9YwWkP\noB4BN1ygYCZk7ZZQ5MLWH8qrB0MSdWYEsVB2YDTgF8FQR8Twffo3igP2ozGO5G2Q\nD7Psp/NzZLF8HDxS1F5we/l8R4Y7WEDJ0shngiQM33IvKMECW19dxuD2Uon6qgLL\ntQw1RGHzsyN5d8vlT3QpyAxod3lRnHqx92AP4MSrzlrBHglAeogX0b2I9J2x2Klb\nVeiuLzuqCHLkEx3pa3ZstJ2CopQuoxRI2+IwZR447Zm+KXC5Z/hEjn0qMaLH3Bk+\ncvmsDkKARBl/j7SiLRFPmHy4oLPoG4sDOuZslkITsvx2G/BKMhQiYS9+qjamJCZe\n/Ir5VS0jbP5foXBD5bQdJUH6BthUYfNsA9iIeQ20VsgDjUaSiXNkJQ9D3auicqa8\neUGpNw4pVKd+VrE8WJkfAv+g31lF1viGhojGwO8Pkh3aejcAN0e2qKJVCRvzuLzs\nR2gxYZh4azOvGXx1IaPrkMM86u/1PSWE3T+GJfQ4g2/iL0b9PIwcA/Lp2J4Bz8KF\nWSbYKF7SoZvs8dUP3aEqy+io2n0HbiXpmX8QAykh0wbpzrcs/VQIRrLkBNT6o7dD\n04Nf0jcTi898M6a/wZfGdgTU3YMbcB/g+54Un6dNuJVlAFJfbSso0X7uOip6CQWP\nEfan6SlD2d9/geMY5miVHG1ehCnekEjhc8S5D5sKgDbAGCHAJbL9cjkP1tsinge0\nPiUfNkPbPLrbPwC0uf1cDfHvAi3QpT3yEqSoWA+Jxh50ee7RK6RLe/An2D6vFma6\nP3UD9vAKayKO4fLNBju+r71w5E/Z7/hqCzkvEzkU+v5W8JiKcKFgx9EJye5Ivez4\nf+ttKn+Fi53r16OWLgTJkGHMwmdbqtQkN2FoGqoBhow62JmugJLVA6sGCRBmZHJJ\nPmbuNHKOXdvgsvfhn1oBNKa+kv2l6w==\n=rjaa\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5d0c3b24b8407c2497341deb7716835e50389fa3",
+          "sha": "5d0c3b24b8407c2497341deb7716835e50389fa3",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/5d0c3b24b8407c2497341deb7716835e50389fa3"
+        }
+      ],
+      "message": "init: introduce a new option to enable/disable private broadcast\n\nCo-authored-by: brunoerg <brunoely.gc@gmail.com>",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T09:19:53Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-12-14T13:11:05Z"
+      },
+      "sha": "51f7012e127d8506f6146e754a964103dd10554f"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGM5YWFhYzkzYjFlNmNhZTIzODJjYmRiY2RiMDJjYmFiMzZlNDc5ZTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9",
+      "tree": {
+        "sha": "73ed2dbee3fb47fb0922f8ddbc7a72a6ab4a156f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/73ed2dbee3fb47fb0922f8ddbc7a72a6ab4a156f"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 73ed2dbee3fb47fb0922f8ddbc7a72a6ab4a156f\nparent 51f7012e127d8506f6146e754a964103dd10554f\nauthor Vasil Dimov <vd@FreeBSD.org> 1702560848 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759396794 +0200\n\nnet: introduce a new connection type for private broadcast\n\nWe will open a short-lived connection to a random Tor or I2P peer,\nsend our transaction to that peer and close the connection.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeQ7sACgkQVN8G9ktV\ny79SUSAAp9tI38c6JJjKqxw2a/O0nPFUBG8GASQRr1U5JjyzHLlz+HLOVmKdf0TF\nUFjh/zTL5pFqHfQx8qob6igUh2Pu9NAAvp9J8NIWnFihLul8sLT4NbzIMFfQ+GY2\nUw4kJRmXztDL4gl8Yj/GoweRIernTa84QG80JbWJS7kWcmdl/YOgrXYIULOZz+f3\n2GVnNez+0LopvHRIJNILl3DXXshTvGPMJXdcgtPFGKZ/5c6QIFtY4Pp5KRpZNYEQ\nB5Aq3WHau0hIu/w/ZLzsfMQnXaxg4wV1QBOeqQsGuOH36TnGIn3bMZTs/Ot/kCr9\nPEaNQ9PyDkxo99nxnlqoyX9ESkmmP0+MdD9AroBw0+YjtYLpvgFj4kV6j+taEJZR\nLoyeccbomh+0NiGtjj+3yQHc3uv/hMArDEuEa+agOlvdG0aY0r6OClnM8kblc7ji\nmq1K4qqrL3cnFcW5wbBDlLSaDi1nrZVuD59zapo+XmRe9sv+d/bnxIrLO1XbMdYq\nXGKXtLrylzKMPte5qIR07h9K4HvQoOHFREwYbcvglgqp307W3gq2fXB4oD+VoEOQ\nr+LXtlox7tbrKCeoFuP5a7uAOOxoYFgvjD8llVyCApHb4+auyCnTEy2E6jWI14Fa\ndQFw/tEQKQ1Qg02rJjFrwrKaGy6Sp8iBgSDEoGgKxBngR1GVdehMxzLzAfF+fkwW\nerOkFsVVZuZUshJ4tNZImvskFrqfYfD0dR+Jb/OQUa1eySSmH55Y0vofLFREknT3\nF60X6ZyUv5Zur2ATZJXi4+Dqq6KgPvVA6an4IKqi8wwji2Gg9kg1Wm9MuSkAfpJJ\nfee2bWK/+3wRpaO53oFNwMuaUdOtb079gd9eXe8XBQGx28xdbHuxti1SvWmKPP7O\nAtsgNymb3MIqiP/ZAM4lEIE7hLpSHDq4xpb4eYdf0x69Bb3wM1Us3V5wYS/AOq8k\n1DaVs7BL3NoJzPU63iSXzue2k2U5QxwGPbd4767QItieUNTK4rgQxK3VXDe0OYEA\nIKXbCY5/Hmgu0i+ieoYdGsJzOtAUtTGOHujSt3R6Bw58gy03ojpLLZeHeXwh7OZ6\nnvVfbw4loHSaimnMxZzv1/NPzMtHdyOnbhm3pDSBeeP5G0tlQ/MgGHkC1E8ZLYWl\nQC9j090rh9TwScVd9Au2QXV1hV7CrCq2/7+grF4WWkfWHC8/x1e1WFwf13ugvQpE\nHLsRfj59OAjUPaf+p7PFR4i+iuikStv8ssrbQowReuzUSUosaBlbXUutBP8OkKV/\nn5Xhmydnm32TVgFqgv6cJjUvqUfjzxa94XF64txebL2fEjPu9+VIFT8UndZzExVs\nY3IO62/M/63tKMphTBxW++vk5aOtag==\n=cUD0\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/51f7012e127d8506f6146e754a964103dd10554f",
+          "sha": "51f7012e127d8506f6146e754a964103dd10554f",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/51f7012e127d8506f6146e754a964103dd10554f"
+        }
+      ],
+      "message": "net: introduce a new connection type for private broadcast\n\nWe will open a short-lived connection to a random Tor or I2P peer,\nsend our transaction to that peer and close the connection.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T09:19:54Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-12-14T13:34:08Z"
+      },
+      "sha": "c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDM1OTAyYTliMTYxNGMxOWFiM2JjNWEwMTBjNDc0MjlmZmFlYzNlZjY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/35902a9b1614c19ab3bc5a010c47429ffaec3ef6",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/35902a9b1614c19ab3bc5a010c47429ffaec3ef6",
+      "tree": {
+        "sha": "b1e093a1425efc13500d0c6fa60871ee03463cae",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/b1e093a1425efc13500d0c6fa60871ee03463cae"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree b1e093a1425efc13500d0c6fa60871ee03463cae\nparent c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9\nauthor Vasil Dimov <vd@FreeBSD.org> 1743525095 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759396800 +0200\n\nnet: support overriding the proxy selection in ConnectNode()\n\nNormally `ConnectNode()` would choose whether to use a proxy and which\none. Make it possible to override this from the callers and same for\n`OpenNetworkConnection()` - pass down the proxy to `ConnectNode()`.\n\nDocument both functions.\n\nThis is useful if we want to open connections to IPv4 or IPv6 peers\nthrough the Tor SOCKS5 proxy.\n\nAlso have `OpenNetworkConnection()` return whether the connection\nsucceeded or not. This can be used when the caller needs to keep track\nof how many (successful) connections were opened.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeQ8AACgkQVN8G9ktV\ny79f9h/9Hfvsd5zFQiCMBO8DbOprGYk1MxXPEWDpnZ6bDz33jGwi622ow7VsRHiV\nqlhO+K9rcP5ZToYIi2zZxyDrKZ3mIn42wJr+uyX0Lc7yxzYu1IBjqPWmUE2tY2gN\n5XVGkRUni45/uMbZWqMZw4EDFGi9t9gl2A9YxSv4RJXwJI0Pm2ILeSqYNt5Jea/f\n3f8PO+y0gQjAoICBnYL1x2+prpVyoFF3ehKGwSfIqyYUpRf61hArZUHe1NRUYlSG\nVN2lI2/mMS8LfR4aWkn4L12ccU69OMcpPnqQ39rAeDc3bCOxZ0ZVMNjuS4dmPGZb\nzTExfwztDyHff78emDe/SRQojft8hR8PzMlkgMElrggwumxbbYCL4GT7KD+D3t4h\nteWqvI89n9FuUwwJCAfA7tGZC5hpCY6t6Q6hOYihLqRPUcUdOmu/SXyuzPgKBrjL\n5frMxomGx6pr7NbmDtWhnhx+ZZOr9UvEsDudFf23BZWZh+RNG9vaWrm5s90y8l0U\nYRPtDjUqD7h0KBQLjBpOpqihWZ5MMffExBE7j6g4Qt42GC+GoTFY+YXnMvDmRVwt\n3Uwoobpqz2viYQq/kjH9Bk3Uc2UDlAfmVR8SacmkdgvW0J8PfqzJrPS4N2LljP15\n/D9YDcMcQdNVptAl0V3oEkqcdv8LmjmvlZb+efWGoXNGBCDljwQ4nI68LmQZS248\nm9lfXpS5N1Hg5KNuw33mSjTGzZYMnZH/LVwgdsKzo7LyeIXMIltMwRGEl55PVnju\nqgtRkIsN8fxU1wRRwLb5ro10VnGpvatyo6wx9T0eMGU2xCzu3OYCk5SJk6BY0QSK\nTUuNG0gbYdG62+qpjit5UVYj+6EjMNqYL5YUM7PGsOmYiaSE840+/R9iG7LQqGr2\nJl43cUvixAtKw7oZ7XmInW7rgUCz5xQemqJeo8QQetM3vmelnV/6iZzY6a0FS6qJ\nnnUjDQ/D7+vNpJQjGFkKxwWJ+q9putpv7S4XfpJrMl93747U0sYoVQBwPs9U2VqN\nsSFsSqmVLk/L7/VYzImH4Nvunng2aiih1tc3FcFEilVrPNGPQmGGmieUG1qwFF/8\nnYYYHmN5LSWw56A8yWKCSs8tTPBoa1tAOBiqNDuvHFta99HSj7O9f2fYw3i6YMFD\nS7f8BVIvdMhX6KomWiiSrLvEx3CYtCuT9omShqXTtkeGA4FjyIl0QkXPMzbkEHkA\n2oB9PNVsbCwCYQOsn+AtLstYI7i6wN4qYI0aHFhl7r9/h6H/nP+oz3XUD33wWfKn\nY3/vCAofxeR4do0U41eQvOGfrp6GqymmBlXDMkLdT4oxC24HwDeO/QZqoKC18ZbK\nTtKyBkWiuGuCtvWq2HqLNlAuzpAa6A==\n=/kC5\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9",
+          "sha": "c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c9aaac93b1e6cae2382cbdbcdb02cbab36e479e9"
+        }
+      ],
+      "message": "net: support overriding the proxy selection in ConnectNode()\n\nNormally `ConnectNode()` would choose whether to use a proxy and which\none. Make it possible to override this from the callers and same for\n`OpenNetworkConnection()` - pass down the proxy to `ConnectNode()`.\n\nDocument both functions.\n\nThis is useful if we want to open connections to IPv4 or IPv6 peers\nthrough the Tor SOCKS5 proxy.\n\nAlso have `OpenNetworkConnection()` return whether the connection\nsucceeded or not. This can be used when the caller needs to keep track\nof how many (successful) connections were opened.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T09:20:00Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-04-01T16:31:35Z"
+      },
+      "sha": "35902a9b1614c19ab3bc5a010c47429ffaec3ef6"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYzYTI2YjU2ZGVjNTc2Y2FlNzMwNjAxN2NiY2Y2YjBlNDNhOTRmMzk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/63a26b56dec576cae7306017cbcf6b0e43a94f39",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/63a26b56dec576cae7306017cbcf6b0e43a94f39",
+      "tree": {
+        "sha": "d1f020b8334d9065973ba298c57489148036e879",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d1f020b8334d9065973ba298c57489148036e879"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree d1f020b8334d9065973ba298c57489148036e879\nparent 35902a9b1614c19ab3bc5a010c47429ffaec3ef6\nauthor Vasil Dimov <vd@FreeBSD.org> 1743566861 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399491 +0200\n\nnet: implement opening PRIVATE_BROADCAST connections\n\nImplement opening `ConnectionType::PRIVATE_BROADCAST` connections with\nthe following properties:\n* Only to Tor or I2P (or IPv4/IPv6 through the Tor proxy, if provided)\n* Open such connections only when requested and don't maintain N opened\n  connections of this type.\n* Since this is substantially different than what\n  `OpenNetworkConnection()` does, open the private broadcast connections\n  from a different thread instead of modifying `OpenNetworkConnection()`\n  to also open those types of connections.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkQACgkQVN8G9ktV\ny79boh//Wdld9s2LZ64rpMAmQ25Rix4+7ftgkhbZ5Iak+tJ+7Hmu3TWcs5qr8Hhz\n9iApYifgGM078m1h9fT+T+Sv4XLafVZc3uqiyyMFV5LiSI/42lvGZJj0VAjj45DO\neLkDxRQARS7ZHDQaJfEnXxGzgjY46mwUwj1tNhcqNEwpJGED8thxJvhPOVDaCAQI\nSWMkDiGpyB7s5mGslc8t+rk+B6MDVeVQSmCohvTZwgv8OWQ3v/SuzwSqfhGwU6VD\nM9lCh3yThdqBLQ69twbfPGPO7QYYrVaafPF/S8Pyyrags5r1h18zC5RDElmy1VJW\nrtGcYbONwRq+74L9zWUKF6DdlrJOrq1IHNBDLEYHfOFgUxENkvFY+vMf4Jc45VCy\nTB5TYhDwlUZ8Kh2Z1LzS3n/bzP546q0AOJjqadDfwJMzaKYNR2mnhLlPpErUOa9D\no5uzZvmo7QC4v/pUdQpDUu4qIhcIxrx00BrWkWsrEgnVufbNc8EGlR7Zcpuq39eb\nPuwTWt7LhFitz6wzIoC2vJoYj/XKs5LdMR3BnKo3zxa8xWcKSFafqjOYh7ivnT/w\nLlTj7mgfVEaIkQXNzvLGZdaEL6bKv2qwUoA+BPrI4f2Bh2faZW+0ZUA0kxViiz+8\nXcnYe+UA28jNxdNeT4d1NYiEBoFGOgd7UatfzcSWcwPzRHjXRIl7yVG4Lk3H0S6u\nnTHisveMqs/7UboU27LgVKufsao9DDSlB7amMb43Gqi1RF35RuOp1//42XcehAkm\nh6LBqnmZ37jIfCK7cFjdOECZOtA2tfyU5gsZrwnR+Ehl2ShnCSmkGRM1o/AXyccH\nndwloUJs9GpRGUwLUORGlr1W9tPBilWJe1W5cdaKeKazpkFh4l9u4OviaQOOu2I2\nS5gee67fBfoDIrj1THUAwU5b1NKC6MqOYsK56cl+2bZb+n383lhKWg6CVT/60bsX\nNpp+fUo0TyWFXeKZblhFjqSqZcXCVD1mo2X1cd7ZkuOQ7Vuez5yhEB7rOgoqE6TL\nXjMbqbJwY1JkwWl4LRBcYKcV8vrIV0JFGDgAgxuDirlZ0Sayxy6xB0xRvhN2CpOZ\nmUDqYeBE/oe9nRqsEflFiMOlGYNXOBYQ9ZzidPcEKJfVJejDLyYh04vZ33TNG8IF\nZMZ6Zc0yQYQcXhU6MIs2DX2md/EHqtcxD4HWQoNa8gx+1nqwbkFknTXUxEbgkd+e\nLkkg8JX0OTsWRtbMn+VynDoIAWStSgrINLqBrqym9Bp3/T5uwfb/MwwddfOn+ZNg\nA47FtGJV+mGj3T4ydjCAFq8BjzbLs30Iir4Kjql15dJSDSzmCLgIkQJuj0Q7t4PO\n/bZI1S7v7P/L/e1FpaTVqoOuFEhdOA==\n=zNZV\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/35902a9b1614c19ab3bc5a010c47429ffaec3ef6",
+          "sha": "35902a9b1614c19ab3bc5a010c47429ffaec3ef6",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/35902a9b1614c19ab3bc5a010c47429ffaec3ef6"
+        }
+      ],
+      "message": "net: implement opening PRIVATE_BROADCAST connections\n\nImplement opening `ConnectionType::PRIVATE_BROADCAST` connections with\nthe following properties:\n* Only to Tor or I2P (or IPv4/IPv6 through the Tor proxy, if provided)\n* Open such connections only when requested and don't maintain N opened\n  connections of this type.\n* Since this is substantially different than what\n  `OpenNetworkConnection()` does, open the private broadcast connections\n  from a different thread instead of modifying `OpenNetworkConnection()`\n  to also open those types of connections.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:51Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-04-02T04:07:41Z"
+      },
+      "sha": "63a26b56dec576cae7306017cbcf6b0e43a94f39"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGUyNTFjMjY1ZTdiZTVmMjY4NzE3ZDk0OTdlYmYyNWNiZWMzZGNkOTU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e251c265e7be5f268717d9497ebf25cbec3dcd95",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e251c265e7be5f268717d9497ebf25cbec3dcd95",
+      "tree": {
+        "sha": "d28a3a3a1ec35351630870fd01a36f90f121e4a8",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d28a3a3a1ec35351630870fd01a36f90f121e4a8"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree d28a3a3a1ec35351630870fd01a36f90f121e4a8\nparent 63a26b56dec576cae7306017cbcf6b0e43a94f39\nauthor Vasil Dimov <vd@FreeBSD.org> 1703082737 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399492 +0200\n\nnet_processing: rename RelayTransaction to better describe what it does\n\nRename `PeerManager::RelayTransaction()` to\n`PeerManager::ScheduleTxForBroadcastToAll()`. The transaction is not relayed\nwhen the method returns. It is only scheduled for broadcasting at a later\ntime. Also, there will be another method which only schedules for broadcast\nto Tor or I2P peers.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkQACgkQVN8G9ktV\ny79bNyAAjRkwKQIqcIy9vTixApSu2JY3k0KLXjRkcEftjDMPfEUrxyKUBPH5uXry\nijwRighUitE8hApq0//vdGVh1mPq5suTR0ypll8sHqHmxcVuvLiz18CZQ8jhmlZP\nMptHTP6SPHmkScbLwh49gi9ZeiDRBGR7MxLNafpdlT834q000POID7SYjyIne2Ch\nP22a+StN85veFEjlQaq7TvZFxevyahqNDUR9GjVne+vJEv+yp0oJhS6x9CLGpIy2\nNJjzDbNqQLu36ayvUwY2KYeTauKUUwB4eDRw0+BlLSUryUkoQqlV+Og9WR0THFij\nznrpWp+jr8QrnlzAuWGxVtvT3iFAeQ9FpqyNxlD70M+yA8QXXRZVwoBS/mfIC0jM\nNV+nIz3IKU2NQJL+bjNI5XRe9jxBWaBt8o9ehjXezuHPiEV2kXSCbjmWS0AbD7Gz\njeH7pyYg9xoSLwNBfHKGHYCQE6Imq6XVfc10HTYiL9YLSAaD1DVBTAWud5NiGadb\nqwSesdjQuZnZdit/NjpXt1yxtd5F7yTGh5dmlh9rkOD+0TFghvRpzEkLCS0QADpl\nFcLaWmAjD0fmeSPAclL++do0erT5TuAqQLyKzSuFq4S66RyOvrwSWqDBZQXkkSbt\n3xtwO6S2WCf0sGcAx2LEGhm79PFFAz2ttMtObaCiXyfEVUuMct4T2gO/IpilUs35\ndLLTYMOBPltZ1KlnntLjD/gc5m3yRKNC5kqNMG+6ma5JEFSZ0Wi93KAEUDTP9Asc\n9bLM29R7NHKXZ1cw/+CS17rKIsUJcSVWKvhVBYudQ9EFxOHK+DINOPAX9AIxST70\njpLTP5HMT1nE6AlOd+yHxzlfJFB5adZTBfIPE7vH4ll4wGcPaQjCpi/vjZ44/Zxy\nhMlEjUw6nD3ZXVph3Dw1bXsn8qrWuhVeiFGjHrHuiqzz3aRC4RyHFLzYlwvt2i2o\nX3FCmHsQmxymHAtWsauh1rDU3iXtfcdY5K4sEFmuay6tSRks7EnphNGdd1kpdb9S\nsMhxxJNbsUtvglDaWpFYRluMaUgAhpyEAvEqjqA8jzPI+DUxv7SX1v01XGsDTu99\n4Z5nEOJVUOcblJg04v0sWtJhZCfifl6MIfEWA7KdRcTJY2WA5i9OenW/JSaaiUiB\n0Dzmrjd/2nYwAr/unG+mJVLP0wfZ/vqtk3/FcyFh32iuERLlO9sOH0/xehTX4Bbh\nxiLi8WUCwc/6ARJT6cCoxEWMQtFFVeSksJxVny6g5bJlPwpVlC5CTDBCj/yCJEfP\nfSEP7vKdN00hyvp7JpVTbAyrioNXjgyqHg6/U/gueNtXDApMBHCklFlAlgsZaOKb\nDxz/38ZUkSvC7nnfyqciW67FZili9g==\n=FqKq\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/63a26b56dec576cae7306017cbcf6b0e43a94f39",
+          "sha": "63a26b56dec576cae7306017cbcf6b0e43a94f39",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/63a26b56dec576cae7306017cbcf6b0e43a94f39"
+        }
+      ],
+      "message": "net_processing: rename RelayTransaction to better describe what it does\n\nRename `PeerManager::RelayTransaction()` to\n`PeerManager::ScheduleTxForBroadcastToAll()`. The transaction is not relayed\nwhen the method returns. It is only scheduled for broadcasting at a later\ntime. Also, there will be another method which only schedules for broadcast\nto Tor or I2P peers.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:52Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-12-20T14:32:17Z"
+      },
+      "sha": "e251c265e7be5f268717d9497ebf25cbec3dcd95"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE4YTRiNzYwNTJiZWNhYjFkZGY3NWVhZjhhNmQxYmYyZTA2YzU1ZTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9",
+      "tree": {
+        "sha": "8134aaf246541f34fbb0b35f8d23879f76531b32",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8134aaf246541f34fbb0b35f8d23879f76531b32"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 8134aaf246541f34fbb0b35f8d23879f76531b32\nparent e251c265e7be5f268717d9497ebf25cbec3dcd95\nauthor Vasil Dimov <vd@FreeBSD.org> 1706198790 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399493 +0200\n\nnode: change a tx-relay on/off flag to a tri-state\n\nPreviously the `bool relay` argument to `BroadcastTransaction()`\ndesignated:\n\n```\nrelay=true: add to the mempool and broadcast to all peers\nrelay=false: add to the mempool\n```\n\nExtend this with a third option to not add the transaction to the\nmempool and broadcast privately.\n\nThis is a non-functional change - the new third option is not handled\ninside `BroadcastTransaction()` and is not used by any of the callers.\n\nThe idea for the new `node/types.h` and the comments in it by Ryan.\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkUACgkQVN8G9ktV\ny7/k2SAAq8ibqLDWkl2pv4CrM8EBL/4SUNcXzH2oRvJHPhVsMi2aPP7wCk8lileT\nRjNhCZOAkw7GsAVFxmUN0LjEFU/cBmHB+8XWL5cjL3BQH7VmB2yu8Q1Z4QrorFYi\n2z78LWQzmr26nRkhw35ou/PGxAXDOPsbzTGFFAOhFPCFu7/IvvMOYw38NYkXYPAg\nPlMG5V79h3QWpnpbrbAliw38GHdXa7vNrY2nDoWh6vGqHm4wQGBeLlkqncVsRJ+s\nhKldr7ytU0KYHHn6poO9LYhO+6oP2k26VRtXB0JI34h9m3/x/21EqlfCX8OurItw\ncJqDG13+4q/Fu2Hq5MCFlc/kpSRDwvBunMXHSZuOk1ShbJYxd19NEXQpc5wHqU8n\nUtZlchXXL3RHTqSRjkVbF4QBfKVeHjvOLKRnWzkhPqRjP3uN/95PiOfvQsKDqVkt\n6oIluhXB2OU0GkXq5cr8div/cobetFRtZUzFKpvWf3xf4GQwCE+eyc2bx70ZB0vI\nGqZmS/6WnH3kMDnV+yHRCmwmHqW9cbcbd5GfGtlhAQ1dbFZYb4HyJfhzPOtFeTX0\nF49zpJdsTACtLZmRjv5h/n7UOUogeCD5mr5/JloVJa6AIWrHeKiGoOXeRIREcuhD\nAONAsALxnKacLslKxi7znEAvliq1UYlmLYtUQYDSv8k/CXykLeh3L/l/pja5rkfK\nu3enT5hs0ikIvrG27svmm7cSbf9dWzkXdrjnaPWFglysL6r4+nLGcPQwL94y8G5Q\nIUlm1QS/2M2lfpYUVG94WLyPFzNPxh1yH3KoQRcsNyrX2PhqrRscPav0boBhOkkt\nOwNAn8rE596PtMS77uxnS0BRm3Jn7lF3AkuB+OlRYXOr/fPB+bS8Di5TnmjE/fmT\nGjowwiJwyt54hWp5I1fWxCoEYGkb0ki8JKEl6h81XEgyKVQa/X6h1M0vN9pucSG3\nHlgZm0ZcNsXjFA99ZtYPPcLiTwIWtRNu83DJ7bi4Sawsi/uiIqfJzmz5eBFTR9Fe\n0l7gc5z2m+dfwzADNprCAUctTI9fiF+AhOoPKMESFRd46JUlCiRqMSQ6pLJKsII3\nHZ2wxfgQz88ZryCLarjx82scjrUJcksHxXRrdcBzqm7XkktM3McyByOxcUVpxx+A\n7vNkfnT1k4qhidOZp+1u/V4fVLGQ7IJw+rkXPptVGzbN2jf/abjPF3WcwnVKiS2O\n2aBYL+X122DF9EseAKrYfcBQXUJX1hq6EVeTupPcsSB/UxVZ1CmWgnHOzTmPGhXg\n7xiavgZwh+tREAp+g+tECPnfeQt0LbffJBo1i0LHrskM8T46VOXG1pBjaD8RC9Jj\nM6Hyd1STkP2CxOqFa2X3b906s9x4AA==\n=pUry\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e251c265e7be5f268717d9497ebf25cbec3dcd95",
+          "sha": "e251c265e7be5f268717d9497ebf25cbec3dcd95",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e251c265e7be5f268717d9497ebf25cbec3dcd95"
+        }
+      ],
+      "message": "node: change a tx-relay on/off flag to a tri-state\n\nPreviously the `bool relay` argument to `BroadcastTransaction()`\ndesignated:\n\n```\nrelay=true: add to the mempool and broadcast to all peers\nrelay=false: add to the mempool\n```\n\nExtend this with a third option to not add the transaction to the\nmempool and broadcast privately.\n\nThis is a non-functional change - the new third option is not handled\ninside `BroadcastTransaction()` and is not used by any of the callers.\n\nThe idea for the new `node/types.h` and the comments in it by Ryan.\n\nCo-authored-by: Ryan Ofsky <ryan@ofsky.org>",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:53Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-01-25T16:06:30Z"
+      },
+      "sha": "18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDdiM2NkZTRiMjI2ZTQ0NzgxNWExYjVmOGM2NGQxNjdiMzg4MWQwNzQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7b3cde4b226e447815a1b5f8c64d167b3881d074",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/7b3cde4b226e447815a1b5f8c64d167b3881d074",
+      "tree": {
+        "sha": "bf1a89b93d56c88b56db24f97d3dba6f38fd4cb2",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/bf1a89b93d56c88b56db24f97d3dba6f38fd4cb2"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree bf1a89b93d56c88b56db24f97d3dba6f38fd4cb2\nparent 18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9\nauthor Vasil Dimov <vd@FreeBSD.org> 1706605284 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399493 +0200\n\nnet_processing: store transactions for private broadcast in PeerManager\n\nExtend `PeerManager` with a transaction storage and a new method\n`ScheduleTxForPrivateBroadcast()` which:\n* adds a transaction to that storage and\n* calls `CConnman::PrivateBroadcastAdd()` to open dedicated privacy\n  connections that will pick an entry from the transaction storage and\n  broadcast it.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkYACgkQVN8G9ktV\ny785jSAAmPf9jZRFK6k0BgQ9fDH6qtkz6WiZoKM4FOvUcSuK4eDfCXaJ1eZhzvsy\nPZlc55LxleBTPjMqvfSTfw17FAnd3TQnSvZm+6CkULv038/SmGkkNh5dTcXdoFEs\nqeG9ZVAr8DN82SKXk/zXrmOeOnxSXaAbVERvqB8D9Sm89646dSUy7DzyEK3FId3D\ns6QTyHESnPH/eZcIE8Kms2wGr2Bs6A3By1yWacXasGDvE8nk3d3piZ2LwqxsNxAQ\n82t+O3N6HHxMm36Yyv8SNcGAbUwhkOcTM1/p9gfzRMMkLLnIOKlJTXqNoORsj1F9\nOhwrPcbToXAgjr94JgOWTCnm6HH6BGiJQoxHKmUsur+NPIICPu7PepQntGD0u0fD\nDOdGUsWtgMxjSXnIVVs8vm/nI/jMvnKvlqjXkC6EBAk3LDTi6P0PFKtpA10Z3wf0\nHN559sqfbRXh0jRDIiDVdqgLNYUMAesznJeundUkGt1A7PF6+tfnbBHPy4EZgBU3\n0ct0VLMj9FVx65alWXm51s+bM4Yuo+p39lN9v1eYdjcrShybnD3Uzh5wpRfzoZKm\nLHJ43Th8wb1icIlhpNMYXjco0CPWkN/Ns6P4wCmSX9h+ACwYKxfAZ89vocir+ZJw\nn+j4BOdbObnhXNY/0xG27brDUJo7C/3X9FEn2CvAp6+oKM9SZk43Gu1PwUnl8D/f\n7hpZs4zKHZl9a6g/jDE6FI87S/X8v956JUnZCeg3Fk8txELJv37GYxf2qxIhBul0\npJCYURL4NSywr7jwOau8Eb1uWdnmrrgTQxHwGVbs8FSQP22Anp53Sw21faVVFmNW\nCP1x4SUtkNJugvzULugWWYpq5XCHV8dg+TbgPtiuxyXB1xbbIJpASyrf5PtbW99u\nnGnG0ncqCnYL9fFvrGg+0+bzXMztuPVj9/rpkySaZaORzPPVILnizJCTNWjHRYeP\nCKj76kW6Cy6fdD8L7XWcBpZrpqRE8U+mFvI6r9Ops1AzF5MbM6O+ubYS1tU90EWM\nAaNa6YUvZcp0DCjpgChYz3C9tHYFLJ+VHc+f3nerefBmiR/AcMY5kifRSEwvWPzj\nEIgCbBDz3io8UYB8i4sUWaX/TxggoypcDWJILpmcrnT8tVU2RvLAMB4MTJfbbELG\nGNLOJ3yIjf2FUPMaMy3H6XYIIaq3V2VWO1U/VYcI4QxoejYAfWgGUx9+dWPKh5Eq\nzn4N3h/gAy6QuKWoEFx2XjQZknHb9hNyKW8zCPWY4XsosydvnnySuFJQWzKQv9M/\nIC8TotVtffpxYxQP6AHLtM4EjGx/Nn31ryCSWJGfPxJkgyYFizQKumFMDXCX53F6\nLLx8zvrZy/M3TAa1Xba67kmBbLy/uQ==\n=L8hF\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9",
+          "sha": "18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/18a4b76052becab1ddf75eaf8a6d1bf2e06c55e9"
+        }
+      ],
+      "message": "net_processing: store transactions for private broadcast in PeerManager\n\nExtend `PeerManager` with a transaction storage and a new method\n`ScheduleTxForPrivateBroadcast()` which:\n* adds a transaction to that storage and\n* calls `CConnman::PrivateBroadcastAdd()` to open dedicated privacy\n  connections that will pick an entry from the transaction storage and\n  broadcast it.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:53Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-01-30T09:01:24Z"
+      },
+      "sha": "7b3cde4b226e447815a1b5f8c64d167b3881d074"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDU3MmJhZTVhMGUyMDM1NWQ1YmNkNDY5ZmFhMDQzN2JhMjMzNzQ1ZTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/572bae5a0e20355d5bcd469faa0437ba233745e9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/572bae5a0e20355d5bcd469faa0437ba233745e9",
+      "tree": {
+        "sha": "cfec1663871c41bd8c74e77cc296198f57c93991",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/cfec1663871c41bd8c74e77cc296198f57c93991"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree cfec1663871c41bd8c74e77cc296198f57c93991\nparent 7b3cde4b226e447815a1b5f8c64d167b3881d074\nauthor Vasil Dimov <vd@FreeBSD.org> 1703161470 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399494 +0200\n\nnet_processing: reorder the code that handles the VERSION message\n\nChange the order in which code snippets are executed as a result of\nreceiving the `VERSION` message. Move the snippets that do\n`MakeAndPushMessage()` near the end. This will help with handling of\nprivate broadcast connections - they do not require any of that.\n\nThis is a non-functional change.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkYACgkQVN8G9ktV\ny7/QKB//WrIa/rlevZxy03a8jxqWFOz1WNMcl4txDDs1eWQ3EEV2GKh4Zm0TXUHw\nLgChnTQYfEuvdSPUTvYkTUZwW3+3Qnuw+AK6p5hUvvx4mX6Ywmeo3NlzQTGRPqyG\nGt0ZcZkE+DWBVVd0/OiPtCY0yZXvI4pPxF6wVFr3+qZ/MH3pKLzIrdT6oPl5HOgj\n/Vlxvnb86WSSY1W5JtWt2QDNdLtZ0Pqpmu1P3iMcDrCejymoCRqPPFXvWfC3Af3g\nhNocqfwYgTFXuo5+fEDDGOXc6eUZbTpVzYDSRHO9paeVrHmpnVEYuufj71uHiZ++\nKjWWrBOLvw6FCV0E/ONNKXW2Qdjz59w3qdpI1g8F3DsEidUNN6mvrmY5/k4r2tbK\nUYYdT7mfJktd+oNS0wWLRAooEW9eiztZFwZJr0nfLWpPQeQpCXtzOaP5R3016+sI\nCom0gSA2Cda6Qsu8AsqCA0xf/873dqQ3qq2xMKnRh1U4G295U4DuC57FUeQPP7o5\nApDD3R2DD7Xj+9q4J8B+drt+n0b8+aO0xxyjh4yM8KNknpQdPpPCZc2/5IQt5mml\nYuDftKkXwx97y1dAbB3yG2WXpXZuyyF4KYdzhj4v6tV3SHC4il5S/HnvUAuWV6SM\n1ox249M9urE4hFn9lxQD7YhGixPFsyMTfqwt+rZQMVmCuaqxjTkuCp0XdTCsF7wy\n+dbPARGbtvZoEcvxiYXwzHgEZziUIWPU2cflWnNpAIr9ZaglUAdowREiXHa4Ea/n\nI4QOReSg/FnVCW99ARDnAZXxs4hR/FE6tfuHouQYKuL9lSLb2XcT4dMSJl9UYmmc\nwtByJEnDKN77bLhUS4R6I26es1ccjBDIpxCD1fo/HRWZ6BWY1PIS4noWg9h8+UUN\njn6wNZKEFBBxDqQzz7kGRtYYrgp9PV8MsiIQdjGLIJM/8P+rRvKeGEOxzMDTYI59\nVIVp2ts0hauGviLkaLi7o/vCMdky03ICFWWSoEoMlYI1ASD5YMjdWuyl+eU32oMX\neakmx/heJdcXpGh1e3canfOlFEyx1zN7VML29zxMtOPuKAyaF9XyqGfpQ0zkOSP3\nB0n3THd2x5YvpNWOoWwQ+U2j+YZNF+CAjncJry8aT/HtWnPE0yy0/YV79+dferEU\nJoUNxZan2ONqHUslIHq+mltJuKEeLBv1yYwSrM79zzFNrEZiXmAGO5oHGR3gS/DP\npomBU27VOR8O8I+EOoGBvbdBo/JCvfzjongFf227pnl7561loGXMEYCZz4R0CurZ\nfQAnLdnYdvehzuqwCRg3bStDm29IhUDP6c7TynnJoUBkwdapY9HYIPb490NOfivq\nS8fq6z8+GSIDBDejNobV+9PYkRl9aQ==\n=l5JY\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7b3cde4b226e447815a1b5f8c64d167b3881d074",
+          "sha": "7b3cde4b226e447815a1b5f8c64d167b3881d074",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7b3cde4b226e447815a1b5f8c64d167b3881d074"
+        }
+      ],
+      "message": "net_processing: reorder the code that handles the VERSION message\n\nChange the order in which code snippets are executed as a result of\nreceiving the `VERSION` message. Move the snippets that do\n`MakeAndPushMessage()` near the end. This will help with handling of\nprivate broadcast connections - they do not require any of that.\n\nThis is a non-functional change.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:54Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-12-21T12:24:30Z"
+      },
+      "sha": "572bae5a0e20355d5bcd469faa0437ba233745e9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMzYzNlM2Y3ZTMzZjU5ODQyZWIzNTY1MTUzNmUwMDAxMjkyNDFmYmI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c3c3e3f7e33f59842eb35651536e000129241fbb",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c3c3e3f7e33f59842eb35651536e000129241fbb",
+      "tree": {
+        "sha": "d3ba16963f36ce1c3f2421a04f93416f205025a6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d3ba16963f36ce1c3f2421a04f93416f205025a6"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree d3ba16963f36ce1c3f2421a04f93416f205025a6\nparent 572bae5a0e20355d5bcd469faa0437ba233745e9\nauthor Vasil Dimov <vd@FreeBSD.org> 1681911630 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399494 +0200\n\nnet_processing: handle ConnectionType::PRIVATE_BROADCAST connections\n\nFor connections of type `ConnectionType::PRIVATE_BROADCAST`:\n* After receiving VERACK, relay a transaction from the list of\n  transactions for private broadcast and disconnect\n* Don't process any messages after VERACK\n* Don't send any messages other than the minimum required for the\n  transaction relay\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkcACgkQVN8G9ktV\ny7+t8R/8DTcztB1Jy6rjRnD2x8zRh8+iyPFFSDIH764vK9BwZnWJO9ZV6SNH6zm9\nzK4p8cv4JDHztz0EqlJs094pXm8/QQB0eyYFxcw4vhoOlX/6eyQl9JGCLgsISnM7\n6odm5El8KVT+lmuajoLNbGEe6sv4+fy/SPCcxj78vFZs3BVpGQpaO/eb2yzHrASn\n+OXO9xZnppJVVesKuqGNVY7NB7OIiopD5KUcBVx3Xx98dz+GLbbnPW/Ku+qRSKBE\nIPAzacGrPqypSGY5J490YK7EoNEdNE55PY78Li9vbdjQOmPKa6s0jawmadkX4lfv\n3R07eYrZSvT5SEQ0OSy2WoVUmv30C2GtNE23ywM95RVXkC7iFmD28j3t/ABmwXk4\noJnLw7E31N+DuAfasT+X9KijEhTlOOuIcULCgjagEt5je4VdY2pSrJAIADjgr+ZB\n6Lp4CZf1C3J4Sar8rZ1FAm8RFQ88ED4FvBgY1w6mz0TNikwuZxIr8tB72xYZVsP5\nEfNVWjA6yAeP++RDVlkf4e5SuIWJCV1Xxmt3JHdpXNpZlFFOTOEuadtdIQSbx7vf\nzWnQ6oe/OtXFY6wztTgwxi8YEgjpqFR4Zd6zCLQVHj/dGLbZ/rpOZL8ZfaHNUZqI\nosidsL757aQ/I3tfTepkpyHG1rqdjiFdGirm0qv0cx/Ox0HCXWYKLcrzRgCkYe4l\nfnoVj3dUeZeHGLr74tb8pkXtTIyXxcDG14HC4pN2hA7UuZUi1VwxHmGai8HGmgkw\nstB6Fk4HzFRdX3Gg4WAXZA/z113tS+5FbQM3uqkArNpXe9FB1mxD7b9xeeACgYTj\nkkUX1kUakyW3ulgfHHdg7+WySzTh/Erk05Dw/ynDXDE2l1bfFUGYv1xJRJQlxnk+\ngBue+JDWM4tcVyk3R0pHyNIFPvLeDdeE7wf0r3s8KVVHqg1sJuJoF2OaF1VbSdK0\nI0gV4dhfu3quZe2wSwRf3sKfb0tRLDiwQpEAQb6QrhTlSpqKzqBSVVobijfEj6hV\nfe/R96lQmDLRCi851Ex8V/AP+eJyU/K1DsQDLXdAxqOJA4HLlQgPDQsR3TDkadGr\njV8Fty0x95JBWBPPt9aJi6ADK/egA3REQWDcGFSCRc2+zFlH66oRmoMetwJTMBIH\n2k+M9DUtBpZH2HpPPnbDpg15lom5oxspeDLO3onvbtTcWBxTcOFlZH6AnMRXpC0z\nMXRc89msziVK56RlK1t1Rg69YrWs7ePsN2IY6p5agMRkaEainRh+OtJiM7LC3Zc+\nqfH1mhdFKrqv4v3+qWjAWEWF0vpCQn4aUiDjylFpdVGaFNReHo5nhamBd3+/XSNi\nBGuwMjCF/uGq5UBq94Y4lHfP5AxIdg==\n=bO4n\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/572bae5a0e20355d5bcd469faa0437ba233745e9",
+          "sha": "572bae5a0e20355d5bcd469faa0437ba233745e9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/572bae5a0e20355d5bcd469faa0437ba233745e9"
+        }
+      ],
+      "message": "net_processing: handle ConnectionType::PRIVATE_BROADCAST connections\n\nFor connections of type `ConnectionType::PRIVATE_BROADCAST`:\n* After receiving VERACK, relay a transaction from the list of\n  transactions for private broadcast and disconnect\n* Don't process any messages after VERACK\n* Don't send any messages other than the minimum required for the\n  transaction relay",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:54Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-04-19T13:40:30Z"
+      },
+      "sha": "c3c3e3f7e33f59842eb35651536e000129241fbb"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGIwNmM1MTQ5OTNiZTIxYThiMzc2ZDlmN2RmOTg1YTM4YThjYWM1ODA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b06c514993be21a8b376d9f7df985a38a8cac580",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/b06c514993be21a8b376d9f7df985a38a8cac580",
+      "tree": {
+        "sha": "3d93a0f7bef552430d9a6037522a04c64bfd4ae5",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3d93a0f7bef552430d9a6037522a04c64bfd4ae5"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 3d93a0f7bef552430d9a6037522a04c64bfd4ae5\nparent c3c3e3f7e33f59842eb35651536e000129241fbb\nauthor Vasil Dimov <vd@FreeBSD.org> 1706637083 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399495 +0200\n\nnet_processing: stop private broadcast of a transaction after round-trip\n\nRemove the transaction from the list of transactions to broadcast after\nwe receive it from the network.\n\nOnly remove the transaction if it is the same as the one we sent: both\ntxid and wtxid match. Don't remove transactions that have the same txid\nand different wxtid. Such transactions show that some of the private\nbroadcast recipients malleated the witness and the transaction made it\nback to us. The witness could be either:\n* invalid, in which case the transaction will not be accepted in\n  anybody's pool; or\n* valid, in which case either the original or the malleated transaction\n  will make it to nodes' mempools and eventually be mined. Our response\n  is to keep broadcasting the original. If the malleated transaction\n  wins then we will eventually stop broadcasting the original when it\n  gets stale and gets removed from the \"to broadcast\" storage cause it\n  is not acceptable in our mempool.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkcACgkQVN8G9ktV\ny797Zh//cML4ucEmekOLoIt2ssGATQ5D0ELfVUUc5ChcsJUXbk3Srk01SLSHDFfX\nHY3FPqt3gqh0HdtmokbZ3gyGPW2jwJehxLU1t+ZBprugMGsTmuRf4WNOl848/gVC\nZpqFRGjpxhNQFMZXGUIVoaBCUeWxFloK6HcYHXtte8L+K5ateznKZwyjRCq7yWm8\njEexd99wXRizHtqsX32JNR7vot5QfX4MLm6QwNFlbuLAb5Gtg7biZdXcH+xc24+B\nZOSJQODcSt/n3o2EMyO0C6upjp6iqXA+crFor80xKj9SpgNaraU573Gv10uCnmD8\nb74gA9lWOd5voYU0oJ6LGVZukSa/4pK2DU93sjXRKVyCcj5roChJMXNUFJvtRj9H\nS94n9tDjkyxgXQOxfkbuz6pBxEPGdiVI6EeKCE1GMMWgPu4DmLsBi6D1k3SiXyUz\nhbc6y2A4Fv1KDnJ/3EkAylEKeUca9+iEifQmLO0dhAXmirWv2i4AcQB9uO+2ofKX\nmr/koeEWJAtN+af+7gB+0y/JjmNOHpRBjhl0moatYnZCVdsZzu6tnNG/AFoL8TZg\nZZx+i3StcuzWckBEOVsHmYgdyXRBsw9ajbR55V4SgvLzs4Bre4YMQAjeAR42QAlN\nBAi6/wqP2RnEojBfx9lWpukAgsWzQClOfmvCZyWfpyLfN0Ols3pcYVQOdo/dP1yW\n6wqV1SkqC2MhN/pmIsX/59CPBurhN4Q9con3MCsWsRAj8lFSnoG26LE4aqvF7x3m\nfn1xYdmNqzytI0eIGQ7eQGDZ0+fDclchZu5rzjVnMpiYOQeWLkKra+PL+7OmH3p4\npiN3YkTb6wnkh3owc1PyLpnBmfspoXP9IrZzW7yupejj0H/TbvUr+DtdPd76uU06\nSW0R8q2NY9ZxCWQ8U4vcFa57uRAsPdHRek92TQnE7ZyXt4FCKVIMMaNtsuV4IH1G\n3FMJaFZOpyH9KpMFFBfmF7UYOAzlxrdGtVwMpi7xB9Pgu+wCauV2e7lvwJGGjsHQ\n7sv0joufjjWehxQGp4gSc+FwS1jf3ZxdN1c+Cqi3IggqC88uzSd8kVVXNWSLFKaw\nWHhUnWQiuQO+KM9UITbQGsaL1ARXtiIGfES5ZQOf5rCj6+fIbDvvG+8UHEGNpROn\nC2AH/pDsmsPvlJNkq/Nt0RllEyACQM6s82vYRMtlELTInteXfpj65H0TRCW7M04B\nBmfSXWsAQ8T4BPAAyjruS3xj9/t1NQHXqK2DJa4T0ggA+mN7wuKNLlyp8tWfSbJJ\nLiMogLdi9XwBnOXC+P7KkDns0fvbfosNw2tKqgFRisGiODx+tWKTtRm5IjJfjYsQ\n9E/JFWgPfOif2PvTi9QIuFi46aCFaQ==\n=3rp+\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c3c3e3f7e33f59842eb35651536e000129241fbb",
+          "sha": "c3c3e3f7e33f59842eb35651536e000129241fbb",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c3c3e3f7e33f59842eb35651536e000129241fbb"
+        }
+      ],
+      "message": "net_processing: stop private broadcast of a transaction after round-trip\n\nRemove the transaction from the list of transactions to broadcast after\nwe receive it from the network.\n\nOnly remove the transaction if it is the same as the one we sent: both\ntxid and wtxid match. Don't remove transactions that have the same txid\nand different wxtid. Such transactions show that some of the private\nbroadcast recipients malleated the witness and the transaction made it\nback to us. The witness could be either:\n* invalid, in which case the transaction will not be accepted in\n  anybody's pool; or\n* valid, in which case either the original or the malleated transaction\n  will make it to nodes' mempools and eventually be mined. Our response\n  is to keep broadcasting the original. If the malleated transaction\n  wins then we will eventually stop broadcasting the original when it\n  gets stale and gets removed from the \"to broadcast\" storage cause it\n  is not acceptable in our mempool.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:55Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-01-30T17:51:23Z"
+      },
+      "sha": "b06c514993be21a8b376d9f7df985a38a8cac580"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDBlZGJiMTFjODc3YTIyZTlhMDUxMTA3YmFhNDE1MTFhNmUzNDI2Y2Q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0edbb11c877a22e9a051107baa41511a6e3426cd",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/0edbb11c877a22e9a051107baa41511a6e3426cd",
+      "tree": {
+        "sha": "5fe9ea04e3af8d760f6ffb8703d3307693025e54",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5fe9ea04e3af8d760f6ffb8703d3307693025e54"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 5fe9ea04e3af8d760f6ffb8703d3307693025e54\nparent b06c514993be21a8b376d9f7df985a38a8cac580\nauthor Vasil Dimov <vd@FreeBSD.org> 1706635523 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399496 +0200\n\nnet_processing: retry private broadcast\n\nPeriodically check for stale transactions in peerman and if found,\nreschedule new connections to be opened by connman for broadcasting\nthem.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkgACgkQVN8G9ktV\ny7/WEiAArMOLPOaoqhFs27CuO1Xzf+9mi5qSy32rbJcqrZlOvYxAxQWeIZMXccjz\nU80AdB3I6DYdYCiRFWSB72VzCGXh9gEI03KhLosjdulY3KSIvfGldKXG6Bzb7GpP\n8Gy8Z2Dm1nvpXun3IZUaOFrZcRqJZQWxoXlDYT8J4S5ekRAuGSCPv5ApdHlGY95u\nxnJXWuLU5eEWH7cDqBpymA0lv8fsxX7rQXIhuW3DJz/WmgzlJPCoSyRkmzQ17uvm\nySVudMPF/vQOOt3edtWODehDn3sw7iPqb6x3ZaxX8ehySIOm7g+fxs43ojfeIal0\nOmSPn0bocAY7T5oxEICevd+rnqwHfW+sYSmW52vPjUQO6hlxfyRoeWH1iigZ50EL\nikdcGnj7891Rc9K3V1pXq1A+FCgS9S0/KbcoTgH7WfzbqEuZ72Ls7T5XZJnIJN7T\n57mWPWAeb6bsAyS0HG8BT7fZLDgM/A2Tu4e1p/xycvkEWbe3QU1XX/GFH5HUm8XD\nWqEs1JuMzfTuUIldFxn5t+e4JRe7EkI9bQazq/z31fQme+TBpw5baKVTlV707QkT\nHfR9hPT5i6aQCXie/RkyeuxxA08joTFE87NV0BMwNANJ5Ok2cGYL/OlnReARN4dv\n0bx0ywtl28vPE8l0TnLu7KeJX3LpVB7nWERKoe3f9VXLrKjZMxAdRqjJ06Lu6yzU\nCgld7Q225fuAkGOjQfnYdm0FoVNijO+F0A9V6x554CeoKO5K1FfU0M1Gc6KFf6hF\noujzDs8Xu9sj9CYeNhG1cxL2zRNQicE0NYomLJE8A3P+j4T6NrQMpKQnU4yHyNwB\ndzD6IsV/cAoluUJd8PzoQGqGlFIWvZGnZoYRD+f1o4IF4EnnQHqawnfpWzIzf2jA\nSGY/GYVvdhywbDaKWJJc6GoyNbQ6h0/as0aQ9OQ4Se3yhvLt2o6Z8rZjLg7N1crC\nI53x6mbSG4Zic0JjjFFlh76/SDUpCdNzMmiOyG2mVL6qVUFxPQKc5i2tVA6TYGSK\nCQuLF0JzQpq/U0kiS4t5Xwkao8nTTby/jMOJgUmK+gBShgYjKRvXvV7oxGqfMgSS\nt84uQnpsjjD3U48R78rB8FbsDnRQSgHqYUkCJPdN8OwZc9F6rVmbE+OHIbK45tEG\n2DhzpHctmhS5nih1Z12ubZO/a9bpSTaCwL4If1/jwNiu2WvUC7SIYRF3lG6myLe8\nyNEZpH3hUHWc/60JXHz2hu23oLQwg2d2G752CjOGX4evJS1tT4Ps1TIqdUYHMPE9\n4DAnBCdbmGDXx8xTniXwC56nloKA1CSlXillIiqOEnnUyC8+0//Du2UAdPgWzNMB\nx18CZ8N8Oc4YJ1XUey/456n2A6W8JA==\n=pBu2\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b06c514993be21a8b376d9f7df985a38a8cac580",
+          "sha": "b06c514993be21a8b376d9f7df985a38a8cac580",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/b06c514993be21a8b376d9f7df985a38a8cac580"
+        }
+      ],
+      "message": "net_processing: retry private broadcast\n\nPeriodically check for stale transactions in peerman and if found,\nreschedule new connections to be opened by connman for broadcasting\nthem.",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:56Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-01-30T17:25:23Z"
+      },
+      "sha": "0edbb11c877a22e9a051107baa41511a6e3426cd"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMwNmIxMjkzZDQ0YjllNjZiM2JlNGEyNTZkOTBmYjU3YTc3N2M0OGI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c06b1293d44b9e66b3be4a256d90fb57a777c48b",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c06b1293d44b9e66b3be4a256d90fb57a777c48b",
+      "tree": {
+        "sha": "01bb314920c4c00a918c9c550d297c477d4f097a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/01bb314920c4c00a918c9c550d297c477d4f097a"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 01bb314920c4c00a918c9c550d297c477d4f097a\nparent 0edbb11c877a22e9a051107baa41511a6e3426cd\nauthor Vasil Dimov <vd@FreeBSD.org> 1706800264 +0100\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399496 +0200\n\nrpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkkACgkQVN8G9ktV\ny7+03R/+L6EQGJMidQrG37tKP/WIaM0evLZrpZ6D/2xwqUAnQh1Ms4g5tUU6gUWr\nXrxNdZXa9zrtY0OH02m7P4MfMzk9YfPSSuPT6AHvnwyBdgHzLfjLNWude0vUrF/5\n5ARXF5lKCvEmJbuxllQutDQHVOCOMfh22wDYOMUqwHysMzFTydg1wX+t/KeYgPSL\nXdxJdP0Xmdjk9u+sMdCZ33iQnH0hjtUkwhGjI9lv3612UfVTFppG2VOK1M1V1nAN\n9HAA9Gw8/aa3oHYD80bdfAKKnsqIwOLJIigZP1K7IME4NV+nIDtaSsmcehdLNtrj\noypetZ5vIdqLcXMx4RizE4liIzlunKd5XjVB/J4e+lFWkuPXiQlmThsyRNZz5IrN\ns9K388U0p9ZSwybp/kv1axfIAnlyHWTApEnbFWBxPfkgsxdRbGwJ+qYGiHrJeEgp\nkEh8GQGm5qJPvpb5NqCrYvAzBeeBVuIGx00xzikn2Z0Np8uKNJ6Z8MCsX113noRH\nmbldvTjpl4bDlW2v4VOWz/4zPSfyqn6NBbgHhnEL8/GqvmqxElUtfdyYvC+Ck1bT\nFyXAK8mqiyc68TyJGHYo5MVRZBBJ2EKMnkeVaNQReB8BwhF8HmV1OCf+cR5fAy/u\nf68bUEriDoj3TDO3HyCjP1ccCIy5hOnDJdXITu0r4JfmtXWC3SKSUSi+lvDFFf4F\nkE5BL5p7z1EZuk9mv0QIS8xxpvIPpXhq1gNSHtAFm0BzbUxUt5Dzh5WY7yH5aI7b\nLZFg+7y0FhnGf2cz0+lhuzoqmQzOrFJzQaAXjRShuujA/tOgI3WnPUU3jG8/NLOk\neHeqjIYUDFbnjWVAq+w8zL7HN1LCyDmm9efI0jMIz9RIsrgrlGcC+oTk4uM6Grqk\nSxWrgbes7YHxuuPtz8LYp9C+W3Zo5GhwWZAOkcva7PZja2tOM+l3+c3MaQ/mY/d/\ny7K6nqKMBIxGVL9rfz5lTu0AFfWCPIvfklTSFQMQZAHftjUhONtVSo9B3o6lyN+6\nxei0ewfEF4OwrOWm9q3ECyVjDpXb+6YcIW/akwdBj+F1kgrjlQ16zLty3oD9/Tir\nkw39AkoxNNVb0G3cLtroQyeti2qAwB5utzy2xkMruz6TocvbnkMt4yTp7mkkN6/T\neMDrem+2tb8CiYHpSpzY6OqSMkSWPZ6Lp9iCsYdwsa6p7FGf856B0p93n2J4Nuwg\nEBGJNrCQR046euS+UFTMYqRyR5A0fCh+noCp5HbSBueDCSGE0GCiA5eWAG06sD2s\nX6ZM4Fg003P9sBO+HlDYvekijG/bfc1yh6oVPqpEO7v0B9xh1CQPkErX3yK4mjfA\nVYCLZmAh+Y8mDmIwS0Q65TIhfh4C4g==\n=oTvt\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0edbb11c877a22e9a051107baa41511a6e3426cd",
+          "sha": "0edbb11c877a22e9a051107baa41511a6e3426cd",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/0edbb11c877a22e9a051107baa41511a6e3426cd"
+        }
+      ],
+      "message": "rpc: use private broadcast from sendrawtransaction RPC if -privatebroadcast is ON",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:56Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-02-01T15:11:04Z"
+      },
+      "sha": "c06b1293d44b9e66b3be4a256d90fb57a777c48b"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDAxNGM3YWE4Y2RjZDc3ZjE2MTQ3MWE4NGY4MjYzMTJlYjQwNTY2ZTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/014c7aa8cdcd77f161471a84f826312eb40566e9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/014c7aa8cdcd77f161471a84f826312eb40566e9",
+      "tree": {
+        "sha": "3b56b82f8b3cb1c2c5a1ae00e30000d872a9d29a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3b56b82f8b3cb1c2c5a1ae00e30000d872a9d29a"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 3b56b82f8b3cb1c2c5a1ae00e30000d872a9d29a\nparent c06b1293d44b9e66b3be4a256d90fb57a777c48b\nauthor Vasil Dimov <vd@FreeBSD.org> 1722432152 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399497 +0200\n\ntest: move create_malleated_version() to messages.py for reuse\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkkACgkQVN8G9ktV\ny79vgh//fLQRZ7TLIIfGjxfm/lAaR1di8+SYjStGpVRA3gmVQ4p+4WTtw8dNyZhq\n4Yt9U3ILzLRuBk1IIi1tDnPNiIGctNUFu5fqqbZPBYzg4jAptwWsQEOeKQlERBli\nJzgMurkH1DKp6EXz5Kr5nRQ/LeUzQAdmSTf0CsLsSxyQgGIm4WoSVVBvrfzq0LwK\nkvyY59jvt9SKjCgy4P2r/sIf016BcP2WTLpG913MX7jr5TvuFkkDvqe49qSCt7kK\n/jYGimTxNapUXBJhBv8he7/EWeDai+vrfBbZAL8mpsPPVbTpXtsGbKKwvgTyee7n\n1gauK7FIouZckVPYnUmT/NJ4AjOoXpt+wxxqQbW2Kmmsd0MwxzH9P2NASEvG/p50\n0namOSvMruxSk90JFU8Sry57x6oLLhkQZhkYtf+uvjJZUAhttZnDpOz73pM1NxMy\nR7mQO6UAf4Q9Jg5vp9CC7ms9DgF6vd6sN6+2OMERyucOmkIsTXOMOdLn3DeZ+Rrk\nx23Rwxy7cvoYeRLDv4AQYishJSN0AbHtUcd1v0XnpSF77uspE+icNnTj+TXWh+lF\nUzeyNlUcbe/fzRwnR1wz8nWbZqKY3WrnH1mJNd1buoIi2+3Z11hzOtJCUTqJ5ySj\n9MKnyQ4BuzUun+w+q0/vVW3LfP2eT7nhFkWZ2ncb3c1uO3cBlmjMN8D6bPciVnA8\nP8u/4YQvrSaLYDYXqAjmabbZ4hsSHW+SdpZ2KBnkgL1h48xRWzY4ZJDzKSTWLdxB\n0GYd/Y+KyAFbbe1CqhB/2LpueOfmKXzMwQjnMmlaEZgt4Mbi3PTcXzeUwnZmQF9g\nJVZrF4rdPyWFiZDPiNbrxAKnwbRUNEqajV9osfQHslcW7yuscglVey9AwV+iPKOb\nw/Q2Jjmg+FemcIDq0XDI+8eisQr1FGfOdKz6/764rwV75yMhEhJQQRTSldi2/HBk\nOLF0ohNy7qL6u4haFyrwaGwMwk6/CA1/08d+Fwospu/DFvPuaepQm/8qooLqom1C\nJMOT/QfyEf9MhEF30ecRjYk5gGSbZJmDNgdL09ol2wdKuadCixB71Uo+45yeGXrn\nB/RPoUVefRU9SlJFq1KFjj3BlLE72zUpp+s/H6IeEJ5AauaJQY+SjMsolsTHqgeJ\nLMsXJIJBgjkteKaGt+hYLYt5mJDnUNb7Gsjw/KAP8Fm5VhEYHlQQS9LhlXThNUTT\nyMbcD34YpN9rJFHKhCUgZ7PCRuRRsZ+J5g6LoPAbpgeBwT4jiZd+DlRK0+zZNwMY\nyEe1dZuy9vqkHkQfIiq9Wa9aJkNHEKEBAeSFucLHxCFAr8wRwBPFdP37znDDy28z\nqOcyXek8NRyZcZVEga+eJdEtiNVsBA==\n=YTTz\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c06b1293d44b9e66b3be4a256d90fb57a777c48b",
+          "sha": "c06b1293d44b9e66b3be4a256d90fb57a777c48b",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c06b1293d44b9e66b3be4a256d90fb57a777c48b"
+        }
+      ],
+      "message": "test: move create_malleated_version() to messages.py for reuse",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:57Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2024-07-31T13:22:32Z"
+      },
+      "sha": "014c7aa8cdcd77f161471a84f826312eb40566e9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDIxZWZlOGZhODIwN2I3MmM4OTUzNTcyYjViMDA5Mzk0YmJlNTgwYTY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/21efe8fa8207b72c8953572b5b009394bbe580a6",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/21efe8fa8207b72c8953572b5b009394bbe580a6",
+      "tree": {
+        "sha": "2e73f9abe068f4dab32a864cae17bb3fa59a1d25",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2e73f9abe068f4dab32a864cae17bb3fa59a1d25"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 2e73f9abe068f4dab32a864cae17bb3fa59a1d25\nparent 014c7aa8cdcd77f161471a84f826312eb40566e9\nauthor Vasil Dimov <vd@FreeBSD.org> 1684336789 +0200\ncommitter Vasil Dimov <vd@FreeBSD.org> 1759399497 +0200\n\ntest: add functional test for private broadcast\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQQzBAABCAAdFiEE5k2NRWFNsHVF2czBVN8G9ktVy78FAmjeTkoACgkQVN8G9ktV\ny78MRR//WQv1L6LlFQImq8YjVh3q4oBoYRGZKDQlHdbwasVUeee6qLad4RsaeDf6\n6FCO+wrMvNeXwtqMux7HbZiMrTpeYyk8W9gltIjBWZC8OtKa4UWAz65BiOtm+sHy\nyU06CFlBqmm9yeplqhAfMA/MKBUyB4mg0f/6w3bvW65vOhIwBCqRVV2LcbzJ/lIG\nI4Gi0MyLX0DIx+p0YiF9KXzdFZ6kelBT888yuO8u3WMeajjOJxrd+JLuyKQEMH4U\nuDj8rTBE6CEdK6JqA+4VGmAsMzgC2uwYzLTD5o7m33wfvdqPex3fZZ8nSJxZxG7n\nDqmFPWWnWnXspAqnB3iz4aZgCurBYBVUsGKXQZvbVpFHOzfGeGsU52B/omYwGjPS\ngSzby6xYWBGWJeQ4jMsdlsTseGhrPup94gX0EosQDxOrfzIHUHPXcX3V0lpr+W7Q\n3DWVAohqpHRya8O6vaWtvZ5Uc01FJRDy3Kr/ovbw/Q6uh15AizdrpQau51lFNblr\nrk0mun+WXqoc86rmI50xaG5VJpwq1m3PV49lS/aIZPxvFpXVcjU5hJPKWB+fshw9\nBw1dRAjH34tUdZP+IXoUhwwPH4pKWllPMiWOg47OGT2sJLgjh30xh9inmUtB1eB2\nloLA7OJjsbCmu3dNjwrQXoU+1vF69rh0i1T76jryJDzyNyCxGaUZ+x9qzsTxFkx/\nIWwE9o23TKPtxAYHLiQZemmfRz2/BbkzOM3K3u9y/LDa2Pnlgtj7oNYW/doIPF2M\ngfnKFTm+WKLGieffmt9HgT0uAolQc2hyhLe7QHniOylseOHryE3BMVH1q+/VUX+W\nkyomwUR2emBESfaVL8p+ryM91UeDFEx3QWQm++LkUwtFZoKiW88+JPh/Wrcity70\n0CdjWvntMQgXPQko8/uJeX6fO6dW0EM12yXpSsiE0m+6BBfOX6sfVJ2LJdPVFzC5\ng4/g/lEsTnQslA7hZY04KDriDONMymPQEmMglIh64VEITv9KsOb5P1ipNScgfPdG\njsCGRecz0UT3oFE7iPbf8W0dsNlH1xX3bx2eUlcEFXn/DTLOuGoNVYWKA2la2/qt\nW5iP36Tx/WTG7uKEg1YQu5DOS845YNvQHRkZKeaMg5PejW+M1IOASchQ76mvdRoE\nyAVmsgncK0yr+HjM6IL5Yzhj/PYJQI0rbjM2vfpZsGQJYsGPeonjL2iJnz4mT65H\na4z6tLavA9MHV1nWtUiZ1TVyXO0LPDx/VhSQCtqkAsH6mDmplaMNkgvU+A+UhI5P\nPLKYTvznw7W0iQ/oDooeY+mVVxDVyyZARwx9u0pwuHqLn1PHjsVAtjryy/6rFh6m\nMY4NF+Y/MSkLovmXhPRiTcbqOhXi5Q==\n=F5/+\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/014c7aa8cdcd77f161471a84f826312eb40566e9",
+          "sha": "014c7aa8cdcd77f161471a84f826312eb40566e9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/014c7aa8cdcd77f161471a84f826312eb40566e9"
+        }
+      ],
+      "message": "test: add functional test for private broadcast",
+      "committer": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2025-10-02T10:04:57Z"
+      },
+      "author": {
+        "name": "Vasil Dimov",
+        "email": "vd@FreeBSD.org",
+        "date": "2023-05-17T15:19:49Z"
+      },
+      "sha": "21efe8fa8207b72c8953572b5b009394bbe580a6"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 20055822422,
+      "node_id": "HRFPE_lADOABII585-yiT2zwAAAASra5BW",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20055822422",
+      "actor": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
+      "commit_url": "https://api.github.com/repos/vasild/bitcoin/commits/21efe8fa8207b72c8953572b5b009394bbe580a6",
+      "created_at": "2025-10-02T10:05:34Z"
+    },
+    {
       "event": "commented",
-      "id": 3358274780,
-      "node_id": "IC_kwDOABII587IKzTc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3358274780",
+      "id": 3360280902,
+      "node_id": "IC_kwDOABII587ISdFG",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3360280902",
+      "actor": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-10-02T10:05:51Z",
+      "updated_at": "2025-10-02T10:05:51Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "`b01d6df464...21efe8fa82`: rebase due to conflicts",
+      "user": {
+        "login": "vasild",
+        "id": 266751,
+        "node_id": "MDQ6VXNlcjI2Njc1MQ==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/266751?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/vasild",
+        "html_url": "https://github.com/vasild",
+        "followers_url": "https://api.github.com/users/vasild/followers",
+        "following_url": "https://api.github.com/users/vasild/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/vasild/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/vasild/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/vasild/subscriptions",
+        "organizations_url": "https://api.github.com/users/vasild/orgs",
+        "repos_url": "https://api.github.com/users/vasild/repos",
+        "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/vasild/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3360280902",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
+    },
+    {
+      "event": "unlabeled",
+      "id": 20056332291,
+      "node_id": "UNLE_lADOABII585-yiT2zwAAAASrc1gD",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20056332291",
       "actor": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -17311,33 +17388,11 @@
       },
       "commit_id": null,
       "commit_url": null,
-      "created_at": "2025-10-01T21:47:13Z",
-      "updated_at": "2025-10-01T21:47:13Z",
-      "author_association": "CONTRIBUTOR",
-      "body": "<!--cf906140f33d8803c4a75a2196329ecb-->\n🐙 This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
-      "user": {
-        "login": "DrahtBot",
-        "id": 39886733,
-        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/DrahtBot",
-        "html_url": "https://github.com/DrahtBot",
-        "followers_url": "https://api.github.com/users/DrahtBot/followers",
-        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
-        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
-        "repos_url": "https://api.github.com/users/DrahtBot/repos",
-        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
-        "type": "User",
-        "site_admin": false,
-        "patch_url": null
-      },
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/29415#issuecomment-3358274780",
-      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/29415"
+      "created_at": "2025-10-02T10:31:22Z",
+      "label": {
+        "name": "Needs rebase",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
@@ -17615,7 +17670,7 @@
       "path": "src/node/connection_types.h",
       "position": 10,
       "original_position": 10,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "7a0f492104c1621b7089a64fa330c72b06d30574",
       "in_reply_to_id": null,
       "user": {
@@ -18039,7 +18094,7 @@
       "path": "src/net_processing.cpp",
       "position": 477,
       "original_position": 291,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "07dee91112189be02c6694385de261570725b56b",
       "in_reply_to_id": null,
       "user": {
@@ -18145,7 +18200,7 @@
       "path": "src/bitcoin-cli.cpp",
       "position": 1,
       "original_position": 1,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "6fad02cf03d6b37d0a22443a411ec92649b1d39d",
       "in_reply_to_id": null,
       "user": {
@@ -18569,7 +18624,7 @@
       "path": "src/node/connection_types.h",
       "position": 10,
       "original_position": 10,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "7a0f492104c1621b7089a64fa330c72b06d30574",
       "in_reply_to_id": 1518080397,
       "user": {
@@ -18781,7 +18836,7 @@
       "path": "test/functional/p2p_private_broadcast.py",
       "position": 56,
       "original_position": 66,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "d10a0649b018638574fa7dc316b3e783bf6cee69",
       "in_reply_to_id": null,
       "user": {
@@ -19311,7 +19366,7 @@
       "path": "src/net_processing.cpp",
       "position": 477,
       "original_position": 291,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "07dee91112189be02c6694385de261570725b56b",
       "in_reply_to_id": 1518279844,
       "user": {
@@ -19682,7 +19737,7 @@
       "path": "test/functional/p2p_private_broadcast.py",
       "position": 56,
       "original_position": 66,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "d10a0649b018638574fa7dc316b3e783bf6cee69",
       "in_reply_to_id": 1520232425,
       "user": {
@@ -20053,7 +20108,7 @@
       "path": "src/net.cpp",
       "position": 5,
       "original_position": 5,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "5ce95d9960a3935e633fba08ddd9efe3f5b20b0d",
       "in_reply_to_id": null,
       "user": {
@@ -20093,8 +20148,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 376,
-      "original_line": 376,
+      "line": 356,
+      "original_line": 356,
       "side": "RIGHT"
     },
     {
@@ -20159,7 +20214,7 @@
       "path": "src/net.cpp",
       "position": 5,
       "original_position": 5,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "5ce95d9960a3935e633fba08ddd9efe3f5b20b0d",
       "in_reply_to_id": 1540139554,
       "user": {
@@ -20199,8 +20254,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 376,
-      "original_line": 376,
+      "line": 356,
+      "original_line": 356,
       "side": "RIGHT"
     },
     {
@@ -20265,7 +20320,7 @@
       "path": "src/net.cpp",
       "position": 5,
       "original_position": 5,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "5ce95d9960a3935e633fba08ddd9efe3f5b20b0d",
       "in_reply_to_id": 1540139554,
       "user": {
@@ -20305,8 +20360,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 376,
-      "original_line": 376,
+      "line": 356,
+      "original_line": 356,
       "side": "RIGHT"
     },
     {
@@ -22332,7 +22387,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 49,
       "original_position": 21,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "180e51a723520f530bb675e937eeaabebcc0b0b5",
       "in_reply_to_id": null,
       "user": {
@@ -22756,7 +22811,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 49,
       "original_position": 21,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "180e51a723520f530bb675e937eeaabebcc0b0b5",
       "in_reply_to_id": 1580205599,
       "user": {
@@ -23021,7 +23076,7 @@
       "path": "src/net.h",
       "position": 5,
       "original_position": 5,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "0ba30dec085f860c89f4fd8c8a398aa8a13b5ebd",
       "in_reply_to_id": null,
       "user": {
@@ -23392,7 +23447,7 @@
       "path": "src/net.cpp",
       "position": 54,
       "original_position": 51,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "0ba30dec085f860c89f4fd8c8a398aa8a13b5ebd",
       "in_reply_to_id": null,
       "user": {
@@ -23432,8 +23487,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 496,
-      "original_line": 496,
+      "line": 472,
+      "original_line": 472,
       "side": "RIGHT"
     },
     {
@@ -23657,7 +23712,7 @@
       "path": "src/net_processing.cpp",
       "position": 67,
       "original_position": 30,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": null,
       "user": {
@@ -23763,7 +23818,7 @@
       "path": "src/private_broadcast.h",
       "position": 26,
       "original_position": 22,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": null,
       "user": {
@@ -23816,7 +23871,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 1,
       "original_position": 1,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": null,
       "user": {
@@ -23869,7 +23924,7 @@
       "path": "src/private_broadcast.h",
       "position": 1,
       "original_position": 1,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": null,
       "user": {
@@ -23975,7 +24030,7 @@
       "path": "src/net_processing.cpp",
       "position": 101,
       "original_position": 52,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "fecab592de8d0994e6d61e454e118d652ffd7b93",
       "in_reply_to_id": null,
       "user": {
@@ -24399,7 +24454,7 @@
       "path": "src/net.h",
       "position": 5,
       "original_position": 5,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "0ba30dec085f860c89f4fd8c8a398aa8a13b5ebd",
       "in_reply_to_id": 1595556422,
       "user": {
@@ -24558,7 +24613,7 @@
       "path": "src/net.cpp",
       "position": 54,
       "original_position": 51,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "0ba30dec085f860c89f4fd8c8a398aa8a13b5ebd",
       "in_reply_to_id": 1595793107,
       "user": {
@@ -24598,8 +24653,8 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 496,
-      "original_line": 496,
+      "line": 472,
+      "original_line": 472,
       "side": "RIGHT"
     },
     {
@@ -24823,7 +24878,7 @@
       "path": "src/net_processing.cpp",
       "position": 67,
       "original_position": 30,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": 1596833034,
       "user": {
@@ -24929,7 +24984,7 @@
       "path": "src/private_broadcast.h",
       "position": 26,
       "original_position": 22,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": 1596842874,
       "user": {
@@ -24982,7 +25037,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 1,
       "original_position": 1,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": 1596847026,
       "user": {
@@ -25035,7 +25090,7 @@
       "path": "src/private_broadcast.h",
       "position": 1,
       "original_position": 1,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "434a20371e441660147da6d0c6c1832cb0d0073b",
       "in_reply_to_id": 1596847172,
       "user": {
@@ -25088,7 +25143,7 @@
       "path": "src/net_processing.cpp",
       "position": 101,
       "original_position": 52,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "fecab592de8d0994e6d61e454e118d652ffd7b93",
       "in_reply_to_id": 1596947249,
       "user": {
@@ -25883,7 +25938,7 @@
       "path": "src/private_broadcast.h",
       "position": 22,
       "original_position": 18,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cade8e833197a202dbb03c50359396ecd437ac8c",
       "in_reply_to_id": null,
       "user": {
@@ -25989,7 +26044,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 47,
       "original_position": 23,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "b81c3cc19ec8055d04b38a72fdfabbfcb2ed2358",
       "in_reply_to_id": null,
       "user": {
@@ -26148,7 +26203,7 @@
       "path": "src/net_processing.cpp",
       "position": 571,
       "original_position": 15,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "3f5a4187a9e5d2bbb65c06c1799155fd7dd0d132",
       "in_reply_to_id": null,
       "user": {
@@ -26201,7 +26256,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 32,
       "original_position": 13,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "3f5a4187a9e5d2bbb65c06c1799155fd7dd0d132",
       "in_reply_to_id": null,
       "user": {
@@ -26307,7 +26362,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 47,
       "original_position": 44,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "5f49e61ffa576aa6c27de30a7db51d17c4f5c516",
       "in_reply_to_id": null,
       "user": {
@@ -26625,7 +26680,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 47,
       "original_position": 23,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "b81c3cc19ec8055d04b38a72fdfabbfcb2ed2358",
       "in_reply_to_id": 1655427794,
       "user": {
@@ -26784,7 +26839,7 @@
       "path": "src/net_processing.cpp",
       "position": 571,
       "original_position": 15,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "3f5a4187a9e5d2bbb65c06c1799155fd7dd0d132",
       "in_reply_to_id": 1657757991,
       "user": {
@@ -26837,7 +26892,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 32,
       "original_position": 13,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "3f5a4187a9e5d2bbb65c06c1799155fd7dd0d132",
       "in_reply_to_id": 1657760369,
       "user": {
@@ -26943,7 +26998,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 47,
       "original_position": 44,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "5f49e61ffa576aa6c27de30a7db51d17c4f5c516",
       "in_reply_to_id": 1658942976,
       "user": {
@@ -27579,7 +27634,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": null,
       "user": {
@@ -27738,7 +27793,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -27897,7 +27952,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -28056,7 +28111,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -28162,7 +28217,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -28215,7 +28270,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 75,
       "original_position": 33,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "4a955955ec587120fb121e5068e3bc1f80406ac5",
       "in_reply_to_id": null,
       "user": {
@@ -28268,7 +28323,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 75,
       "original_position": 33,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "4a955955ec587120fb121e5068e3bc1f80406ac5",
       "in_reply_to_id": 1715690103,
       "user": {
@@ -28321,7 +28376,7 @@
       "path": "src/private_broadcast.cpp",
       "position": 75,
       "original_position": 33,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "4a955955ec587120fb121e5068e3bc1f80406ac5",
       "in_reply_to_id": 1715690103,
       "user": {
@@ -28586,7 +28641,7 @@
       "path": "src/net_processing.cpp",
       "position": 402,
       "original_position": 39,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "b628d96f21d9c7e6e4a9e1c944fa7a9668d1e1af",
       "in_reply_to_id": null,
       "user": {
@@ -28639,7 +28694,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": null,
       "user": {
@@ -28745,7 +28800,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": 1781868981,
       "user": {
@@ -28957,7 +29012,7 @@
       "path": "src/net_processing.cpp",
       "position": 402,
       "original_position": 39,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "b628d96f21d9c7e6e4a9e1c944fa7a9668d1e1af",
       "in_reply_to_id": 1781795191,
       "user": {
@@ -29010,7 +29065,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": 1781868981,
       "user": {
@@ -29063,7 +29118,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": 1781868981,
       "user": {
@@ -29116,7 +29171,7 @@
       "path": "src/net_processing.cpp",
       "position": 520,
       "original_position": 49,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "f9b2eaf96cf32dae53a0c00a30fe32f38dc9def6",
       "in_reply_to_id": null,
       "user": {
@@ -29275,7 +29330,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": 1781868981,
       "user": {
@@ -29381,7 +29436,7 @@
       "path": "src/net_processing.cpp",
       "position": 520,
       "original_position": 49,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "f9b2eaf96cf32dae53a0c00a30fe32f38dc9def6",
       "in_reply_to_id": 1790649950,
       "user": {
@@ -29434,7 +29489,7 @@
       "path": "src/private_broadcast.h",
       "position": 91,
       "original_position": 45,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "80246442b80ae2abd2ca6921f4eeb348f4f819e0",
       "in_reply_to_id": 1781868981,
       "user": {
@@ -29487,7 +29542,7 @@
       "path": "src/net_processing.cpp",
       "position": 520,
       "original_position": 49,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "f9b2eaf96cf32dae53a0c00a30fe32f38dc9def6",
       "in_reply_to_id": 1790649950,
       "user": {
@@ -29593,7 +29648,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29646,7 +29701,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29699,7 +29754,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29752,7 +29807,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29805,7 +29860,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29858,7 +29913,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29911,7 +29966,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -29964,7 +30019,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30017,7 +30072,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30070,7 +30125,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30123,7 +30178,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30176,7 +30231,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30229,7 +30284,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30282,7 +30337,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30335,7 +30390,7 @@
       "path": "src/init.cpp",
       "position": 78,
       "original_position": 110,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "30ec819596f4000b46c9b7bf8d3ee1518af5d533",
       "in_reply_to_id": 1700086637,
       "user": {
@@ -30653,7 +30708,7 @@
       "path": "src/net_processing.cpp",
       "position": 246,
       "original_position": 125,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "12f6e7f3d35d0d0a35b63d70d1dd752932d64a7d",
       "in_reply_to_id": null,
       "user": {
@@ -30706,7 +30761,7 @@
       "path": "src/net_processing.cpp",
       "position": 383,
       "original_position": 184,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "12f6e7f3d35d0d0a35b63d70d1dd752932d64a7d",
       "in_reply_to_id": null,
       "user": {
@@ -30812,7 +30867,7 @@
       "path": "src/net_processing.cpp",
       "position": 341,
       "original_position": 340,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": null,
       "user": {
@@ -30865,7 +30920,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": null,
       "user": {
@@ -30918,7 +30973,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -31236,7 +31291,7 @@
       "path": "src/net_processing.cpp",
       "position": 246,
       "original_position": 125,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "12f6e7f3d35d0d0a35b63d70d1dd752932d64a7d",
       "in_reply_to_id": 2030224619,
       "user": {
@@ -31289,7 +31344,7 @@
       "path": "src/net_processing.cpp",
       "position": 383,
       "original_position": 184,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "12f6e7f3d35d0d0a35b63d70d1dd752932d64a7d",
       "in_reply_to_id": 2030225474,
       "user": {
@@ -31395,7 +31450,7 @@
       "path": "src/net_processing.cpp",
       "position": 341,
       "original_position": 340,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2031548641,
       "user": {
@@ -31448,7 +31503,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -31554,7 +31609,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -31713,7 +31768,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": null,
       "user": {
@@ -31766,7 +31821,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -31819,7 +31874,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -32031,7 +32086,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -32084,7 +32139,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -32137,7 +32192,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": null,
       "user": {
@@ -32190,7 +32245,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -32243,7 +32298,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -32296,7 +32351,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -32349,7 +32404,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -32402,7 +32457,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -32455,7 +32510,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -32508,7 +32563,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32561,7 +32616,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32614,7 +32669,7 @@
       "path": "src/CMakeLists.txt",
       "position": 2,
       "original_position": 2,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "14ebee8ea29e555caaeaa4e0a935f0897390bdfb",
       "in_reply_to_id": 2035012202,
       "user": {
@@ -32667,7 +32722,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32720,7 +32775,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32773,7 +32828,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32826,7 +32881,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32879,7 +32934,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32932,7 +32987,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -32985,7 +33040,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -33038,7 +33093,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -33091,7 +33146,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -33144,7 +33199,7 @@
       "path": "src/net_processing.cpp",
       "position": 167,
       "original_position": 167,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "cae4c1134d2a55ff5c20c2ce78512b7682f6fa7c",
       "in_reply_to_id": 2032895434,
       "user": {
@@ -33197,7 +33252,7 @@
       "path": "src/net_processing.cpp",
       "position": 613,
       "original_position": 293,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "33f2770bc80316e65eb838bb63d3f38ab53dd27c",
       "in_reply_to_id": 2035643498,
       "user": {
@@ -34045,7 +34100,7 @@
       "path": "src/net_processing.cpp",
       "position": 226,
       "original_position": 71,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "655af5976571ec694ba5aa57b35b3882e0a48cab",
       "in_reply_to_id": null,
       "user": {
@@ -34098,7 +34153,7 @@
       "path": "src/net_processing.cpp",
       "position": 560,
       "original_position": 560,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "2b34857ad54aebbf0a9271e742c2caee85577bc8",
       "in_reply_to_id": null,
       "user": {
@@ -34363,7 +34418,7 @@
       "path": "src/net_processing.cpp",
       "position": 226,
       "original_position": 71,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "655af5976571ec694ba5aa57b35b3882e0a48cab",
       "in_reply_to_id": 2047059613,
       "user": {
@@ -34416,7 +34471,7 @@
       "path": "src/net_processing.cpp",
       "position": 226,
       "original_position": 71,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "655af5976571ec694ba5aa57b35b3882e0a48cab",
       "in_reply_to_id": 2047059613,
       "user": {
@@ -34734,7 +34789,7 @@
       "path": "src/net_processing.cpp",
       "position": 560,
       "original_position": 560,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "2b34857ad54aebbf0a9271e742c2caee85577bc8",
       "in_reply_to_id": 2049127611,
       "user": {
@@ -34787,7 +34842,7 @@
       "path": "src/net_processing.cpp",
       "position": 226,
       "original_position": 71,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "655af5976571ec694ba5aa57b35b3882e0a48cab",
       "in_reply_to_id": 2047059613,
       "user": {
@@ -34840,7 +34895,7 @@
       "path": "src/net_processing.cpp",
       "position": 226,
       "original_position": 71,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "655af5976571ec694ba5aa57b35b3882e0a48cab",
       "in_reply_to_id": 2047059613,
       "user": {
@@ -35158,7 +35213,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 32,
       "original_position": 32,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "a4c4dd9138d3eca68d483c3a0ecb1e013659d485",
       "in_reply_to_id": null,
       "user": {
@@ -35211,7 +35266,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 32,
       "original_position": 32,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "a4c4dd9138d3eca68d483c3a0ecb1e013659d485",
       "in_reply_to_id": 2175685307,
       "user": {
@@ -35264,7 +35319,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 32,
       "original_position": 32,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "a4c4dd9138d3eca68d483c3a0ecb1e013659d485",
       "in_reply_to_id": 2175685307,
       "user": {
@@ -35317,7 +35372,7 @@
       "path": "src/rpc/mempool.cpp",
       "position": 32,
       "original_position": 32,
-      "commit_id": "b01d6df464e495ff323adaf9178ad55facce3478",
+      "commit_id": "21efe8fa8207b72c8953572b5b009394bbe580a6",
       "original_commit_id": "a4c4dd9138d3eca68d483c3a0ecb1e013659d485",
       "in_reply_to_id": 2175685307,
       "user": {
