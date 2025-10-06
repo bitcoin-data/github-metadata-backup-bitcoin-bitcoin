@@ -51,7 +51,7 @@
       }
     ],
     "created_at": "2023-01-25T13:36:23Z",
-    "updated_at": "2025-10-06T17:09:00Z",
+    "updated_at": "2025-10-06T19:22:45Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -378,9 +378,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37966,
-        "stargazers_count": 85906,
-        "watchers_count": 85906,
+        "forks_count": 37967,
+        "stargazers_count": 85908,
+        "watchers_count": 85908,
         "size": 294550,
         "default_branch": "master",
         "open_issues_count": 806,
@@ -402,7 +402,7 @@
         "visibility": "public",
         "pushed_at": "2025-10-06T16:48:16Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-10-06T17:14:36Z",
+        "updated_at": "2025-10-06T19:28:36Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -432,7 +432,7 @@
     "deletions": 140,
     "changed_files": 12,
     "commits": 5,
-    "review_comments": 110,
+    "review_comments": 113,
     "comments": 35
   },
   "events": [
@@ -14553,6 +14553,165 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2407510165"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 114,
+      "original_line": 114,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408023767",
+      "pull_request_review_id": 3306684297,
+      "id": 2408023767,
+      "node_id": "PRRC_kwDOABII586Ph4bX",
+      "diff_hunk": "@@ -0,0 +1,143 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    std::atomic<bool> m_interrupt{false};\n+    std::vector<std::thread> m_workers;\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::function<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt.load() && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt.load() || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt.load() && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    void Start(int num_workers)\n+    {\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt.store(false); // Reset\n+\n+        // Create workers\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        // Note: even when m_interrupt is atomic, it must be modified while holding the same mutex\n+        // used by threads waiting on the condition variable. This ensures threads blocked on m_cv\n+        // reliably observe the change and proceed correctly without missing signals.\n+        // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+        WITH_LOCK(m_mutex, m_interrupt.store(true));\n+        m_cv.notify_all();\n+        for (auto& worker : m_workers) {\n+            worker.join();\n+        }\n+        m_workers.clear();\n+        // m_interrupt is left true until next Start()\n+    }\n+\n+    template<class T> EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    auto Submit(T task) -> std::future<decltype(task())>\n+    {\n+        if (m_workers.empty() || m_interrupt.load()) throw std::runtime_error(\"No active workers; cannot accept new tasks\");\n+        using TaskType = std::packaged_task<decltype(task())()>;\n+        auto ptr_task = std::make_shared<TaskType>(std::move(task));\n+        std::future<decltype(task())> future = ptr_task->get_future();\n+        {\n+            LOCK(m_mutex);\n+            m_work_queue.emplace([ptr_task]() {\n+                (*ptr_task)();\n+            });\n+        }\n+        m_cv.notify_one();\n+        return future;",
+      "path": "src/util/threadpool.h",
+      "position": 114,
+      "original_position": 114,
+      "commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "original_commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "in_reply_to_id": 2407510165,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "> If we `wait()` or `get()` on the returned future, does that imply a release/acquire memory ordering or a relaxed memory ordering? I can't seem to find out what this means for other non-atomic memory that was written on the worker thread before the task is completed.\r\n\r\nFor the returned value, `wait()`/`get()` provide release/acquire semantics. All updates performed by the task should be visible after `get()` returns.\r\nNow, if the task modifies other objects that might be accessed concurrently by threads that don’t wait on the future, I'm pretty sure you need to explicitly synchronize access to those objects.\r\n\r\nMaybe show an example of how you’re using it, and we could reason about it.",
+      "created_at": "2025-10-06T19:01:45Z",
+      "updated_at": "2025-10-06T19:02:12Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2408023767",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408023767"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 114,
+      "original_line": 114,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408056506",
+      "pull_request_review_id": 3306726994,
+      "id": 2408056506,
+      "node_id": "PRRC_kwDOABII586PiAa6",
+      "diff_hunk": "@@ -0,0 +1,143 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    std::atomic<bool> m_interrupt{false};\n+    std::vector<std::thread> m_workers;\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::function<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt.load() && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt.load() || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt.load() && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    void Start(int num_workers)\n+    {\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt.store(false); // Reset\n+\n+        // Create workers\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        // Note: even when m_interrupt is atomic, it must be modified while holding the same mutex\n+        // used by threads waiting on the condition variable. This ensures threads blocked on m_cv\n+        // reliably observe the change and proceed correctly without missing signals.\n+        // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+        WITH_LOCK(m_mutex, m_interrupt.store(true));\n+        m_cv.notify_all();\n+        for (auto& worker : m_workers) {\n+            worker.join();\n+        }\n+        m_workers.clear();\n+        // m_interrupt is left true until next Start()\n+    }\n+\n+    template<class T> EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    auto Submit(T task) -> std::future<decltype(task())>\n+    {\n+        if (m_workers.empty() || m_interrupt.load()) throw std::runtime_error(\"No active workers; cannot accept new tasks\");\n+        using TaskType = std::packaged_task<decltype(task())()>;\n+        auto ptr_task = std::make_shared<TaskType>(std::move(task));\n+        std::future<decltype(task())> future = ptr_task->get_future();\n+        {\n+            LOCK(m_mutex);\n+            m_work_queue.emplace([ptr_task]() {\n+                (*ptr_task)();\n+            });\n+        }\n+        m_cv.notify_one();\n+        return future;",
+      "path": "src/util/threadpool.h",
+      "position": 114,
+      "original_position": 114,
+      "commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "original_commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "in_reply_to_id": 2407510165,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Sure, so I tried updating #31132 to use the thread pool here. It makes the change simpler if we were to already have this thread pool merged. However, the threads write to non-synchronized shared vectors, which the main thread will read. We need to make sure the write happens before the read. I initially stored the futures and wait on them like this https://github.com/andrewtoth/bitcoin/commit/c256f1b457cbd5b900aa34703eb5853d2449bcde#diff-3eff97d24109f473292b38a6495c5b51e8bda9f4bff9b691cf255968ba80d85dR151-R164. Since there is no happens before guarantee though, I think we still need a completion semaphore that each thread releases instead.",
+      "created_at": "2025-10-06T19:10:40Z",
+      "updated_at": "2025-10-06T19:10:41Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2408056506",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408056506"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 114,
+      "original_line": 114,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408106215",
+      "pull_request_review_id": 3306796999,
+      "id": 2408106215,
+      "node_id": "PRRC_kwDOABII586PiMjn",
+      "diff_hunk": "@@ -0,0 +1,143 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    std::atomic<bool> m_interrupt{false};\n+    std::vector<std::thread> m_workers;\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::function<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt.load() && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt.load() || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt.load() && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    void Start(int num_workers)\n+    {\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt.store(false); // Reset\n+\n+        // Create workers\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        // Note: even when m_interrupt is atomic, it must be modified while holding the same mutex\n+        // used by threads waiting on the condition variable. This ensures threads blocked on m_cv\n+        // reliably observe the change and proceed correctly without missing signals.\n+        // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+        WITH_LOCK(m_mutex, m_interrupt.store(true));\n+        m_cv.notify_all();\n+        for (auto& worker : m_workers) {\n+            worker.join();\n+        }\n+        m_workers.clear();\n+        // m_interrupt is left true until next Start()\n+    }\n+\n+    template<class T> EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    auto Submit(T task) -> std::future<decltype(task())>\n+    {\n+        if (m_workers.empty() || m_interrupt.load()) throw std::runtime_error(\"No active workers; cannot accept new tasks\");\n+        using TaskType = std::packaged_task<decltype(task())()>;\n+        auto ptr_task = std::make_shared<TaskType>(std::move(task));\n+        std::future<decltype(task())> future = ptr_task->get_future();\n+        {\n+            LOCK(m_mutex);\n+            m_work_queue.emplace([ptr_task]() {\n+                (*ptr_task)();\n+            });\n+        }\n+        m_cv.notify_one();\n+        return future;",
+      "path": "src/util/threadpool.h",
+      "position": 114,
+      "original_position": 114,
+      "commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "original_commit_id": "9dbea51ab511fc9823a87cd522c1d705a3436bad",
+      "in_reply_to_id": 2407510165,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "> All updates performed by the task should be visible after get() returns.\r\n\r\nHmm so in that case, then the diff I linked above is correct? The main thread is the one waiting on the future, and the non-synchronized vector is modified only by the worker thread. So the change to the vector should be visible on the main thread.\r\n\r\n> For the returned value, wait()/get() provide release/acquire semantics.\r\n\r\nSo you mean not for the returned value, but for any thread that calls `get()/wait()`? Having the return value be visible is sufficient with just a relaxed memory ordering.\r\n\r\nSo I'm confused whether other memory modified by the thread will be visible (release/acquire), or just the returned value (relaxed).",
+      "created_at": "2025-10-06T19:22:45Z",
+      "updated_at": "2025-10-06T19:31:15Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2408106215",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2408106215"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
