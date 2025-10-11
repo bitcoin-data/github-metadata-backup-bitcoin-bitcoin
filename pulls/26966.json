@@ -51,7 +51,7 @@
       }
     ],
     "created_at": "2023-01-25T13:36:23Z",
-    "updated_at": "2025-10-11T15:14:05Z",
+    "updated_at": "2025-10-11T22:35:05Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -357,12 +357,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38011,
-        "stargazers_count": 86050,
-        "watchers_count": 86050,
+        "forks_count": 38013,
+        "stargazers_count": 86066,
+        "watchers_count": 86066,
         "size": 294747,
         "default_branch": "master",
-        "open_issues_count": 824,
+        "open_issues_count": 825,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -381,7 +381,7 @@
         "visibility": "public",
         "pushed_at": "2025-10-10T19:52:05Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-10-11T15:52:28Z",
+        "updated_at": "2025-10-11T22:38:21Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -411,7 +411,7 @@
     "deletions": 140,
     "changed_files": 14,
     "commits": 6,
-    "review_comments": 152,
+    "review_comments": 154,
     "comments": 37
   },
   "events": [
@@ -17751,6 +17751,112 @@
       "start_side": null,
       "line": 154,
       "original_line": 154,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2423172535",
+      "pull_request_review_id": 3327639483,
+      "id": 2423172535,
+      "node_id": "PRRC_kwDOABII586Qbq23",
+      "diff_hunk": "@@ -0,0 +1,199 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+/**\n+ * @brief Fixed-size thread pool for running arbitrary tasks concurrently.\n+ *\n+ * The thread pool maintains a set of worker threads that consume and execute\n+ * tasks submitted through Submit(). Once started, tasks can be queued and\n+ * processed asynchronously until Stop() is called.\n+ *\n+ * ### Thread-safety and lifecycle\n+ * - `Start()` and `Stop()` must be called from a controller (non-worker) thread.\n+ *   Calling `Stop()` from a worker thread will deadlock, as it waits for all\n+ *   workers to join, including the current one.\n+ *\n+ * - `Submit()` can be called from any thread, including workers. It safely\n+ *   enqueues new work for execution as long as the pool has active workers.\n+ *\n+ * - `Stop()` prevents further task submission and wakes all worker threads.\n+ *   Workers finish processing all remaining queued tasks before exiting,\n+ *   guaranteeing that no caller waits forever on a pending future.\n+ */\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    // Note: m_interrupt must be modified while holding the same mutex used by threads waiting on the condition variable.\n+    // This ensures threads blocked on m_cv reliably observe the change and proceed correctly without missing signals.\n+    // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+    bool m_interrupt GUARDED_BY(m_mutex){false};\n+    std::vector<std::thread> m_workers GUARDED_BY(m_mutex);\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::function<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    explicit ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    /**\n+     * @brief Start worker threads.\n+     *\n+     * Creates and launches `num_workers` threads that begin executing tasks\n+     * from the queue. If the pool is already started, throws.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Start(int num_workers) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        assert(num_workers > 0);\n+        LOCK(m_mutex);\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt = false; // Reset\n+\n+        // Create workers\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    /**\n+     * @brief Stop all worker threads and wait for them to exit.\n+     *\n+     * Sets the interrupt flag, wakes all waiting workers, and joins them.\n+     * Any remaining tasks in the queue will be processed before returning.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        std::vector<std::thread> threads_to_join;\n+        {\n+            LOCK(m_mutex);\n+            m_interrupt = true;\n+            threads_to_join.swap(m_workers);\n+        }\n+        m_cv.notify_all();\n+        for (auto& worker : threads_to_join) worker.join();\n+        {\n+            // Sanity cleanup: release any std::function captured shared_ptrs\n+            LOCK(m_mutex);\n+            std::queue<std::function<void()>> empty;\n+            m_work_queue.swap(empty);",
+      "path": "src/util/threadpool.h",
+      "position": 139,
+      "original_position": 139,
+      "commit_id": "aa9cf5db0dce0e5982f69857070c9f2a30fcf095",
+      "original_commit_id": "3943630a4cea56b040377b33476803745055510c",
+      "in_reply_to_id": 2422124854,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "> I'm a little unclear what this swap is trying to do.\r\n> Also I don't understand why m_mutex is locked twice in this function with a notify in between\r\n\r\nThe idea behind the swap was more about ensuring the queue is empty after joining the threads, mainly to avoid any lingering future that would block callers indefinitely. That's why I used the \"sanity\" wording there.\r\nI did it after joining the threads because we’re currently waiting for all pending tasks to complete before stopping the worker loop. If we cleaned the queue prior to joining, all futures would throw a `future_error` - which could be fine too, but we’d probably want to throw something different, like a custom `TaskInterruptedException`, and adapt the submitter code to handle possible interruptions.\r\n\r\nA bit more context, I added this sanity swap after finding https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2411949367. But it is not really necessary anymore with the latest changes. Could also just drop it.\r\n\r\n> I would expect the point of swapping into a temporary vector would be to destroy the callables without holding m_mutex (since they could own resources and take time to destroy)\r\n\r\nThat's an overseen, yeah. Thanks!",
+      "created_at": "2025-10-11T22:17:46Z",
+      "updated_at": "2025-10-11T22:33:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2423172535",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2423172535"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
+        }
+      },
+      "start_line": 137,
+      "original_start_line": 137,
+      "start_side": "RIGHT",
+      "line": 139,
+      "original_line": 139,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2423193226",
+      "pull_request_review_id": 3327665476,
+      "id": 2423193226,
+      "node_id": "PRRC_kwDOABII586Qbv6K",
+      "diff_hunk": "@@ -0,0 +1,199 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+/**\n+ * @brief Fixed-size thread pool for running arbitrary tasks concurrently.\n+ *\n+ * The thread pool maintains a set of worker threads that consume and execute\n+ * tasks submitted through Submit(). Once started, tasks can be queued and\n+ * processed asynchronously until Stop() is called.\n+ *\n+ * ### Thread-safety and lifecycle\n+ * - `Start()` and `Stop()` must be called from a controller (non-worker) thread.\n+ *   Calling `Stop()` from a worker thread will deadlock, as it waits for all\n+ *   workers to join, including the current one.\n+ *\n+ * - `Submit()` can be called from any thread, including workers. It safely\n+ *   enqueues new work for execution as long as the pool has active workers.\n+ *\n+ * - `Stop()` prevents further task submission and wakes all worker threads.\n+ *   Workers finish processing all remaining queued tasks before exiting,\n+ *   guaranteeing that no caller waits forever on a pending future.\n+ */\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::function<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    // Note: m_interrupt must be modified while holding the same mutex used by threads waiting on the condition variable.\n+    // This ensures threads blocked on m_cv reliably observe the change and proceed correctly without missing signals.\n+    // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+    bool m_interrupt GUARDED_BY(m_mutex){false};\n+    std::vector<std::thread> m_workers GUARDED_BY(m_mutex);\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::function<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    explicit ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    /**\n+     * @brief Start worker threads.\n+     *\n+     * Creates and launches `num_workers` threads that begin executing tasks\n+     * from the queue. If the pool is already started, throws.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Start(int num_workers) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        assert(num_workers > 0);\n+        LOCK(m_mutex);\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt = false; // Reset\n+\n+        // Create workers\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    /**\n+     * @brief Stop all worker threads and wait for them to exit.\n+     *\n+     * Sets the interrupt flag, wakes all waiting workers, and joins them.\n+     * Any remaining tasks in the queue will be processed before returning.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        std::vector<std::thread> threads_to_join;\n+        {\n+            LOCK(m_mutex);\n+            m_interrupt = true;\n+            threads_to_join.swap(m_workers);\n+        }\n+        m_cv.notify_all();\n+        for (auto& worker : threads_to_join) worker.join();\n+        {\n+            // Sanity cleanup: release any std::function captured shared_ptrs\n+            LOCK(m_mutex);\n+            std::queue<std::function<void()>> empty;",
+      "path": "src/util/threadpool.h",
+      "position": 138,
+      "original_position": 138,
+      "commit_id": "aa9cf5db0dce0e5982f69857070c9f2a30fcf095",
+      "original_commit_id": "3943630a4cea56b040377b33476803745055510c",
+      "in_reply_to_id": 2421835077,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "> I don't understand the need for the sanity cleanup. Shouldn't the logic from `WorkerThread` guarantee that `m_work_queue` is empty at this point, so that we could just assert that here?\r\n\r\nYeah, right now it is not really necessary. Have explained the context and the rationale here: https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2423172535",
+      "created_at": "2025-10-11T22:35:05Z",
+      "updated_at": "2025-10-11T22:35:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/26966#discussion_r2423193226",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2423193226"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/26966"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 138,
+      "original_line": 138,
       "side": "RIGHT"
     }
   ]
