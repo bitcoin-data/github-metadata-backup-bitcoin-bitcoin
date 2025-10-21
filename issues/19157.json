@@ -10,8 +10,8 @@
     "events_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157/events",
     "html_url": "https://github.com/bitcoin/bitcoin/issues/19157",
     "number": 19157,
-    "state": "open",
-    "state_reason": null,
+    "state": "closed",
+    "state_reason": "completed",
     "title": "Improve deadlock detection",
     "body": "Background\r\n---\r\nIf two or more threads acquire mutexes in different order, that could cause a deadlock. Currently we have two mechanisms for detecting that - our [DEBUG_LOCKORDER](https://github.com/bitcoin/bitcoin/blob/bdedfcf/src/sync.cpp#L134) and the [thread sanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html).\r\n\r\nProblem\r\n---\r\nBoth methods may fail to detect some deadlocks:\r\n\r\ndeadlock type | detected by `DEBUG_LOCKORDER` | detected by TSan | detected by the proposed solution\r\n---|---|---|---\r\nA => B => C => A | :x: | :heavy_check_mark: | :heavy_check_mark:\r\ntest case `deadlock_unlock_not_last` | :x: | :heavy_check_mark: | :heavy_check_mark:\r\ntest case `deadlock_3` | :x: | :x: <sup>[1]</sup> | :heavy_check_mark:\r\nA => B, restart the program, B => A <sup>[2]</sup> | :x: | :x: | :heavy_check_mark: <sup>[3]</sup>\r\n\r\n<sup>[1]</sup> submitted as a bug report at https://github.com/google/sanitizers/issues/1258\r\n<sup>[2]</sup> I guess this is how the bug which https://github.com/bitcoin/bitcoin/pull/19132 fixes sneaked in\r\n<sup>[3]</sup> as long as just B => A is executed\r\n\r\n\r\n<details>\r\n<summary>test cases</summary>\r\n\r\n```cpp\r\nclass Event\r\n{\r\npublic:\r\n    void signal()\r\n    {\r\n        std::unique_lock<std::mutex> lk(m_mutex);\r\n        m_occurred = true;\r\n        m_cond.notify_all();\r\n    }\r\n\r\n    void wait()\r\n    {\r\n        std::unique_lock<std::mutex> lk(m_mutex);\r\n        m_cond.wait(lk, [&]() { return m_occurred; });\r\n    }\r\n\r\nprivate:\r\n    bool m_occurred{false};\r\n    std::condition_variable m_cond;\r\n    std::mutex m_mutex;\r\n};\r\n\r\nstatic std::mutex printf_mutex;\r\nvoid printf_sync(const char* format, ...)\r\n{\r\n    va_list ap;\r\n    va_start(ap, format);\r\n\r\n    {\r\n        std::unique_lock<std::mutex> lk(printf_mutex);\r\n        vprintf(format, ap);\r\n    }\r\n\r\n    va_end(ap);\r\n}\r\n\r\nBOOST_AUTO_TEST_CASE(deadlock_3)\r\n{\r\n#if 0\r\n    // detected by DEBUG_LOCKORDER\r\n    // not detected by the thread sanitizer (when DEBUG_LOCKORDER is disabled)\r\n    constexpr size_t n_threads = 2;\r\n#else\r\n    // deadlock is not detected by either one\r\n    constexpr size_t n_threads = 3;\r\n#endif\r\n\r\n    // t0: lock m0\r\n    // t1: lock m1\r\n    // t2: lock m2\r\n    // t0: try to lock m1, waits for t1\r\n    // t1: try to lock m2, waits for t2\r\n    // t2: try to lock m0, waits for t0 => deadlock\r\n\r\n    std::array<Mutex, n_threads> mutexes;\r\n    std::array<std::thread, n_threads> threads;\r\n    std::array<Event, n_threads> locked_own;\r\n    std::array<Event, n_threads> try_to_lock_next;\r\n\r\n    auto thread = [&](size_t i) {\r\n        LOCK(mutexes[i]);\r\n        printf_sync(\"thread%zu locked mutex%zu\\n\", i, i);\r\n        locked_own[i].signal();\r\n\r\n        try_to_lock_next[i].wait();\r\n\r\n        const size_t next = (i + 1) % n_threads;\r\n        printf_sync(\"thread%zu trying to lock mutex%zu\\n\", i, next);\r\n        LOCK(mutexes[next]);\r\n    };\r\n\r\n    for (size_t i = 0; i < n_threads; ++i) {\r\n        threads[i] = std::thread{thread, i};\r\n    }\r\n\r\n    for (size_t i = 0; i < n_threads; ++i) {\r\n        locked_own[i].wait();\r\n    }\r\n\r\n    for (size_t i = 0; i < n_threads; ++i) {\r\n        try_to_lock_next[i].signal();\r\n    }\r\n\r\n    for (size_t i = 0; i < n_threads; ++i) {\r\n        threads[i].join();\r\n    }\r\n}\r\n\r\nBOOST_AUTO_TEST_CASE(deadlock_unlock_not_last)\r\n{\r\n    // t0: lock m0\r\n    // t0: lock m1\r\n    // t0: unlock m0\r\n    // t1: lock m0\r\n    // t1: try to lock m1, waits for t0\r\n    // t0: try to lock m0, waits for t1 => deadlock\r\n\r\n    Mutex m0;\r\n    Mutex m1;\r\n    Event t1_locked_m0;\r\n\r\n    std::thread t0{[&]() {\r\n        ENTER_CRITICAL_SECTION(m0);\r\n        LOCK(m1);\r\n        LEAVE_CRITICAL_SECTION(m0);\r\n        t1_locked_m0.wait();\r\n        LOCK(m0);\r\n    }};\r\n\r\n    std::thread t1{[&]() {\r\n        LOCK(m0);\r\n        t1_locked_m0.signal();\r\n        LOCK(m1);\r\n    }};\r\n\r\n    t0.join();\r\n    t1.join();\r\n}\r\n```\r\n</details>\r\n\r\nSolution\r\n---\r\nAttach a predefined integer to each mutex that denotes the locking order in relation to other mutexes. So, whenever attempting to lock a mutex a thread would check if the previous mutex it acquired has a lower number.\r\n\r\nThis would require some thorough considerations when adding a new mutex - when is it going to be used, what other mutexes are going to be held at the time the new one is acquired and what other mutexes may be acquired while holding the new one. That is a good practice and should be done anyway. Such a mechanism will enforce it.",
     "user": {
@@ -32,7 +32,8 @@
       "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
       "received_events_url": "https://api.github.com/users/vasild/received_events",
       "type": "User",
-      "site_admin": false
+      "site_admin": false,
+      "patch_url": null
     },
     "labels": [
       {
@@ -47,9 +48,31 @@
     "assignees": [],
     "author_association": "CONTRIBUTOR",
     "locked": false,
-    "comments": 15,
+    "comments": 16,
+    "closed_at": "2025-10-21T14:53:04Z",
+    "closed_by": {
+      "login": "willcl-ark",
+      "id": 6606587,
+      "node_id": "MDQ6VXNlcjY2MDY1ODc=",
+      "avatar_url": "https://avatars.githubusercontent.com/u/6606587?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/willcl-ark",
+      "html_url": "https://github.com/willcl-ark",
+      "followers_url": "https://api.github.com/users/willcl-ark/followers",
+      "following_url": "https://api.github.com/users/willcl-ark/following%7B/other_user%7D",
+      "gists_url": "https://api.github.com/users/willcl-ark/gists%7B/gist_id%7D",
+      "starred_url": "https://api.github.com/users/willcl-ark/starred%7B/owner%7D%7B/repo%7D",
+      "subscriptions_url": "https://api.github.com/users/willcl-ark/subscriptions",
+      "organizations_url": "https://api.github.com/users/willcl-ark/orgs",
+      "repos_url": "https://api.github.com/users/willcl-ark/repos",
+      "events_url": "https://api.github.com/users/willcl-ark/events%7B/privacy%7D",
+      "received_events_url": "https://api.github.com/users/willcl-ark/received_events",
+      "type": "User",
+      "site_admin": false,
+      "patch_url": null
+    },
     "created_at": "2020-06-03T13:22:03Z",
-    "updated_at": "2022-08-12T13:24:00Z"
+    "updated_at": "2025-10-21T14:53:05Z"
   },
   "events": [
     {
@@ -75,7 +98,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -91,24 +115,25 @@
       "node_id": "MDE0OlVubGFiZWxlZEV2ZW50MzQwMjE1MzIyMg==",
       "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/3402153222",
       "actor": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -124,24 +149,25 @@
       "node_id": "MDEyOkxhYmVsZWRFdmVudDM0MDIxNTMyMjQ=",
       "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/3402153224",
       "actor": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -157,24 +183,25 @@
       "node_id": "MDEyOklzc3VlQ29tbWVudDYzODE5NzUyMw==",
       "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/638197523",
       "actor": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -183,24 +210,25 @@
       "author_association": "MEMBER",
       "body": "> Both methods may fail to detect some deadlocks\r\n\r\nIt seems they fail to detect a deadlock, but isn't the deadlock happening good enough of an indication that something is wrong? For example running the tests and observing a reproducible timeout should be enough to hint to a deadlock, no?",
       "user": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638197523",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -228,7 +256,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -254,7 +283,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638205333",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -265,24 +295,25 @@
       "node_id": "MDEyOklzc3VlQ29tbWVudDYzODIwOTg1NA==",
       "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/638209854",
       "actor": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -291,24 +322,25 @@
       "author_association": "MEMBER",
       "body": "Concept ACK",
       "user": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638209854",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -336,7 +368,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -362,7 +395,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638409425",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -390,7 +424,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -416,7 +451,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638415904",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -444,7 +480,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -473,7 +510,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -502,7 +540,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -528,7 +567,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-638642004",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -556,7 +596,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -585,7 +626,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -614,7 +656,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -640,7 +683,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639070249",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -668,7 +712,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -697,7 +742,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -726,7 +772,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -752,7 +799,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639328800",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -763,24 +811,25 @@
       "node_id": "MDEyOklzc3VlQ29tbWVudDYzOTQzNDE3Ng==",
       "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/639434176",
       "actor": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -789,24 +838,25 @@
       "author_association": "MEMBER",
       "body": "This sounds similar to https://clang.llvm.org/docs/ThreadSafetyAnalysis.html#acquired-before-acquired-after, but I heard someone say they are not actually implemented in libcxx <sup>[Citation needed]</sup>",
       "user": {
-        "login": "MarcoFalke",
+        "login": "maflcko",
         "id": 6399679,
         "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
         "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
         "gravatar_id": "",
-        "url": "https://api.github.com/users/MarcoFalke",
-        "html_url": "https://github.com/MarcoFalke",
-        "followers_url": "https://api.github.com/users/MarcoFalke/followers",
-        "following_url": "https://api.github.com/users/MarcoFalke/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/MarcoFalke/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/MarcoFalke/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/MarcoFalke/subscriptions",
-        "organizations_url": "https://api.github.com/users/MarcoFalke/orgs",
-        "repos_url": "https://api.github.com/users/MarcoFalke/repos",
-        "events_url": "https://api.github.com/users/MarcoFalke/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/MarcoFalke/received_events",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639434176",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -834,7 +884,8 @@
         "events_url": "https://api.github.com/users/hebasto/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/hebasto/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -860,7 +911,8 @@
         "events_url": "https://api.github.com/users/hebasto/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/hebasto/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639434901",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -888,7 +940,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -914,7 +967,8 @@
         "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639647817",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -942,7 +996,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -971,7 +1026,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1000,7 +1056,8 @@
         "events_url": "https://api.github.com/users/hebasto/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/hebasto/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1026,7 +1083,8 @@
         "events_url": "https://api.github.com/users/hebasto/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/hebasto/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-639661769",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -1054,7 +1112,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1080,7 +1139,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-640416692",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -1108,7 +1168,8 @@
         "events_url": "https://api.github.com/users/adamjonas/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/adamjonas/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1134,7 +1195,8 @@
         "events_url": "https://api.github.com/users/adamjonas/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/adamjonas/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-1204306739",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
@@ -1162,7 +1224,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1191,7 +1254,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1220,7 +1284,8 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
@@ -1246,10 +1311,97 @@
         "events_url": "https://api.github.com/users/vasild/events%7B/privacy%7D",
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
-        "site_admin": false
+        "site_admin": false,
+        "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-1213105407",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
+    },
+    {
+      "event": "commented",
+      "id": 3427107551,
+      "node_id": "IC_kwDOABII587MRYLf",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3427107551",
+      "actor": {
+        "login": "willcl-ark",
+        "id": 6606587,
+        "node_id": "MDQ6VXNlcjY2MDY1ODc=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6606587?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/willcl-ark",
+        "html_url": "https://github.com/willcl-ark",
+        "followers_url": "https://api.github.com/users/willcl-ark/followers",
+        "following_url": "https://api.github.com/users/willcl-ark/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/willcl-ark/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/willcl-ark/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/willcl-ark/subscriptions",
+        "organizations_url": "https://api.github.com/users/willcl-ark/orgs",
+        "repos_url": "https://api.github.com/users/willcl-ark/repos",
+        "events_url": "https://api.github.com/users/willcl-ark/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/willcl-ark/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-10-21T14:53:04Z",
+      "updated_at": "2025-10-21T14:53:04Z",
+      "author_association": "MEMBER",
+      "body": "This issue hasn’t attracted much interest from other contributors in quite some time.\n\nGiven that, it doesn’t seem important enough to keep open indefinitely. I’m going to close it for now due to lack of activity, but pull requests or renewed discussion are always welcome.\n\nComment here if you think this should be re-opened.",
+      "user": {
+        "login": "willcl-ark",
+        "id": 6606587,
+        "node_id": "MDQ6VXNlcjY2MDY1ODc=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6606587?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/willcl-ark",
+        "html_url": "https://github.com/willcl-ark",
+        "followers_url": "https://api.github.com/users/willcl-ark/followers",
+        "following_url": "https://api.github.com/users/willcl-ark/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/willcl-ark/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/willcl-ark/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/willcl-ark/subscriptions",
+        "organizations_url": "https://api.github.com/users/willcl-ark/orgs",
+        "repos_url": "https://api.github.com/users/willcl-ark/repos",
+        "events_url": "https://api.github.com/users/willcl-ark/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/willcl-ark/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/issues/19157#issuecomment-3427107551",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/19157"
+    },
+    {
+      "event": "closed",
+      "id": 20407301761,
+      "node_id": "CE_lADOABII584ljOL-zwAAAATAXraB",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20407301761",
+      "actor": {
+        "login": "willcl-ark",
+        "id": 6606587,
+        "node_id": "MDQ6VXNlcjY2MDY1ODc=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6606587?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/willcl-ark",
+        "html_url": "https://github.com/willcl-ark",
+        "followers_url": "https://api.github.com/users/willcl-ark/followers",
+        "following_url": "https://api.github.com/users/willcl-ark/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/willcl-ark/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/willcl-ark/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/willcl-ark/subscriptions",
+        "organizations_url": "https://api.github.com/users/willcl-ark/orgs",
+        "repos_url": "https://api.github.com/users/willcl-ark/repos",
+        "events_url": "https://api.github.com/users/willcl-ark/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/willcl-ark/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-10-21T14:53:05Z"
     }
   ]
 }
