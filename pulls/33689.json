@@ -51,7 +51,7 @@
       }
     ],
     "created_at": "2025-10-23T14:36:44Z",
-    "updated_at": "2025-10-28T20:11:38Z",
+    "updated_at": "2025-10-28T21:30:00Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -316,11 +316,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 38125,
-        "stargazers_count": 86489,
-        "watchers_count": 86489,
+        "stargazers_count": 86490,
+        "watchers_count": 86490,
         "size": 295439,
         "default_branch": "master",
-        "open_issues_count": 731,
+        "open_issues_count": 732,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -339,7 +339,7 @@
         "visibility": "public",
         "pushed_at": "2025-10-28T15:59:49Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-10-28T18:23:35Z",
+        "updated_at": "2025-10-28T21:36:12Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -369,7 +369,7 @@
     "deletions": 119,
     "changed_files": 7,
     "commits": 3,
-    "review_comments": 22,
+    "review_comments": 23,
     "comments": 6
   },
   "events": [
@@ -1968,6 +1968,59 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2470902222"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33689"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 182,
+      "original_line": 182,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2471097523",
+      "pull_request_review_id": 3390873847,
+      "id": 2471097523,
+      "node_id": "PRRC_kwDOABII586TSfSz",
+      "diff_hunk": "@@ -0,0 +1,199 @@\n+// Copyright (c) 2024-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_UTIL_THREADPOOL_H\n+#define BITCOIN_UTIL_THREADPOOL_H\n+\n+#include <sync.h>\n+#include <util/check.h>\n+#include <util/string.h>\n+#include <util/thread.h>\n+#include <util/threadinterrupt.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <condition_variable>\n+#include <cstddef>\n+#include <functional>\n+#include <future>\n+#include <memory>\n+#include <stdexcept>\n+#include <utility>\n+#include <queue>\n+#include <thread>\n+#include <vector>\n+\n+/**\n+ * @brief Fixed-size thread pool for running arbitrary tasks concurrently.\n+ *\n+ * The thread pool maintains a set of worker threads that consume and execute\n+ * tasks submitted through Submit(). Once started, tasks can be queued and\n+ * processed asynchronously until Stop() is called.\n+ *\n+ * ### Thread-safety and lifecycle\n+ * - `Start()` and `Stop()` must be called from a controller (non-worker) thread.\n+ *   Calling `Stop()` from a worker thread will deadlock, as it waits for all\n+ *   workers to join, including the current one.\n+ *\n+ * - `Submit()` can be called from any thread, including workers. It safely\n+ *   enqueues new work for execution as long as the pool has active workers.\n+ *\n+ * - `Stop()` prevents further task submission and wakes all worker threads.\n+ *   Workers finish processing all remaining queued tasks before exiting,\n+ *   guaranteeing that no caller waits forever on a pending future.\n+ */\n+class ThreadPool {\n+\n+private:\n+    std::string m_name;\n+    Mutex m_mutex;\n+    std::queue<std::packaged_task<void()>> m_work_queue GUARDED_BY(m_mutex);\n+    std::condition_variable m_cv;\n+    // Note: m_interrupt must be modified while holding the same mutex used by threads waiting on the condition variable.\n+    // This ensures threads blocked on m_cv reliably observe the change and proceed correctly without missing signals.\n+    // Ref: https://en.cppreference.com/w/cpp/thread/condition_variable\n+    bool m_interrupt GUARDED_BY(m_mutex){false};\n+    std::vector<std::thread> m_workers GUARDED_BY(m_mutex);\n+\n+    void WorkerThread() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        WAIT_LOCK(m_mutex, wait_lock);\n+        for (;;) {\n+            std::packaged_task<void()> task;\n+            {\n+                // Wait only if needed; avoid sleeping when a new task was submitted while we were processing another one.\n+                if (!m_interrupt && m_work_queue.empty()) {\n+                    // Block until the pool is interrupted or a task is available.\n+                    m_cv.wait(wait_lock,[&]() EXCLUSIVE_LOCKS_REQUIRED(m_mutex) { return m_interrupt || !m_work_queue.empty(); });\n+                }\n+\n+                // If stopped and no work left, exit worker\n+                if (m_interrupt && m_work_queue.empty()) {\n+                    return;\n+                }\n+\n+                task = std::move(m_work_queue.front());\n+                m_work_queue.pop();\n+            }\n+\n+            {\n+                // Execute the task without the lock\n+                REVERSE_LOCK(wait_lock, m_mutex);\n+                task();\n+            }\n+        }\n+    }\n+\n+public:\n+    explicit ThreadPool(const std::string& name) : m_name(name) {}\n+\n+    ~ThreadPool()\n+    {\n+        Stop(); // In case it hasn't been stopped.\n+    }\n+\n+    /**\n+     * @brief Start worker threads.\n+     *\n+     * Creates and launches `num_workers` threads that begin executing tasks\n+     * from the queue. If the pool is already started, throws.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Start(int num_workers) EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        assert(num_workers > 0);\n+        LOCK(m_mutex);\n+        if (!m_workers.empty()) throw std::runtime_error(\"Thread pool already started\");\n+        m_interrupt = false; // Reset\n+\n+        // Create workers\n+        m_workers.reserve(num_workers);\n+        for (int i = 0; i < num_workers; i++) {\n+            m_workers.emplace_back(&util::TraceThread, m_name + \"_pool_\" + util::ToString(i), [this] { WorkerThread(); });\n+        }\n+    }\n+\n+    /**\n+     * @brief Stop all worker threads and wait for them to exit.\n+     *\n+     * Sets the interrupt flag, wakes all waiting workers, and joins them.\n+     * Any remaining tasks in the queue will be processed before returning.\n+     *\n+     * Must be called from a controller (non-worker) thread.\n+     */\n+    void Stop() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        // Notify workers and join them.\n+        std::vector<std::thread> threads_to_join;\n+        {\n+            LOCK(m_mutex);\n+            m_interrupt = true;\n+            threads_to_join.swap(m_workers);\n+        }\n+        m_cv.notify_all();\n+        for (auto& worker : threads_to_join) worker.join();\n+        // Since we currently wait for tasks completion, sanity-check empty queue\n+        WITH_LOCK(m_mutex, Assume(m_work_queue.empty()));\n+        // Note: m_interrupt is left true until next Start()\n+    }\n+\n+    /**\n+     * @brief Submit a new task for asynchronous execution.\n+     *\n+     * Enqueues a callable to be executed by one of the worker threads.\n+     * Returns a `std::future` that can be used to retrieve the task’s result.\n+     */\n+    template<class F> EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    auto Submit(F&& fn)\n+    {\n+        std::packaged_task task{std::forward<F>(fn)};\n+        auto future{task.get_future()};\n+        {\n+            LOCK(m_mutex);\n+            if (m_interrupt || m_workers.empty()) {\n+                throw std::runtime_error(\"No active workers; cannot accept new tasks\");\n+            }\n+            m_work_queue.emplace(std::move(task));\n+        }\n+        m_cv.notify_one();\n+        return future;\n+    }\n+\n+    /**\n+     * @brief Execute a single queued task synchronously.\n+     * Removes one task from the queue and executes it on the calling thread.\n+     */\n+    void ProcessTask() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        std::packaged_task<void()> task;\n+        {\n+            LOCK(m_mutex);\n+            if (m_work_queue.empty()) return;\n+\n+            // Pop the task\n+            task = std::move(m_work_queue.front());\n+            m_work_queue.pop();\n+        }\n+        task();\n+    }\n+\n+    void Interrupt() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)",
+      "path": "src/util/threadpool.h",
+      "position": 182,
+      "original_position": 182,
+      "commit_id": "195a96258f970c384ce180d57e73616904ef5fa1",
+      "original_commit_id": "c219b93c3b043de202bdf3c65b433fd17af2da89",
+      "in_reply_to_id": 2469885604,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "patch_url": null
+      },
+      "body": "Follow-up to this convo after some great back-and-forth via DM with Andrew.\r\nUsually, RAII works best when we don’t care exactly when an object gets destroyed. In this case, though, we actually do care about that moment (or, in our terms, when it’s stopped), since it marks the point where there are no pending tasks and it’s safe to tear down the backend handlers.\r\nIf we don’t enforce that explicitly, the shutdown procedure could continue while workers are still active, leading them to access null pointers, etc.\r\nThis is something we can’t guarantee if we just let the object be destroyed whenever the program releases it using RAII. So even using RAII, we would be forced to destroy the object manually anyway. Which kinda defeats the purpose of it.",
+      "created_at": "2025-10-28T21:29:59Z",
+      "updated_at": "2025-10-28T21:30:00Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33689#discussion_r2471097523",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2471097523"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33689"
