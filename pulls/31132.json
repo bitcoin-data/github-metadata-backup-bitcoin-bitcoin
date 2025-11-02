@@ -39,7 +39,7 @@
       "site_admin": false,
       "patch_url": null
     },
-    "body": "When fetching inputs in ConnectBlock, each input is fetched from the cache in series. A cache miss means a round trip to the disk db to fetch the outpoint and insert it into the cache. Since the db is locked from being written during ConnectTip, we can fetch all block inputs missing from the cache in parallel on multiple threads before entering ConnectBlock. Using this strategy resulted in a 10% faster IBD.\r\n\r\nDoing IBD with 16 vcores from a local peer with default settings, stopping at height 850k:\r\n\r\n|  | Mean [s] | Min [s] | Max [s] | Relative |\r\n|:---|---:|---:|---:|---:|\r\n| branch | 17065.138 ± 117.439 | 16982.096 | 17148.181 | 1.00 |\r\n| master | 18731.509 ± 94.142 | 18731.509 | 18864.646 | 1.10 |\r\n\r\nFor later blocks this change makes block connection even faster. Doing an assumeutxo from block 840k to 850k with 15 worker threads, this change is 26% faster. With just a single worker thread, this same benchmark is 6% faster.\r\n[Benchmark and flame graph with 15 worker threads](https://bitcoin-dev-tools.github.io/benchcoin/results/pr-19/12150709351/index.html)\r\n[Benchmark and flame graph with 1 worker thread](https://bitcoin-dev-tools.github.io/benchcoin/results/pr-19/12151560582/index.html)\r\n\r\nI have fuzzed for over 500 million iterations with the provided fuzz harness with no issues.\r\n\r\nThis approach is heavily inspired by `CCheckQueue`, but we could not easily reuse it since it only checks for validity and doesn't allow us to store results. So, this PR creates a new `InputFetcher` that loops through all inputs of a block on the main thread and adds their outpoints to a shared vector. After writing, the main thread and worker threads assign ranges of outpoints from the vector and fetch them from the db, and then push the resulting coins onto a thread local vector. Once the threads have finished reading all inputs, the main thread loops through all thread local vectors and inserts the results into the cache.\r\n\r\nThis PR uses the `-par` value for the number of threads, which defaults to the number of vcores on the machine or 15 whichever is fewer. This is the same value used for `CCheckQueue`, so any users that specifically have the multi threaded validation disabled by using `-par=1` will also have this feature disabled. This also means the maximum number of input fetching threads is capped at 15.\r\n\r\nSince `InputFetcher::FetchInputs` is blocking, a follow-up can update this to share the thread pool between `CCheckQueue` and `InputFetcher`.",
+    "body": "When fetching inputs in `ConnectBlock`, each input is fetched from the cache in series. A cache miss means a round trip to the disk db to fetch the outpoint and insert it into the cache. Since the db is locked from being written during `ConnectTip`, we can fetch all inputs of a block in parallel on multiple threads. We can then insert them as they are fetched on the main thread into the temporary `CCoinsViewCache` view that is passed to `ConnectBlock`. Using this strategy results in significantly faster block connection resulting in up to 31% faster IBD[^1][^2].\r\n\r\nWe introduce a new `InputFetcher` utility that manages the worker threads and encapsulates all the fetching logic. It is a lock-free MPSC queue. The `InputFetcher` collects all input prevouts into a queue, and uses a barrier to start all worker threads simultaneously. Worker threads use an atomic counter to synchronize which inputs to fetch, and use a per input atomic flag to signal to the main thread when a coin has been fetched. This lets the main thread wait on inputs in order and insert them into the temporary cache as they are fetched. After all threads have been fetched and inserted, all threads `arrive_and_wait` on the same barrier again. This makes sure all work has been done and no threads are still trying to work before the main thread can proceed.\r\n\r\nThis PR uses the `-par` value for the number of threads, which defaults to the number of vcores on the machine or 15 whichever is fewer. This is the same value used for `CCheckQueue`, so any users that specifically have the multi threaded validation disabled by using `-par=1` will also have this feature disabled. This also means the maximum number of input fetching threads is capped at 15.\r\n\r\nThe `InputFetcher` works on a block that has not been fully validated, but it does not interfere or modify any of the validation before or during `ConnectBlock`. It simply inserts inputs into the temporary cache, which must be fetched before a transaction is validated anyways. If an invalid block is mined, the temporary cache is simply discarded without being flushed. This is an improvement over the current behavior, where inputs are inserted into the main `CoinsTip()` cache when pulled through for an invalid block. Furthermore, if any inputs are missing or spent, the InputFetcher will stop early. This will make invalidating double spending blocks faster.\r\n\r\nSince the input fetcher is blocking and all threads are only used before connecting a block, future work could combine the `CCheckQueue` validation threads and the `InputFetcher` threads into a shared thread pool.\r\n\r\n[^1]: https://github.com/bitcoin/bitcoin/pull/31132#issuecomment-3463894000\r\n[^2]: https://github.com/bitcoin/bitcoin/pull/31132#pullrequestreview-3347436866",
     "labels": [
       {
         "id": 118379652,
@@ -51,7 +51,7 @@
       }
     ],
     "created_at": "2024-10-22T14:40:28Z",
-    "updated_at": "2025-11-02T17:59:36Z",
+    "updated_at": "2025-11-02T18:49:27Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -294,8 +294,8 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 38145,
-        "stargazers_count": 86584,
-        "watchers_count": 86584,
+        "stargazers_count": 86583,
+        "watchers_count": 86583,
         "size": 295529,
         "default_branch": "master",
         "open_issues_count": 734,
@@ -317,7 +317,7 @@
         "visibility": "public",
         "pushed_at": "2025-10-31T19:00:28Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-11-02T15:40:14Z",
+        "updated_at": "2025-11-02T18:31:45Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -347,7 +347,7 @@
     "deletions": 1,
     "changed_files": 11,
     "commits": 5,
-    "review_comments": 194,
+    "review_comments": 196,
     "comments": 38
   },
   "events": [
