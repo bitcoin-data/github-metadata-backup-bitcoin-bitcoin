@@ -37,6 +37,7 @@
       "received_events_url": "https://api.github.com/users/l0rinc/received_events",
       "type": "User",
       "site_admin": false,
+      "name": null,
       "patch_url": null
     },
     "body": "This change is part of [[IBD] - Tracking PR for speeding up Initial Block Download](https://github.com/bitcoin/bitcoin/pull/32043)\r\n\r\n### Summary\r\n\r\nThe in-memory representation of the UTXO set uses (salted) [SipHash](https://github.com/bitcoin/bitcoin/blob/master/src/coins.h#L226) for avoiding key collision attacks.\r\n\r\nHashing `uint256` keys is performed frequently throughout the codebase. Previously, specialized optimizations existed as standalone functions (`SipHashUint256` and `SipHashUint256Extra`), but the constant salting operations (C0-C3 XOR with keys) were recomputed on every call.\r\n\r\nThis PR introduces `PresaltedSipHasher`, a class that caches the initial SipHash state (v0-v3 after XORing constants with keys), eliminating redundant constant computations when hashing multiple values with the same keys. The optimization is applied uniformly across:\r\n- All `Salted*Hasher` classes (`SaltedUint256Hasher`, `SaltedTxidHasher`, `SaltedWtxidHasher`, `SaltedOutpointHasher`)\r\n- `CBlockHeaderAndShortTxIDs` for compact block short ID computation\r\n\r\n### Details\r\n\r\nThe change replaces standalone `SipHashUint256` and `SipHashUint256Extra` functions with `PresaltedSipHasher` class methods that cache the constant-salted state. This is particularly beneficial for hash map operations where the same salt is used repeatedly (as suggested by Sipa in https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2628994530).\r\n\r\n### Measurements\r\n\r\n<details>\r\n<summary>Benchmarks</summary>\r\n\r\n```C++\r\ndiff --git a/src/bench/crypto_hash.cpp b/src/bench/crypto_hash.cpp\r\n--- a/src/bench/crypto_hash.cpp\t(revision 9b1a7c3e8dd78d97fbf47c2d056d043b05969176)\r\n+++ b/src/bench/crypto_hash.cpp\t(revision e1b4f056b3097e7e34b0eda31f57826d81c9d810)\r\n@@ -2,7 +2,6 @@\r\n // Distributed under the MIT software license, see the accompanying\r\n // file COPYING or http://www.opensource.org/licenses/mit-license.php.\r\n \r\n-\r\n #include <bench/bench.h>\r\n #include <crypto/muhash.h>\r\n #include <crypto/ripemd160.h>\r\n@@ -12,9 +11,11 @@\r\n #include <crypto/sha512.h>\r\n #include <crypto/siphash.h>\r\n #include <random.h>\r\n-#include <span.h>\r\n #include <tinyformat.h>\r\n #include <uint256.h>\r\n+#include <primitives/transaction.h>\r\n+#include <util/hasher.h>\r\n+#include <unordered_set>\r\n \r\n #include <cstdint>\r\n #include <vector>\r\n@@ -205,6 +206,98 @@\r\n     });\r\n }\r\n \r\n+static void SaltedOutpointHasherBench_hash(benchmark::Bench& bench)\r\n+{\r\n+    FastRandomContext rng{/*fDeterministic=*/true};\r\n+    constexpr size_t size{1000};\r\n+\r\n+    std::vector<COutPoint> outpoints(size);\r\n+    for (auto& outpoint : outpoints) {\r\n+        outpoint = {Txid::FromUint256(rng.rand256()), rng.rand32()};\r\n+    }\r\n+\r\n+    const SaltedOutpointHasher hasher;\r\n+    bench.batch(size).run([&] {\r\n+        size_t result{0};\r\n+        for (const auto& outpoint : outpoints) {\r\n+            result ^= hasher(outpoint);\r\n+        }\r\n+        ankerl::nanobench::doNotOptimizeAway(result);\r\n+    });\r\n+}\r\n+\r\n+static void SaltedOutpointHasherBench_match(benchmark::Bench& bench)\r\n+{\r\n+    FastRandomContext rng{/*fDeterministic=*/true};\r\n+    constexpr size_t size{1000};\r\n+\r\n+    std::unordered_set<COutPoint, SaltedOutpointHasher> values;\r\n+    std::vector<COutPoint> value_vector;\r\n+    values.reserve(size);\r\n+    value_vector.reserve(size);\r\n+\r\n+    for (size_t i{0}; i < size; ++i) {\r\n+        COutPoint outpoint{Txid::FromUint256(rng.rand256()), rng.rand32()};\r\n+        values.emplace(outpoint);\r\n+        value_vector.push_back(outpoint);\r\n+        assert(values.contains(outpoint));\r\n+    }\r\n+\r\n+    bench.batch(size).run([&] {\r\n+        bool result{true};\r\n+        for (const auto& outpoint : value_vector) {\r\n+            result ^= values.contains(outpoint);\r\n+        }\r\n+        ankerl::nanobench::doNotOptimizeAway(result);\r\n+    });\r\n+}\r\n+\r\n+static void SaltedOutpointHasherBench_mismatch(benchmark::Bench& bench)\r\n+{\r\n+    FastRandomContext rng{/*fDeterministic=*/true};\r\n+    constexpr size_t size{1000};\r\n+\r\n+    std::unordered_set<COutPoint, SaltedOutpointHasher> values;\r\n+    std::vector<COutPoint> missing_value_vector;\r\n+    values.reserve(size);\r\n+    missing_value_vector.reserve(size);\r\n+\r\n+    for (size_t i{0}; i < size; ++i) {\r\n+        values.emplace(Txid::FromUint256(rng.rand256()), rng.rand32());\r\n+        COutPoint missing_outpoint{Txid::FromUint256(rng.rand256()), rng.rand32()};\r\n+        missing_value_vector.push_back(missing_outpoint);\r\n+        assert(!values.contains(missing_outpoint));\r\n+    }\r\n+\r\n+    bench.batch(size).run([&] {\r\n+        bool result{false};\r\n+        for (const auto& outpoint : missing_value_vector) {\r\n+            result ^= values.contains(outpoint);\r\n+        }\r\n+        ankerl::nanobench::doNotOptimizeAway(result);\r\n+    });\r\n+}\r\n+\r\n+static void SaltedOutpointHasherBench_create_set(benchmark::Bench& bench)\r\n+{\r\n+    FastRandomContext rng{/*fDeterministic=*/true};\r\n+    constexpr size_t size{1000};\r\n+\r\n+    std::vector<COutPoint> outpoints(size);\r\n+    for (auto& outpoint : outpoints) {\r\n+        outpoint = {Txid::FromUint256(rng.rand256()), rng.rand32()};\r\n+    }\r\n+\r\n+    bench.batch(size).run([&] {\r\n+        std::unordered_set<COutPoint, SaltedOutpointHasher> set;\r\n+        set.reserve(size);\r\n+        for (const auto& outpoint : outpoints) {\r\n+            set.emplace(outpoint);\r\n+        }\r\n+        ankerl::nanobench::doNotOptimizeAway(set.size());\r\n+    });\r\n+}\r\n+\r\n static void MuHash(benchmark::Bench& bench)\r\n {\r\n     MuHash3072 acc;\r\n@@ -276,6 +369,10 @@\r\n BENCHMARK(SHA256_32b_AVX2, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(SHA256_32b_SHANI, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(SipHash_32b, benchmark::PriorityLevel::HIGH);\r\n+BENCHMARK(SaltedOutpointHasherBench_hash, benchmark::PriorityLevel::HIGH);\r\n+BENCHMARK(SaltedOutpointHasherBench_match, benchmark::PriorityLevel::HIGH);\r\n+BENCHMARK(SaltedOutpointHasherBench_mismatch, benchmark::PriorityLevel::HIGH);\r\n+BENCHMARK(SaltedOutpointHasherBench_create_set, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(SHA256D64_1024_STANDARD, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(SHA256D64_1024_SSE4, benchmark::PriorityLevel::HIGH);\r\n BENCHMARK(SHA256D64_1024_AVX2, benchmark::PriorityLevel::HIGH);\r\n\r\n```\r\n\r\n</details>\r\n\r\n> cmake -B build -DBUILD_BENCH=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc) && build/bin/bench_bitcoin -filter='SaltedOutpointHasherBench' -min-time=10000\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|               58.60 |       17,065,922.04 |    0.3% |     11.02 | `SaltedOutpointHasherBench_create_set`\r\n|               11.97 |       83,576,684.83 |    0.1% |     11.01 | `SaltedOutpointHasherBench_hash`\r\n|               14.50 |       68,985,850.12 |    0.3% |     10.96 | `SaltedOutpointHasherBench_match`\r\n|               13.90 |       71,942,033.47 |    0.4% |     11.03 | `SaltedOutpointHasherBench_mismatch`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------:|:----------\r\n|               57.27 |       17,462,299.19 |    0.1% |     11.02 | `SaltedOutpointHasherBench_create_set`\r\n|               11.24 |       88,997,888.48 |    0.3% |     11.04 | `SaltedOutpointHasherBench_hash`\r\n|               13.91 |       71,902,014.20 |    0.2% |     11.01 | `SaltedOutpointHasherBench_match`\r\n|               13.29 |       75,230,390.31 |    0.1% |     11.00 | `SaltedOutpointHasherBench_mismatch`\r\n\r\ncompared to master:\r\n```python\r\ncreate_set - 17,462,299.19 / 17,065,922.04 - 2.3% faster\r\nhash       - 88,997,888.48 / 83,576,684.83 - 6.4% faster\r\nmatch      - 71,902,014.20 / 68,985,850.12 - 4.2% faster\r\nmismatch   - 75,230,390.31 / 71,942,033.47 - 4.5% faster\r\n```\r\n\r\n> C++ compiler .......................... GNU 13.3.0\r\n\r\n> Before:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|              136.76 |        7,312,133.16 |    0.0% |        1,086.67 |          491.12 |  2.213 |         119.54 |    1.1% |     11.01 | `SaltedOutpointHasherBench_create_set`\r\n|               23.82 |       41,978,882.62 |    0.0% |          252.01 |           85.57 |  2.945 |           4.00 |    0.0% |     11.00 | `SaltedOutpointHasherBench_hash`\r\n|               60.42 |       16,549,695.42 |    0.1% |          460.51 |          217.04 |  2.122 |          21.00 |    1.4% |     10.99 | `SaltedOutpointHasherBench_match`\r\n|               78.66 |       12,713,595.35 |    0.1% |          555.59 |          282.52 |  1.967 |          20.19 |    2.2% |     10.74 | `SaltedOutpointHasherBench_mismatch`\r\n\r\n> After:\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|              135.38 |        7,386,349.49 |    0.0% |        1,078.19 |          486.16 |  2.218 |         119.56 |    1.1% |     11.00 | `SaltedOutpointHasherBench_create_set`\r\n|               23.67 |       42,254,558.08 |    0.0% |          247.01 |           85.01 |  2.906 |           4.00 |    0.0% |     11.00 | `SaltedOutpointHasherBench_hash`\r\n|               58.95 |       16,962,220.14 |    0.1% |          446.55 |          211.74 |  2.109 |          20.86 |    1.4% |     11.01 | `SaltedOutpointHasherBench_match`\r\n|               76.98 |       12,991,047.69 |    0.1% |          548.93 |          276.50 |  1.985 |          20.25 |    2.3% |     10.72 | `SaltedOutpointHasherBench_mismatch`\r\n\r\n```python\r\ncompared to master:\r\ncreate_set -  7,386,349.49 / 7,312,133.16  - 1.0% faster\r\nhash       - 42,254,558.08 / 41,978,882.62 - 0.6% faster\r\nmatch      - 16,962,220.14 / 16,549,695.42 - 2.4% faster\r\nmismatch   - 12,991,047.69 / 12,713,595.35 - 2.1% faster\r\n```",
@@ -52,11 +53,11 @@
       }
     ],
     "created_at": "2024-07-12T15:01:37Z",
-    "updated_at": "2025-11-03T16:20:17Z",
+    "updated_at": "2025-11-04T15:57:41Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "b314f78c960adfa91a0f8a96dd221539c475b349",
+    "merge_commit_sha": "9b3b7fc17007a280be73e1ceff482332d1f5ea19",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -78,6 +79,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       {
@@ -99,6 +101,7 @@
         "received_events_url": "https://api.github.com/users/jonatack/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       {
@@ -120,6 +123,7 @@
         "received_events_url": "https://api.github.com/users/josibake/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       {
@@ -141,6 +145,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     ],
@@ -169,6 +174,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -195,6 +201,7 @@
           "received_events_url": "https://api.github.com/users/l0rinc/received_events",
           "type": "User",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -247,9 +254,9 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 275133,
+        "size": 275088,
         "default_branch": "master",
-        "open_issues_count": 12,
+        "open_issues_count": 13,
         "is_template": false,
         "topics": [],
         "has_issues": false,
@@ -260,9 +267,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-11-03T12:47:59Z",
+        "pushed_at": "2025-11-03T21:15:14Z",
         "created_at": "2023-08-03T09:49:12Z",
-        "updated_at": "2025-10-29T19:21:15Z",
+        "updated_at": "2025-11-03T20:50:19Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -304,6 +311,7 @@
         "received_events_url": "https://api.github.com/users/bitcoin/received_events",
         "type": "Organization",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -330,6 +338,7 @@
           "received_events_url": "https://api.github.com/users/bitcoin/received_events",
           "type": "Organization",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -379,12 +388,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38149,
-        "stargazers_count": 86595,
-        "watchers_count": 86595,
-        "size": 295526,
+        "forks_count": 38151,
+        "stargazers_count": 86607,
+        "watchers_count": 86607,
+        "size": 295572,
         "default_branch": "master",
-        "open_issues_count": 737,
+        "open_issues_count": 731,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -401,9 +410,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-11-03T16:37:47Z",
+        "pushed_at": "2025-11-04T15:38:49Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-11-03T16:37:58Z",
+        "updated_at": "2025-11-04T15:46:47Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -434,7 +443,7 @@
     "changed_files": 9,
     "commits": 5,
     "review_comments": 18,
-    "comments": 20
+    "comments": 21
   },
   "events": [
     {
@@ -461,6 +470,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -488,6 +498,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2225781091",
@@ -517,6 +528,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "3b7b82b4b0c39a38538aae2cba10bec3907c5cbf",
@@ -547,6 +559,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -581,6 +594,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -611,6 +625,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -638,6 +653,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2227334986",
@@ -667,6 +683,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -697,6 +714,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -727,6 +745,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -754,6 +773,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2227389053",
@@ -783,6 +803,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -810,6 +831,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2227428876",
@@ -839,6 +861,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -869,6 +892,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -896,6 +920,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2228844594",
@@ -925,6 +950,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -952,6 +978,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2230532745",
@@ -981,6 +1008,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1011,6 +1039,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1041,6 +1070,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1071,6 +1101,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1098,6 +1129,7 @@
         "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2249287267",
@@ -1127,6 +1159,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1157,6 +1190,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1184,6 +1218,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2253245705",
@@ -1213,6 +1248,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1243,6 +1279,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "0dc224b81170d3109a48895b142b4d10cdf4346a",
@@ -1273,6 +1310,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "8d6c6bda46516b8a3f3aa8e4c426ba3ccacd6954",
@@ -1303,6 +1341,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1330,6 +1369,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2321835226",
@@ -1359,6 +1399,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1393,6 +1434,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "44098fe323e53613592e4da906b20a99774ee751",
@@ -1423,6 +1465,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1457,6 +1500,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1491,6 +1535,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1525,6 +1570,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "183052ff6a9361286a23aa89781171724099e725",
@@ -1555,6 +1601,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1579,6 +1626,7 @@
         "received_events_url": "https://api.github.com/users/josibake/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -1600,6 +1648,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -1627,6 +1676,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "bc959f5ba9a62b41b36cc662aa176b03969be176",
@@ -1657,6 +1707,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1684,6 +1735,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2416812237",
@@ -1713,6 +1765,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1743,6 +1796,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1773,6 +1827,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1807,6 +1862,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1831,6 +1887,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -1852,6 +1909,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -1879,6 +1937,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1913,6 +1972,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1943,6 +2003,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1970,6 +2031,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2601924070",
@@ -1999,6 +2061,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2036,6 +2099,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#pullrequestreview-2571061197",
@@ -2067,6 +2131,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2091,6 +2156,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -2112,6 +2178,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -2139,6 +2206,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2166,6 +2234,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2628994530",
@@ -2195,6 +2264,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "2885e7785417b57a3f3cad420196837965572258",
@@ -2225,6 +2295,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "d848da97f2e4fd0997507b2d1c2a1f4a2325193d",
@@ -2255,6 +2326,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2282,6 +2354,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2629085535",
@@ -2311,6 +2384,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2341,6 +2415,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2371,6 +2446,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2401,6 +2477,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2431,6 +2508,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2465,6 +2543,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2495,6 +2574,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2525,6 +2605,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2559,6 +2640,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2593,6 +2675,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "31e1a49acfb4fbcdf81216015aa2f818548589c6",
@@ -2623,6 +2706,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "987be1b5292241cb9179728d807c5176227eba4e",
@@ -2653,6 +2737,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2680,6 +2765,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-2887450663",
@@ -2709,6 +2795,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2739,6 +2826,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2769,6 +2857,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2799,6 +2888,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2829,6 +2919,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2863,6 +2954,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2890,6 +2982,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3186059855",
@@ -2919,6 +3012,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "656da514c5a3ee4d376b9b60f57451d3e4b6aec7",
@@ -2956,6 +3050,7 @@
         "received_events_url": "https://api.github.com/users/jonatack/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#pullrequestreview-3117932623",
@@ -2987,6 +3082,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3021,6 +3117,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3055,6 +3152,7 @@
         "received_events_url": "https://api.github.com/users/Raimo33/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3082,6 +3180,7 @@
         "received_events_url": "https://api.github.com/users/Raimo33/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3238765987",
@@ -3111,6 +3210,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3138,6 +3238,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3353850602",
@@ -3167,6 +3268,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3191,6 +3293,7 @@
         "received_events_url": "https://api.github.com/users/jonatack/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -3212,6 +3315,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -3239,6 +3343,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3266,6 +3371,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3353912094",
@@ -3295,6 +3401,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3322,6 +3429,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3353915093",
@@ -3511,6 +3619,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3538,6 +3647,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3354492388",
@@ -3567,6 +3677,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "d9f3ebfa62b451bac7dfab9a68021f5dc7b5d632",
@@ -3597,6 +3708,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3627,6 +3739,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3657,6 +3770,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3687,6 +3801,7 @@
         "received_events_url": "https://api.github.com/users/achow101/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3723,6 +3838,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#pullrequestreview-3289153725",
@@ -3794,6 +3910,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "89bbbbd257063118e6968c409e52632835b76ce8",
@@ -3831,6 +3948,7 @@
         "received_events_url": "https://api.github.com/users/laanwj/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#pullrequestreview-3361685613",
@@ -3862,6 +3980,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3886,6 +4005,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -3907,6 +4027,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -3934,6 +4055,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3975,12 +4097,133 @@
         "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#pullrequestreview-3411441889",
       "submitted_at": "2025-11-03T16:19:58Z",
       "state": "APPROVED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/30442"
+    },
+    {
+      "event": "commented",
+      "id": 3486739651,
+      "node_id": "IC_kwDOABII587P02zD",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3486739651",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T15:57:41Z",
+      "updated_at": "2025-11-04T15:57:41Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Thanks @ryanofsky, given that this is in review for more than 1 year, I will address your concerns in a follow-up.\r\nrfm?",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30442#issuecomment-3486739651",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30442"
+    },
+    {
+      "event": "mentioned",
+      "id": 20706748448,
+      "node_id": "MEE_lADOABII586PZc6MzwAAAATSN-gg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20706748448",
+      "actor": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T15:57:42Z"
+    },
+    {
+      "event": "subscribed",
+      "id": 20706748533,
+      "node_id": "SE_lADOABII586PZc6MzwAAAATSN-h1",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20706748533",
+      "actor": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T15:57:43Z"
     }
   ],
   "comments": [
@@ -4015,6 +4258,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In \"bench: Add COutPoint and SaltedOutpointHasher benchmarks\" 6ce13a33c6901d820467b9c24a03ca3861d91640\r\n\r\nYou could factor out `size` as a static global variable and reuse it in the benchmarks to avoid repetition!",
@@ -4068,6 +4312,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In \"bench: Add COutPoint and SaltedOutpointHasher benchmarks\" 6ce13a33c6901d820467b9c24a03ca3861d91640\r\n\r\nYou could create a helper for inserting random outpoints to reduce duplication.",
@@ -4121,6 +4366,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In \"bench: Add COutPoint and SaltedOutpointHasher benchmarks\" 6ce13a33c6901d820467b9c24a03ca3861d91640\r\n\r\nWhy are you xoring the hashes?",
@@ -4174,6 +4420,7 @@
         "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In \"bench: Add COutPoint and SaltedOutpointHasher benchmarks\" 6ce13a33c6901d820467b9c24a03ca3861d91640\r\n\r\nWhy aren't you benching insertion to the unordered map?",
@@ -4227,6 +4474,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Just to make sure they're not optimized away - ankerl::nanobench::doNotOptimizeAway is likely more costly than a simple xor.\r\nDo you have a better idea?",
@@ -4280,6 +4528,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I thought of that but they each have different difficulties, so they should be tuned separately (i.e. if something takes 2x as much time per round, we likely want fewer repetitions)",
@@ -4333,6 +4582,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I'd be measuring the map's behavior in that case, not the hashing",
@@ -4386,6 +4636,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "But there is a SaltedOutpointHasherBenchmark_create_set which does something similar",
@@ -4439,6 +4690,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "If I need to edit again, I'll consider it, thanks",
@@ -4492,6 +4744,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit \"optimization: Cache PresaltedSipHasher in CBlockHeaderAndShortTxIDs\"\r\n\r\nWhy is this optional? It looks like it's always initialized in the constructor.",
@@ -4545,6 +4798,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "This is meant to avoid a partial initialization, `.value()` throws if we forget to call `FillShortTxIDSelector` (while previously we would have just salted with 0)",
@@ -4598,6 +4852,7 @@
         "received_events_url": "https://api.github.com/users/sipa/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I was wrong; it's initialized in `CBlockHeaderAndShortTxIDs::FillShortTxIDSelector`.\r\n\r\nIf we want runtime checks, I'd rather have an `Assert()` or `Assume()` than relying on the throwing behavior of `std::optional<T>::value()`, but that's just a nit.",
@@ -4651,6 +4906,7 @@
         "received_events_url": "https://api.github.com/users/l0rinc/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "You mean \r\n```C++\r\nreturn (*Assert(m_hasher))(wtxid.ToUint256()) & 0xffffffffffffL;\r\n```\r\nwould be more explicit than\r\n```C++\r\nreturn m_hasher.value()(wtxid.ToUint256()) & 0xffffffffffffL;\r\n```\r\n\r\n[Pushed](https://github.com/bitcoin/bitcoin/compare/d9f3ebfa62b451bac7dfab9a68021f5dc7b5d632..89bbbbd257063118e6968c409e52632835b76ce8), let me know what you think.",
@@ -4704,6 +4960,7 @@
         "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit \"optimization: Introduce PresaltedSipHasher for repeated hashing\" (8568340be2c679713703edc3d418272ac78d1147)\r\n\r\nThis code would feel safer if `v` vector was declared const, to provide some guarantee that `v[0]` will actually equal `C0 ^ k0` (and so on) at the time this is called.\r\n\r\nEDIT: Implemented this const suggestion in diff below",
@@ -4757,6 +5014,7 @@
         "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit \"optimization: Introduce PresaltedSipHasher for repeated hashing\" (8568340be2c679713703edc3d418272ac78d1147)\r\n\r\nCan the description of this class from commit description be added here so this has some documentation?\r\n\r\nAlso it seems like distinction between the `CSipHasher` and `PresaltedSipHasher` classes is not really that one is presalted and the other isn't. They seem both seem presalted and have the same members and do the same work in the constructor.\r\n\r\nWould seem more accurate to call `PresaltedSipHasher` something like `ReusableSipHasher` or `ImmutableSipHasher` since the key difference from `CSipHasher` seems to be that it can be reused any number of times because of its constant state.",
@@ -4810,6 +5068,7 @@
         "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit \"optimization: Introduce PresaltedSipHasher for repeated hashing\" (8568340be2c679713703edc3d418272ac78d1147)\r\n\r\nWould be good to document that calling this is equivalent to calling `SipHasher(k0, k1).Write(val).Write(extra).Finalize()`",
@@ -4863,6 +5122,7 @@
         "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit \"optimization: Introduce PresaltedSipHasher for repeated hashing\" (8568340be2c679713703edc3d418272ac78d1147)\r\n\r\nI can see this code is just being moved, not duplicated again, but since this does duplicate the CSipHasher constructor code, would seem good to just move and define once in a single place. \r\n\r\nWould suggest a change like the following (this change also makes PresaltedSipHasher state constant as suggested earlier):\r\n\r\n```diff\r\n--- a/src/crypto/siphash.cpp\r\n+++ b/src/crypto/siphash.cpp\r\n@@ -15,12 +15,8 @@\r\n     v2 = std::rotl(v2, 32); \\\r\n } while (0)\r\n \r\n-CSipHasher::CSipHasher(uint64_t k0, uint64_t k1)\r\n+CSipHasher::CSipHasher(uint64_t k0, uint64_t k1) : SipHashState{k0, k1}\r\n {\r\n-    v[0] = C0 ^ k0;\r\n-    v[1] = C1 ^ k1;\r\n-    v[2] = C2 ^ k0;\r\n-    v[3] = C3 ^ k1;\r\n     count = 0;\r\n     tmp = 0;\r\n }\r\n@@ -136,7 +132,7 @@ uint64_t SipHashUint256(uint64_t k0, uint64_t k1, const uint256& val)\r\n /* Specialized implementation for efficiency */\r\n uint64_t PresaltedSipHasher::operator()(const uint256& val, uint32_t extra) const noexcept\r\n {\r\n-    uint64_t v0 = v[0], v1 = v[1], v2 = v[2], v3 = v[3];\r\n+    uint64_t v0 = m_state.v[0], v1 = m_state.v[1], v2 = m_state.v[2], v3 = m_state.v[3];\r\n     uint64_t d = val.GetUint64(0);\r\n     v3 ^= d;\r\n     SIPROUND;\r\n--- a/src/crypto/siphash.h\r\n+++ b/src/crypto/siphash.h\r\n@@ -10,19 +10,27 @@\r\n #include <span.h>\r\n #include <uint256.h>\r\n \r\n-/** SipHash-2-4 */\r\n-class CSipHasher\r\n+class SipHashState\r\n {\r\n-private:\r\n-    uint64_t v[4];\r\n-    uint64_t tmp;\r\n-    uint8_t count; // Only the low 8 bits of the input size matter.\r\n-\r\n public:\r\n+    SipHashState(uint64_t k0, uint64_t k1)  noexcept : v{C0 ^ k0, C1 ^ k1, C2 ^ k0, C3 ^ k1} {}\r\n+\r\n+    uint64_t v[4];\r\n+\r\n     static constexpr uint64_t C0{0x736f6d6570736575ULL};\r\n     static constexpr uint64_t C1{0x646f72616e646f6dULL};\r\n     static constexpr uint64_t C2{0x6c7967656e657261ULL};\r\n     static constexpr uint64_t C3{0x7465646279746573ULL};\r\n+};\r\n+\r\n+/** SipHash-2-4 */\r\n+class CSipHasher : public SipHashState\r\n+{\r\n+private:\r\n+    uint64_t tmp;\r\n+    uint8_t count; // Only the low 8 bits of the input size matter.\r\n+\r\n+public:\r\n \r\n     /** Construct a SipHash calculator initialized with 128-bit key (k0, k1) */\r\n     CSipHasher(uint64_t k0, uint64_t k1);\r\n@@ -51,15 +59,10 @@ uint64_t SipHashUint256(uint64_t k0, uint64_t k1, const uint256& val);\r\n \r\n class PresaltedSipHasher\r\n {\r\n-    uint64_t v[4];\r\n+    const SipHashState m_state;\r\n \r\n public:\r\n-    explicit PresaltedSipHasher(uint64_t k0, uint64_t k1) noexcept {\r\n-        v[0] = CSipHasher::C0 ^ k0;\r\n-        v[1] = CSipHasher::C1 ^ k1;\r\n-        v[2] = CSipHasher::C2 ^ k0;\r\n-        v[3] = CSipHasher::C3 ^ k1;\r\n-    }\r\n+    explicit PresaltedSipHasher(uint64_t k0, uint64_t k1) noexcept : m_state{k0, k1} {}\r\n \r\n     uint64_t operator()(const uint256& val, uint32_t extra) const noexcept;\r\n };\r\n```\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
