@@ -37,6 +37,7 @@
       "received_events_url": "https://api.github.com/users/vasild/received_events",
       "type": "User",
       "site_admin": false,
+      "name": null,
       "patch_url": null
     },
     "body": "Currently `CConnman` is a mixture of:\r\n* low level socket handling, e.g. send, recv, poll, bind, listen, connect, and\r\n* higher level logic that is specific to the Bitcoin P2P protocol, e.g. V1/V2 transport, choosing which address to connect to, if we manage to connect mark the address good in `AddrMan`, maintaining the number of inbound and outbound connections, banning of peers, interacting with `PeerManager`.\r\n\r\n---\r\n\r\nThis PR splits the socket handling into a new class which makes the code more modular and reusable. Having more modular and reusable code is a good thing on its own, even if the code is not reused. Stratum V2 and libevent-less RPC/HTTP server could benefit from this, but it makes sense on its own, even without those projects.\r\n\r\n---\r\n\r\nThe socket operations are driven by the new class `SockMan` which informs the higher level via provided methods when e.g. new data arrives on the socket or a new connection is accepted. For this, `SockMan` provides some non-virtual methods to start it rolling and then it calls pure virtual methods which are implemented by the higher level (e.g. `CConnman`) on certain events, for example \"got this new data on this node's socket\".\r\n\r\nThe interface of `SockMan` is:\r\n\r\n```cpp\r\n/**\r\n * A socket manager class which handles socket operations.\r\n * To use this class, inherit from it and implement the pure virtual methods.\r\n * Handled operations:\r\n * - binding and listening on sockets\r\n * - starting of necessary threads to process socket operations\r\n * - accepting incoming connections\r\n * - making outbound connections\r\n * - closing connections\r\n * - waiting for IO readiness on sockets and doing send/recv accordingly\r\n */\r\nclass SockMan\r\n{\r\npublic:\r\n\r\n    //\r\n    // Non-virtual functions, to be reused by children classes.\r\n    //\r\n\r\n    /**\r\n     * Bind to a new address:port, start listening and add the listen socket to `m_listen`.\r\n     * Should be called before `StartSocketsThreads()`.\r\n     * @param[in] to Where to bind.\r\n     * @param[out] err_msg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `err_msg` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& err_msg);\r\n\r\n    /**\r\n     * Start the necessary threads for sockets IO.\r\n     */\r\n    void StartSocketsThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketsThreads()` to exit.\r\n     */\r\n    void JoinSocketsThreads();\r\n\r\n    /**\r\n     * Make an outbound connection, save the socket internally and return a newly generated connection id.\r\n     * @param[in] to The address to connect to, either as CService or a host as string and port as\r\n     * an integer, if the later is used, then `proxy` must be valid.\r\n     * @param[in] is_important If true, then log failures with higher severity.\r\n     * @param[in] proxy Proxy to connect through, if set.\r\n     * @param[out] proxy_failed If `proxy` is valid and the connection failed because of the\r\n     * proxy, then it will be set to true.\r\n     * @param[out] me If the connection was successful then this is set to the address on the\r\n     * local side of the socket.\r\n     * @return Newly generated id, or std::nullopt if the operation fails.\r\n     */\r\n    std::optional<SockMan::Id> ConnectAndMakeId(const std::variant<CService, StringHostIntPort>& to,\r\n                                                bool is_important,\r\n                                                std::optional<Proxy> proxy,\r\n                                                bool& proxy_failed,\r\n                                                CService& me)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex, !m_unused_i2p_sessions_mutex);\r\n\r\n    /**\r\n     * Destroy a given connection by closing its socket and release resources occupied by it.\r\n     * @param[in] id Connection to destroy.\r\n     * @return Whether the connection existed and its socket was closed by this call.\r\n     */\r\n    bool CloseConnection(Id id)\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Try to send some data over the given connection.\r\n     * @param[in] id Identifier of the connection.\r\n     * @param[in] data The data to send, it might happen that only a prefix of this is sent.\r\n     * @param[in] will_send_more Used as an optimization if the caller knows that they will\r\n     * be sending more data soon after this call.\r\n     * @param[out] errmsg If <0 is returned then this will contain a human readable message\r\n     * explaining the error.\r\n     * @retval >=0 The number of bytes actually sent.\r\n     * @retval <0 A permanent error has occurred.\r\n     */\r\n    ssize_t SendBytes(Id id,\r\n                      std::span<const unsigned char> data,\r\n                      bool will_send_more,\r\n                      std::string& errmsg) const\r\n        EXCLUSIVE_LOCKS_REQUIRED(!m_connected_mutex);\r\n\r\n    /**\r\n     * Stop listening by closing all listening sockets.\r\n     */\r\n    void StopListening();\r\n\r\n    //\r\n    // Pure virtual functions must be implemented by children classes.\r\n    //\r\n\r\n    /**\r\n     * Be notified when a new connection has been accepted.\r\n     * @param[in] id Id of the newly accepted connection.\r\n     * @param[in] me The address and port at our side of the connection.\r\n     * @param[in] them The address and port at the peer's side of the connection.\r\n     * @retval true The new connection was accepted at the higher level.\r\n     * @retval false The connection was refused at the higher level, so the\r\n     * associated socket and id should be discarded by `SockMan`.\r\n     */\r\n    virtual bool EventNewConnectionAccepted(Id id,\r\n                                            const CService& me,\r\n                                            const CService& them) = 0;\r\n\r\n    /**\r\n     * Called when the socket is ready to send data and `ShouldTryToSend()` has\r\n     * returned true. This is where the higher level code serializes its messages\r\n     * and calls `SockMan::SendBytes()`.\r\n     * @param[in] id Id of the connection whose socket is ready to send.\r\n     * @param[out] cancel_recv Should always be set upon return and if it is true,\r\n     * then the next attempt to receive data from that connection will be omitted.\r\n     */\r\n    virtual void EventReadyToSend(Id id, bool& cancel_recv) = 0;\r\n\r\n    /**\r\n     * Called when new data has been received.\r\n     * @param[in] id Connection for which the data arrived.\r\n     * @param[in] data Received data.\r\n     */\r\n    virtual void EventGotData(Id id, std::span<const uint8_t> data) = 0;\r\n\r\n    /**\r\n     * Called when the remote peer has sent an EOF on the socket. This is a graceful\r\n     * close of their writing side, we can still send and they will receive, if it\r\n     * makes sense at the application level.\r\n     * @param[in] id Connection whose socket got EOF.\r\n     */\r\n    virtual void EventGotEOF(Id id) = 0;\r\n\r\n    /**\r\n     * Called when we get an irrecoverable error trying to read from a socket.\r\n     * @param[in] id Connection whose socket got an error.\r\n     * @param[in] errmsg Message describing the error.\r\n     */\r\n    virtual void EventGotPermanentReadError(Id id, const std::string& errmsg) = 0;\r\n};\r\n```\r\n\r\nResolves: https://github.com/bitcoin/bitcoin/issues/30694\r\n\r\n---\r\n\r\nReview hint: this PR moves some code around, so reviewers may find this helpful: `git show --color-moved --color-moved-ws=allow-indentation-change`.",
@@ -52,7 +53,7 @@
       }
     ],
     "created_at": "2024-09-27T07:57:10Z",
-    "updated_at": "2025-10-24T19:11:18Z",
+    "updated_at": "2025-11-04T02:15:48Z",
     "mergeable": false,
     "mergeable_state": "dirty",
     "merged": false,
@@ -77,6 +78,7 @@
         "received_events_url": "https://api.github.com/users/tdb3/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     ],
@@ -105,6 +107,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -131,6 +134,7 @@
           "received_events_url": "https://api.github.com/users/vasild/received_events",
           "type": "User",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -181,9 +185,9 @@
         "homepage": "https://bitcoin.org/en/download",
         "language": "C++",
         "forks_count": 1,
-        "stargazers_count": 8,
-        "watchers_count": 8,
-        "size": 268899,
+        "stargazers_count": 6,
+        "watchers_count": 6,
+        "size": 269347,
         "default_branch": "master",
         "open_issues_count": 2,
         "is_template": false,
@@ -196,9 +200,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-10-17T10:25:20Z",
+        "pushed_at": "2025-11-03T18:59:56Z",
         "created_at": "2018-02-07T11:52:47Z",
-        "updated_at": "2025-10-17T10:06:13Z",
+        "updated_at": "2025-11-03T14:50:00Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -240,6 +244,7 @@
         "received_events_url": "https://api.github.com/users/bitcoin/received_events",
         "type": "Organization",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -266,6 +271,7 @@
           "received_events_url": "https://api.github.com/users/bitcoin/received_events",
           "type": "Organization",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -315,12 +321,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38076,
-        "stargazers_count": 86389,
-        "watchers_count": 86389,
-        "size": 295234,
+        "forks_count": 38151,
+        "stargazers_count": 86599,
+        "watchers_count": 86599,
+        "size": 295529,
         "default_branch": "master",
-        "open_issues_count": 741,
+        "open_issues_count": 737,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -337,9 +343,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-10-24T18:43:53Z",
+        "pushed_at": "2025-11-03T16:37:47Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-10-24T18:44:02Z",
+        "updated_at": "2025-11-04T00:18:26Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -370,7 +376,7 @@
     "changed_files": 20,
     "commits": 17,
     "review_comments": 175,
-    "comments": 56
+    "comments": 57
   },
   "events": [
     {
@@ -397,14 +403,15 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
       "commit_url": null,
       "created_at": "2024-09-27T07:57:13Z",
-      "updated_at": "2025-10-23T06:07:53Z",
+      "updated_at": "2025-11-04T02:15:48Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/30988.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept NACK | [theuni](https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2702063374) |\n| Concept ACK | [tdb3](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2336026243), [Sjors](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552832660), [hodlinator](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2582270517), [jonatack](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2621788527) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2373476515) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#32983](https://github.com/bitcoin/bitcoin/pull/32983) (rpc: refactor: use string_view in Arg/MaybeArg by stickies-v)\n* [#32747](https://github.com/bitcoin/bitcoin/pull/32747) (Introduce SockMan (\"lite\"): low-level socket handling for HTTP by pinheadmz)\n* [#32394](https://github.com/bitcoin/bitcoin/pull/32394) (net: make m_nodes_mutex non-recursive by vasild)\n* [#32278](https://github.com/bitcoin/bitcoin/pull/32278) (doc: better document NetEventsInterface and the deletion of \"CNode\"s by vasild)\n* [#32065](https://github.com/bitcoin/bitcoin/pull/32065) (i2p: make a time gap between creating transient sessions and using them by vasild)\n* [#32015](https://github.com/bitcoin/bitcoin/pull/32015) (net: replace manual reference counting of CNode with shared_ptr by vasild)\n* [#30951](https://github.com/bitcoin/bitcoin/pull/30951) (net: option to disallow v1 connection on ipv4 and ipv6 peers by stratospher)\n* [#30277](https://github.com/bitcoin/bitcoin/pull/30277) ([DO NOT MERGE] Erlay: bandwidth-efficient transaction relay protocol (Full implementation) by sr-gi)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29641](https://github.com/bitcoin/bitcoin/pull/29641) (scripted-diff: Use LogInfo over LogPrintf [WIP, NOMERGE, DRAFT] by maflcko)\n* [#29418](https://github.com/bitcoin/bitcoin/pull/29418) (rpc: provide per message stats for global traffic via new RPC 'getnetmsgstats' by vasild)\n* [#29415](https://github.com/bitcoin/bitcoin/pull/29415) (Broadcast own transactions only via short-lived Tor or I2P connections by vasild)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\nPossible typos and grammar issues:\n\n- \"Each connection is assigned an unique id of this type.\" -> \"a unique\" [use \"a\" before a consonant-starting sound; \"an unique\" is incorrect]\n- \"@param[in] interrupt_net Singal this to tell SockMan to cease network activity.\" -> \"Signal\" [typo in \"Singal\"]\n- \"if the later is used, then `proxy` must be valid.\" -> \"latter\" [use \"latter\" (not \"later\") when contrasting two previously mentioned options]\n\n<sup>drahtbot_id_5_m</sup>\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/30988.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept NACK | [theuni](https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2702063374) |\n| Concept ACK | [tdb3](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2336026243), [Sjors](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552832660), [hodlinator](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2582270517), [jonatack](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2621788527), [ryanofsky](https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3483436641) |\n| Stale ACK | [pinheadmz](https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2373476515) |\n\nIf your review is incorrectly listed, please react with 👎 to this comment and the bot will ignore it on the next update.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#32983](https://github.com/bitcoin/bitcoin/pull/32983) (rpc: refactor: use string_view in Arg/MaybeArg by stickies-v)\n* [#32747](https://github.com/bitcoin/bitcoin/pull/32747) (Introduce SockMan (\"lite\"): low-level socket handling for HTTP by pinheadmz)\n* [#32394](https://github.com/bitcoin/bitcoin/pull/32394) (net: make m_nodes_mutex non-recursive by vasild)\n* [#32278](https://github.com/bitcoin/bitcoin/pull/32278) (doc: better document NetEventsInterface and the deletion of \"CNode\"s by vasild)\n* [#32065](https://github.com/bitcoin/bitcoin/pull/32065) (i2p: make a time gap between creating transient sessions and using them by vasild)\n* [#32015](https://github.com/bitcoin/bitcoin/pull/32015) (net: replace manual reference counting of CNode with shared_ptr by vasild)\n* [#30951](https://github.com/bitcoin/bitcoin/pull/30951) (net: option to disallow v1 connection on ipv4 and ipv6 peers by stratospher)\n* [#30277](https://github.com/bitcoin/bitcoin/pull/30277) ([DO NOT MERGE] Erlay: bandwidth-efficient transaction relay protocol (Full implementation) by sr-gi)\n* [#30116](https://github.com/bitcoin/bitcoin/pull/30116) (p2p: Fill reconciliation sets (Erlay) attempt 2 by sr-gi)\n* [#29641](https://github.com/bitcoin/bitcoin/pull/29641) (scripted-diff: Use LogInfo over LogPrintf [WIP, NOMERGE, DRAFT] by maflcko)\n* [#29418](https://github.com/bitcoin/bitcoin/pull/29418) (rpc: provide per message stats for global traffic via new RPC 'getnetmsgstats' by vasild)\n* [#29415](https://github.com/bitcoin/bitcoin/pull/29415) (Broadcast own transactions only via short-lived Tor or I2P connections by vasild)\n* [#28463](https://github.com/bitcoin/bitcoin/pull/28463) (p2p: Increase inbound capacity for block-relay only connections by mzumsande)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\nPossible typos and grammar issues:\n\n- \"Each connection is assigned an unique id of this type.\" -> \"a unique\" [use \"a\" before a consonant-starting sound; \"an unique\" is incorrect]\n- \"@param[in] interrupt_net Singal this to tell SockMan to cease network activity.\" -> \"Signal\" [typo in \"Singal\"]\n- \"if the later is used, then `proxy` must be valid.\" -> \"latter\" [use \"latter\" (not \"later\") when contrasting two previously mentioned options]\n\n<sup>drahtbot_id_5_m</sup>\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -424,6 +431,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2378648531",
@@ -453,6 +461,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -487,6 +496,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -514,6 +524,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2379079961",
@@ -549,6 +560,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2333138089",
@@ -580,6 +592,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "70c2f13f83a5cc740330d0b4af9cbd74515be6b2",
@@ -610,6 +623,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -637,6 +651,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2379495804",
@@ -666,6 +681,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -700,6 +716,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -727,6 +744,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2379691000",
@@ -756,6 +774,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -790,6 +809,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -831,6 +851,7 @@
         "received_events_url": "https://api.github.com/users/tdb3/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2336026243",
@@ -862,6 +883,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -889,6 +911,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2383223911",
@@ -918,6 +941,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -945,6 +969,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2383313791",
@@ -974,6 +999,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1001,6 +1027,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2391022009",
@@ -1030,6 +1057,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1060,6 +1088,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1090,6 +1119,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1120,6 +1150,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1150,6 +1181,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1177,6 +1209,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2393768768",
@@ -1206,6 +1239,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1236,6 +1270,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1273,6 +1308,7 @@
         "received_events_url": "https://api.github.com/users/Jacksonearl2468/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2349481835",
@@ -1304,6 +1340,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1344,6 +1381,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2372105727",
@@ -1382,6 +1420,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2373476515",
@@ -1413,6 +1452,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1437,6 +1477,7 @@
         "received_events_url": "https://api.github.com/users/tdb3/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -1458,6 +1499,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -1485,6 +1527,7 @@
         "received_events_url": "https://api.github.com/users/0xB10C/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1515,6 +1558,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1542,6 +1586,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2426964142",
@@ -1571,6 +1616,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1601,6 +1647,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1631,6 +1678,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1665,6 +1713,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1692,6 +1741,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2476925664",
@@ -1721,6 +1771,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "c4f51c7f61e6c4e291025e450f6dd97c2b939b56",
@@ -1751,6 +1802,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1778,6 +1830,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2476951015",
@@ -1807,6 +1860,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1837,6 +1891,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1867,6 +1922,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1901,6 +1957,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1935,6 +1992,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "2b0103705fefddff6b880b9eb72fb590740a7300",
@@ -1965,6 +2023,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1992,6 +2051,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2485715952",
@@ -2021,6 +2081,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "645f625e29b36321bcba8db5758b0428b8ebd80f",
@@ -2051,6 +2112,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2078,6 +2140,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2514637932",
@@ -2107,6 +2170,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2147,6 +2211,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2493471520",
@@ -2178,6 +2243,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2205,6 +2271,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2552624259",
@@ -2234,6 +2301,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "b8b042626ea65c2c2b355a6de69cb7c98bd04de3",
@@ -2264,6 +2332,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2291,6 +2360,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2552841151",
@@ -2320,6 +2390,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2354,6 +2425,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2388,6 +2460,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "f71f1a346c71909750e5e7d11305dd0a1c24373c",
@@ -2418,6 +2491,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2445,6 +2519,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2587261731",
@@ -2474,6 +2549,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2508,6 +2584,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2535,6 +2612,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2590020502",
@@ -2570,6 +2648,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2550005361",
@@ -2601,6 +2680,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "d83ff66fd74654e67b56d11a7d8e92d38a4bd17a",
@@ -2631,6 +2711,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2658,6 +2739,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2590500946",
@@ -2687,6 +2769,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2721,6 +2804,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "bcf1254e91782a33b5a1db542f3758831e0bfe2e",
@@ -2751,6 +2835,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2778,6 +2863,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2590687348",
@@ -2807,6 +2893,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2848,6 +2935,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552280742",
@@ -2886,6 +2974,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552366143",
@@ -2923,6 +3012,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552728389",
@@ -2961,6 +3051,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2552832660",
@@ -2998,6 +3089,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2559620130",
@@ -3035,6 +3127,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2570362263",
@@ -3066,6 +3159,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "266ac3267390270e6794d478aa1fbe40e88ffb0f",
@@ -3096,6 +3190,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3123,6 +3218,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2619619537",
@@ -3152,6 +3248,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3179,6 +3276,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2619994736",
@@ -3208,6 +3306,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3235,6 +3334,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2622122439",
@@ -3264,6 +3364,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3298,6 +3399,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "7866c736c87a908cef75dc6901c9c0594c65b0eb",
@@ -3328,6 +3430,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3355,6 +3458,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2624601401",
@@ -3384,6 +3488,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3424,6 +3529,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2584231283",
@@ -3455,6 +3561,7 @@
         "received_events_url": "https://api.github.com/users/PRADACANDI18/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3492,6 +3599,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2586038876",
@@ -3530,6 +3638,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2582270517",
@@ -3567,6 +3676,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2589941779",
@@ -3598,6 +3708,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3632,6 +3743,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3659,6 +3771,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2637415972",
@@ -3694,6 +3807,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2598938658",
@@ -3731,6 +3845,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2599369355",
@@ -3762,6 +3877,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "7d84f431f9fd89b647f385ea5224b5ad76236844",
@@ -3792,6 +3908,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3819,6 +3936,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2643842804",
@@ -3848,6 +3966,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3875,6 +3994,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2647374260",
@@ -3904,6 +4024,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "7b63b4ca1c4bc82bb1673313b326888cdb7eda9b",
@@ -3934,6 +4055,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -3961,6 +4083,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2647781404",
@@ -3990,6 +4113,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4017,6 +4141,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2647888735",
@@ -4046,6 +4171,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "c4ab7f82d6a4265fb96159b6c973ad849df4f8b9",
@@ -4076,6 +4202,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4103,6 +4230,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2656192834",
@@ -4132,6 +4260,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4159,6 +4288,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2656216742",
@@ -4188,6 +4318,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4222,6 +4353,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4249,6 +4381,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2657080863",
@@ -4278,6 +4411,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "563afdd975771cd2b87c4a96e0059f1c6f8774ad",
@@ -4308,6 +4442,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4335,6 +4470,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2658649883",
@@ -4370,6 +4506,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2617479050",
@@ -4401,6 +4538,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "e1671ff42c385f611af778380a83e98920cee82e",
@@ -4431,6 +4569,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4458,6 +4597,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2659191470",
@@ -4487,6 +4627,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "741f17e51ddac002fadbc735e2ca650117594a3c",
@@ -4517,6 +4658,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4544,6 +4686,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2662441920",
@@ -4580,6 +4723,7 @@
         "received_events_url": "https://api.github.com/users/jonatack/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2621788527",
@@ -4617,6 +4761,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2654878363",
@@ -4648,6 +4793,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4675,6 +4821,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2702063374",
@@ -4704,6 +4851,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4734,6 +4882,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4764,6 +4913,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4794,6 +4944,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4824,6 +4975,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4851,6 +5003,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2703769420",
@@ -4880,6 +5033,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4910,6 +5064,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4940,6 +5095,7 @@
         "received_events_url": "https://api.github.com/users/0xB10C/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -4970,6 +5126,7 @@
         "received_events_url": "https://api.github.com/users/0xB10C/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5000,6 +5157,7 @@
         "received_events_url": "https://api.github.com/users/fanquake/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5027,6 +5185,7 @@
         "received_events_url": "https://api.github.com/users/fanquake/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2720395222",
@@ -5056,6 +5215,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5083,6 +5243,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2720735149",
@@ -5112,6 +5273,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5142,6 +5304,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5172,6 +5335,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5199,6 +5363,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2722497291",
@@ -5228,6 +5393,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5258,6 +5424,7 @@
         "received_events_url": "https://api.github.com/users/theuni/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5288,6 +5455,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5322,6 +5490,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "f2f9ff9823fa9ef84ab74af675dad36a390a6b34",
@@ -5352,6 +5521,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5379,6 +5549,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2740633112",
@@ -5408,6 +5579,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5442,6 +5614,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5476,6 +5649,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "7ef9661fb09d2cd9356cca7476256fea2077bec9",
@@ -5506,6 +5680,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5533,6 +5708,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2788734134",
@@ -5562,6 +5738,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5596,6 +5773,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5623,6 +5801,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2792622898",
@@ -5652,6 +5831,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5686,6 +5866,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5713,6 +5894,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2843017925",
@@ -5742,6 +5924,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "503791ed57739a5d76aebbb10a39de15dd61eff6",
@@ -5772,6 +5955,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5799,6 +5983,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2846425432",
@@ -5828,6 +6013,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5862,6 +6048,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5896,6 +6083,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "9cf56ad085d88f0d5fa1b8751ac1ed04e751a5fd",
@@ -5926,6 +6114,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -5953,6 +6142,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2897701739",
@@ -5982,6 +6172,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "a8fcd8385e1ca382378ef0450c742ec714f67e99",
@@ -6012,6 +6203,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6039,6 +6231,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2897976693",
@@ -6068,6 +6261,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6102,6 +6296,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6129,6 +6324,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2897977552",
@@ -6158,6 +6354,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6192,6 +6389,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6232,6 +6430,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2924089877",
@@ -6263,6 +6462,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "6aa43a298d10d1de77f34c392b86302522e50bc4",
@@ -6293,6 +6493,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6320,6 +6521,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2970222630",
@@ -6355,6 +6557,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#pullrequestreview-2926169978",
@@ -6386,6 +6589,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6413,6 +6617,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2995857066",
@@ -6442,6 +6647,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6472,6 +6678,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6499,6 +6706,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3005059779",
@@ -6528,6 +6736,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6562,6 +6771,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6589,6 +6799,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3164755376",
@@ -6618,6 +6829,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6648,6 +6860,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6678,6 +6891,7 @@
         "received_events_url": "https://api.github.com/users/tdb3/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6708,6 +6922,7 @@
         "received_events_url": "https://api.github.com/users/tdb3/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6738,6 +6953,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6768,6 +6984,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6798,6 +7015,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6825,6 +7043,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3214068903",
@@ -6854,6 +7073,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6884,6 +7104,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6914,6 +7135,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "8725d10df5050f9ac2a7cbedf2502716786fca84",
@@ -6944,6 +7166,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -6971,6 +7194,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3371121013",
@@ -7000,6 +7224,7 @@
         "received_events_url": "https://api.github.com/users/param/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7030,6 +7255,7 @@
         "received_events_url": "https://api.github.com/users/param/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7060,6 +7286,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7454,6 +7681,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "dd32dfaaf326f9450a8dbc677c9b05588b00b39d",
@@ -7484,6 +7712,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7511,6 +7740,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3373034901",
@@ -7860,6 +8090,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "69c015b258c3bbfb44af478d7a5a05ad0b0156b8",
@@ -7890,6 +8121,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7917,6 +8149,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3375748629",
@@ -7946,6 +8179,7 @@
         "received_events_url": "https://api.github.com/users/param/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -7976,6 +8210,7 @@
         "received_events_url": "https://api.github.com/users/param/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -8006,6 +8241,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -8040,6 +8276,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -8067,10 +8304,131 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3444534904",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30988"
+    },
+    {
+      "event": "commented",
+      "id": 3483436641,
+      "node_id": "IC_kwDOABII587PoQZh",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3483436641",
+      "actor": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T02:15:40Z",
+      "updated_at": "2025-11-04T02:15:40Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Concept ACK 69c015b258c3bbfb44af478d7a5a05ad0b0156b8 and I've started reviewing this. Overall I think this is a nice change that simplifies net.cpp by removing low level socket calls and details of establishing connections from implementation of the transport protocol. It also seems like it should make net.cpp code more portable if for example we wanted it to use libuv, or a future c++ networking library, or experiment with sandboxing, mesh networking, etc. The [sockman API](https://github.com/vasild/bitcoin/blob/69c015b258c3bbfb44af478d7a5a05ad0b0156b8/src/common/sockman.h) also seems well organized and documented.\r\n\r\nI think I agree with @theuni's comment in https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2702063374 that the http server and sv2 server probably would not benefit very much from using this, but that seems like more of a concern for #32061 than this PR. \r\n\r\nI would be interested to know more about how the HTTP and sv2 implementations \"ended up with very non-optimal performance because of the optimistic send\" though because that would seem like something that would be good to correct or at least document in the sockman class even if it will not be used for these purposes.",
+      "user": {
+        "login": "ryanofsky",
+        "id": 7133040,
+        "node_id": "MDQ6VXNlcjcxMzMwNDA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/7133040?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ryanofsky",
+        "html_url": "https://github.com/ryanofsky",
+        "followers_url": "https://api.github.com/users/ryanofsky/followers",
+        "following_url": "https://api.github.com/users/ryanofsky/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ryanofsky/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ryanofsky/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ryanofsky/subscriptions",
+        "organizations_url": "https://api.github.com/users/ryanofsky/orgs",
+        "repos_url": "https://api.github.com/users/ryanofsky/repos",
+        "events_url": "https://api.github.com/users/ryanofsky/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ryanofsky/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-3483436641",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/30988"
+    },
+    {
+      "event": "mentioned",
+      "id": 20689398376,
+      "node_id": "MEE_lADOABII586YIJemzwAAAATRLypo",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20689398376",
+      "actor": {
+        "login": "theuni",
+        "id": 417043,
+        "node_id": "MDQ6VXNlcjQxNzA0Mw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/417043?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/theuni",
+        "html_url": "https://github.com/theuni",
+        "followers_url": "https://api.github.com/users/theuni/followers",
+        "following_url": "https://api.github.com/users/theuni/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/theuni/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/theuni/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/theuni/subscriptions",
+        "organizations_url": "https://api.github.com/users/theuni/orgs",
+        "repos_url": "https://api.github.com/users/theuni/repos",
+        "events_url": "https://api.github.com/users/theuni/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/theuni/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T02:15:42Z"
+    },
+    {
+      "event": "subscribed",
+      "id": 20689398390,
+      "node_id": "SE_lADOABII586YIJemzwAAAATRLyp2",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/20689398390",
+      "actor": {
+        "login": "theuni",
+        "id": 417043,
+        "node_id": "MDQ6VXNlcjQxNzA0Mw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/417043?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/theuni",
+        "html_url": "https://github.com/theuni",
+        "followers_url": "https://api.github.com/users/theuni/followers",
+        "following_url": "https://api.github.com/users/theuni/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/theuni/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/theuni/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/theuni/subscriptions",
+        "organizations_url": "https://api.github.com/users/theuni/orgs",
+        "repos_url": "https://api.github.com/users/theuni/repos",
+        "events_url": "https://api.github.com/users/theuni/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/theuni/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-11-04T02:15:42Z"
     }
   ],
   "comments": [
@@ -8105,6 +8463,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Arrays are ordered data structures and I don't think it is user-friendly to shuffle them by ID. I think this comment can just be removed.",
@@ -8158,6 +8517,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Removed, thanks!",
@@ -8211,6 +8571,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Silent merge conflict with #30937",
@@ -8264,6 +8625,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "1bfc1ca9b6b68c6356ffc23ecf01e417152ade95\r\n\r\nWhy do CNode .addr and .addrBind still need to be CAddress? maybe it makes some sense for .addr if that's where we also store the service flags for easier gossiping, but why would the local bind address need anything besides an IP and port?",
@@ -8317,6 +8679,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "41c87ddb3d7a18d2c0fa7eccfbde57e9d6e898c2\r\n\r\nMaybe these are expected to be set by callers in future commits, so I'm just leaving myself a note to look for `SO_KEEPALIVE` and `TCP_NODELAY`",
@@ -8370,6 +8733,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "5d4920f630417ceeee1c79304faac6803795cd64\r\n\r\nI don't really have any better suggestion for this but the term \"node\" is now a higher-level ConnMan context, for HTTP and StratumV2 I'd probably refer to them as \"client\".",
@@ -8423,6 +8787,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc\r\n\r\nReminding myself to check for a test that covers a child class with i2p true but no Event listener",
@@ -8476,6 +8841,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Ok I see NODELAY set  by ConnMan in EventNewConnectionAccepted in b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc\r\n\r\nI'm guessing we dont use KEEPALIVE for bitcoin p2p because we have out own ping/pong protocol",
@@ -8529,6 +8895,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc\r\n\r\nSeems weird to me to move the unique pointer to a connected socket out of sockman, implying that sockman itself doesn't own the connections. Peeking ahead at future commits though I think this gets resolved.",
@@ -8582,6 +8949,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "b96beb27d2b3d06a45644c537c114a08f0ccd285\r\n\r\nLove this, great optimization and makes a lot of sense.",
@@ -8635,6 +9003,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "b96beb27d2b3d06a45644c537c114a08f0ccd285\r\n\r\nWhy not use `GetNewNodeId()` here? (and below) Don't you have a Connman with its own `m_next_node_id`?",
@@ -8688,6 +9057,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "bb5b91d430026c4826a2107c8c1a311518cc97ce\r\n\r\nnit s/temporary/temporarily\r\n\r\nand above",
@@ -8741,6 +9111,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "50cb52470ea6cc4de5a5e5260b8f308353942ec0\r\n\r\nThis is great, can be used for timed actions (like locking the wallet) we used to depend on libevent for",
@@ -8794,6 +9165,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "50cb52470ea6cc4de5a5e5260b8f308353942ec0\r\n\r\nInteresting that the parent class handles accepting connections but the child is expected to handle disconnections, and inside the utility event loop function. Of course only the derived class would know when disconnection is appropriate, I wonder if anything it makes sense just to add a comment in `sockman.h` that `EventIOLoopCompletedForAllPeers()` is expected to handle that, erasing items from `m_nodes`",
@@ -8847,6 +9219,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "3bb0145514978092ae966e30693cf619e4034837\r\n\r\nthe `else {error}` looked backwards to me here at first, might be more clear to use `== 0` instead of `!` but i dunno what the official style is for this.",
@@ -8900,6 +9273,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "3bb0145514978092ae966e30693cf619e4034837\r\n\r\nWould this make more sense as a direct method of `Sock` ? Especially now that it returns the simpler `CService` instead of `CAddress`",
@@ -8953,6 +9327,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "3bb0145514978092ae966e30693cf619e4034837\r\n\r\nThis is great. Won't be needed immediately for HTTP or StratumV2 but means we can more easily remove libevent from `bitcoin-cli` !",
@@ -9006,6 +9381,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Moved to `NewSockAccepted()` in 9d1b352a4d050ec88b59cdf59209c0f086fea4e6",
@@ -9059,6 +9435,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "resolved in b94f9d338fd0d3b47a4ea6165ce9cde48f3b19bc",
@@ -9112,6 +9489,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "c133a634d10e172652ebbf05ca114037c8e551b9\r\n\r\nI know this is for testing only, but what happens if there is a NodeId collision (An existing node is inserted with a duplicate ID, replacing a connected node in sockman)?",
@@ -9165,6 +9543,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "c133a634d10e172652ebbf05ca114037c8e551b9\r\n\r\nYou might want to add another comment here - when I was trying to handle socks myself I found this a bit weird and wrote:\r\n\r\n```\r\n    // WaitMany() mine as well be a static function, the context\r\n    // of the first Sock in the vector is not relevant.\r\n```",
@@ -9218,6 +9597,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`CNode::addr` needs to be `CAddress` because at least `PeerManagerImpl::PushNodeVersion()` is using `addr.nServices`.\r\n\r\n`CNode::addrBind` indeed does not need to be `CAddress`. I changed it to `CService`.",
@@ -9271,6 +9651,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "\"Peer\" is a good description for this, but that is already used in `net_processing`.",
@@ -9324,6 +9705,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`GetNewNodeId()` is private. Not worth weakening the encapsulation for this test.",
@@ -9377,6 +9759,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done",
@@ -9430,6 +9813,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Good observation. I guess this is the nature of things: accepting new connections is driven (initiated) by low level socket event when a new connection arrives, while disconnecting can be low level driven or high level driven - e.g. misbehaving peer at the application layer.\r\n\r\nI extended the comment of `EventIOLoopCompletedForAllPeers()` a little bit:\r\n\r\n```diff\r\n    -+     * Can be used to execute periodic tasks for all nodes.                   \r\n    ++     * Can be used to execute periodic tasks for all nodes, like disconnecting\r\n    ++     * nodes due to higher level logic.           \r\n```",
@@ -9483,6 +9867,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I don't think we have an official recommendation. My personal preference is to not treat integers as booleans: use `if (x == 0)` instead of `if (!x)` when `x` is an integer. But I am leaving this as it is because it is like that in `master` and this PR only moves it from `net.cpp` to `sockman.cpp` verbatim. I hope it is easier to reviewers to just check that a blob of code is moved without having to validate its correctness since that same code is already in `master`. This helps with such moves:\r\n\r\n`~/.gitconfig`:\r\n```\r\n[diff]  \r\n        colorMoved = dimmed-zebra\r\n        colorMovedWS = allow-indentation-change\r\n```",
@@ -9536,6 +9921,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Maybe yes, but `sock.{h,cpp}` does not currently include `netaddress.h` and I guess including it may cause circular dependency. It would also increase the scope of this PR. I am leaving it as it is.",
@@ -9589,6 +9975,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "It would be a mess. I added an assert to make it clear that a test which inserts duplicate ids is broken.",
@@ -9642,6 +10029,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done",
@@ -9695,6 +10083,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Why not use std::span? I thought `Span` was only a temporary fill-in until C++20 something something? Also, I'm using std::span elsewhere... is `Span` the preference?",
@@ -9748,6 +10137,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Even in relatively new code folks often use `Span`, e.g. #30043. cc @sipa, @laanwj",
@@ -9801,6 +10191,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Must have been just inertia. The caller of the newly added `SendBytes()` has an argument that is already `Span` from elsewhere in the code, coming from here:\r\n\r\nhttps://github.com/bitcoin/bitcoin/blob/c1252b14d714448295200a595086dd3e78b46c8f/src/net.h#L307-L311\r\n\r\nNow I changed the argument of the newly added `SendBytes()` to `std::span`, looks better and the `Span` variable is accepted. Thanks!\r\n\r\nwen `s/Span/std::span/` all over the place?",
@@ -9854,6 +10245,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "> wen `s/Span/std::span/` all over the place?\r\n\r\nnow: https://github.com/bitcoin/bitcoin/pull/31519",
@@ -9907,6 +10299,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "4c23aacc2b82083f96255963f543dc35fff28334: I'm inclined to say \"listening **on** %s\"\r\n\r\nAs in: we bind _to_ a port in order to listen _on_ it.\r\n\r\nThe linux manual for `listen` also uses \"on\", as in \"listen for connections on a socket\"\r\nhttps://man7.org/linux/man-pages/man2/listen.2.html",
@@ -9960,6 +10353,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "4c23aacc2b82083f96255963f543dc35fff28334: since you need to print log statements here in a few places anyway, might as well drop the `errmsg` argument and always print logs here.",
@@ -10013,6 +10407,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`BindAndStartListening()` needs to return an error string to the caller, because the caller not only logs it but also passes it to `ThreadSafeMessageBox()`.",
@@ -10066,6 +10461,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done, `s/at/on/`",
@@ -10119,6 +10515,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Ah ok, I missed that bit.",
@@ -10172,6 +10569,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "fd81820214e695ba228a954506397c3d781fe3fe: do want to add an `Assume` here, given that `Bind` always adds an entry?",
@@ -10225,6 +10623,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "0241b04cf406d482abfac3fddfad9a9c28725f32: previously this would not get called if `addr.SetSockAddr` failed in `AcceptConnection`. I suspect it doesn't matter though.",
@@ -10278,6 +10677,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "1b05e1d4ba55a42ba74026b68fa4e616b973e06d: maybe `ConnectionId`?\r\n\r\nAnd then in net.h use `typedef ConnectionId NodeId;`\r\n\r\nhttps://github.com/Sjors/bitcoin/commit/f33049b45b7013022ed4c75c0bc52d878fe15fd5\r\n\r\nMost of the churn would be in `sockman.{h,cpp}`, so that seems acceptable.\r\n\r\nThat said, I don't think it's very important.",
@@ -10331,6 +10731,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "14fcef6b0d1d1fa9395f9af2bafbf3de63d14ac2: I find this confusing.\r\n\r\nI think the problem starts with the strange naming of `ThreadI2PAccept`, instead of `ThreadI2PHandler` akin to `ThreadSocketHandler`.\r\n\r\nAnyway, what that thread seems to do is, in a loop, try to `Listen` on the socket and once listening, `Accept(` new connections.\r\n\r\nWhenever listening fails or succeeds it calls `EventI2PListen` which then calls `AddLocal` / `RemoveLocal` to keep the announced public addresses up to date.\r\n\r\nWith that in mind, I would call this new method `EventI2PConnectivity` and rename `success` to either `connected` or `listening`. Then the rest makes sense.",
@@ -10384,6 +10785,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "21c5e05619c8a6eb736bb1c61725f4b5f669ffb4: maybe use `[_, node]` in places where you don't need the `id`.\r\n\r\nIt's a bit unfortunate that you can't (?) directly loop over all `T` in `std::unordered_map<Key, T>`. Since most of the time we don't need `Key` (`id`) here.",
@@ -10437,6 +10839,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "dc6393cb93c4851a363b69fd474656cac1ae3b3b: `EventReadyToSend` doesn't exist yet in this commit, so maybe the commit message can announce it.",
@@ -10490,6 +10893,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "dc6393cb93c4851a363b69fd474656cac1ae3b3b: it would be good to annotate in `CConnman::SocketHandlerConnected` above `sendSet = it->second.occurred & Sock::SEND;` that `Sock::SEND` is unset when `ShouldTryToRecv` is `false`.",
@@ -10543,6 +10947,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Does this hard-coded thread name cause any issues if sockman is used more than once?",
@@ -10596,6 +11001,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I might be misunderstanding `cancel_recv`, in my HTTP server I set it to `true` when I'm planning on disconnecting a node like if there was an error sending data or if `\"Connection: close\"` is set. However this causes weird behavior where new connections get hung up forever. In particular, `interface_rpc.py` stalls on the ultimate node shutdown and eventually times out after 120 seconds of rpc `stop` not working. When I set `cancel_recv=false` everywhere, i don't have this issue. (Still a lot of other issues to clean up in this branch!)\r\n\r\nhttps://github.com/pinheadmz/bitcoin/commit/df1965a4e97ce7f3df067df9b3dcc2bbd8e6e15b",
@@ -10649,6 +11055,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Right, currently `Bind()` always adds an entry, but I do not want to impose that because the code here does not require it. It is fine if there is nothing in `m_listen_permissions`. Then the permissions will remain at `NetPermissionFlags::None`. So it is kind of optional for `Bind()` to add an entry to `m_listen_permissions` and no reason to enforce it.",
@@ -10702,6 +11109,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes, good observation! Indeed the flip will do nothing on the invalid `0.0.0.0` `addr_accepted`.\r\n\r\nThe code in `master` is also a bit odd that it continues if `addr.SetSockAddr()` fails in `CConnman::AcceptConnection()` and it will pass the default constructed, invalid `0.0.0.0` address to `CreateNodeFromAcceptedSocket()`. I didn't change that in this PR as it would be a functional change that is not needed for this PR.",
@@ -10755,6 +11163,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`ThreadI2PAccept` vs `ThreadI2PHandler`. The thing is that this thread is only accepting connections. It does not do anything about I2P connections that are already established. `ThreadSocketHandler` does both accepting new connections and doing send/recv on existent connections.\r\n\r\nYes, your observation is correct. Listening can fail temporary, e.g. if the I2P router daemon is restarted. This is unlike the TCP listening where once `bind()` and `listen()` succeed, then we are listening until we decide to close the socket. Tor is like I2P - it can fail to listen for a while if the Tor daemon is restarted. Our Tor code has the deficiency that it does not handle that, so it would act as if we are listening (e.g. advertising our Tor address) even if we are not listening.\r\n\r\nCurrent `EventI2PListen` vs `EventI2PConnectivity` - I think \"Connectivity\" would be too broad because this method is only called in the event where we start or stop listening for incoming I2P connections. It is not related to whether we have existent I2P connections or to our ability to make new outgoing I2P connections which \"Connectivity\" would imply.",
@@ -10808,6 +11217,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Maybe `EventI2PReady` or `EventI2PStatus`? Something to distinguish it from listen.",
@@ -10861,6 +11271,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Changed to `[_, node]`, thanks! :)",
@@ -10914,6 +11325,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Right! Adjusted the comments.",
@@ -10967,6 +11379,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Hmm, you probably mean `ShouldTryToSend` is `false`, right? And then the same applies to receiving. Amended this:\r\n\r\n```diff\r\n-                recvSet = it->second.occurred & Sock::RECV;\r\n-                sendSet = it->second.occurred & Sock::SEND;\r\n+                recvSet = it->second.occurred & Sock::RECV; // Sock::RECV could only be set if ShouldTryToRecv() has returned true in GenerateWaitSockets().\r\n+                sendSet = it->second.occurred & Sock::SEND; // Sock::SEND could only be set if ShouldTryToSend() has returned true in GenerateWaitSockets().\r\n```",
@@ -11020,6 +11433,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes, it would mess up the logging. I put both `\"net\"` and `\"i2paccept\"` in `SockMan::Options`, so that they are not hardcoded here anymore and can be set by the callers of `SockMan`.",
@@ -11073,6 +11487,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "> `@param[out] cancel_recv Should always be set upon return`\r\n\r\nI think the problem was that `HTTPServer::EventReadyToSend()` could end up not setting `cancel_recv` in which case it remains uninitialized, containing a \"random\" value from the stack at the caller (which was probably `true`, so it canceled all receives from the client, never receiving anything causing an infinite loop):\r\n\r\n```cpp\r\n              bool cancel_recv;\r\n  \r\n              EventReadyToSend(node_id, cancel_recv);\r\n  \r\n              if (cancel_recv) {\r\n                  recv_ready = false;\r\n              }\r\n```\r\n\r\nValgrind or memory sanitizer should complain about this code reading uninitialized value in `if (cancel_recv)`.\r\n\r\nThe below fixes it, remove the last commit from your branch and move the setting of `cancel_recv` from the bottom to the top of the method. So that `cancel_recv` is set in all code paths inside `HTTPServer::EventReadyToSend()`.\r\n\r\n```diff\r\n--- i/src/httpserver.cpp\r\n+++ w/src/httpserver.cpp\r\n@@ -1123,12 +1123,15 @@ bool HTTPServer::EventNewConnectionAccepted(NodeId node_id,\r\n     m_connected_clients.emplace(client->m_node_id, std::move(client));\r\n     return true;\r\n }\r\n \r\n void HTTPServer::EventReadyToSend(NodeId node_id, bool& cancel_recv)\r\n {\r\n+    // Next attempt to receive data from this node is permitted\r\n+    cancel_recv = false;\r\n+\r\n     // Get the HTTPClient\r\n     auto client{WITH_LOCK(m_clients_mutex, return GetClientById(node_id);)};\r\n     if (client == nullptr) {\r\n         return;\r\n     }\r\n \r\n@@ -1149,26 +1152,26 @@ void HTTPServer::EventReadyToSend(NodeId node_id, bool& cancel_recv)\r\n             LogDebug(\r\n                 BCLog::HTTP,\r\n                 \"Error sending HTTP response headers to client %s (id=%lld): %s\\n\",\r\n                 client->m_origin,\r\n                 client->m_node_id,\r\n                 err);\r\n-            cancel_recv = false;\r\n+            cancel_recv = true;\r\n             client->m_disconnect = true;\r\n             return;\r\n         }\r\n \r\n         ssize_t body_bytes_sent = SendBytes(node_id, MakeUCharSpan(res.m_body), /*will_send_more=*/true, err);\r\n         if (body_bytes_sent < 0) {\r\n             LogDebug(\r\n                 BCLog::HTTP,\r\n                 \"Error sending HTTP response body to client %s (id=%lld): %s\\n\",\r\n                 client->m_origin,\r\n                 client->m_node_id,\r\n                 err);\r\n-            cancel_recv = false;\r\n+            cancel_recv = true;\r\n             client->m_disconnect = true;\r\n             return;\r\n         }\r\n \r\n         LogDebug(\r\n             BCLog::HTTP,\r\n@@ -1176,20 +1179,17 @@ void HTTPServer::EventReadyToSend(NodeId node_id, bool& cancel_recv)\r\n             hdr_bytes_sent + body_bytes_sent,\r\n             client->m_origin,\r\n             client->m_node_id);\r\n \r\n         // Our work is done here\r\n         if (!res.m_keep_alive) {\r\n-            cancel_recv = false;\r\n+            cancel_recv = true;\r\n             client->m_disconnect = true;\r\n             return;\r\n         }\r\n     }\r\n-\r\n-    // Next attempt to receive data from this node is permitted\r\n-    cancel_recv = false;\r\n }\r\n \r\n void HTTPServer::EventGotData(NodeId node_id, const uint8_t* data, size_t n)\r\n {\r\n     // Get the HTTPClient\r\n     auto client{WITH_LOCK(m_clients_mutex, return GetClientById(node_id);)};\r\n```",
@@ -11126,6 +11541,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "awesome thank you",
@@ -11179,6 +11595,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`strError` only appears in the comment, and \"error message\" should probably be snake_case:\r\n```suggestion\r\n     * @param[out] err_msg Error string if an error occurs.\r\n     * @retval true Success.\r\n     * @retval false Failure, `err_msg` will be set.\r\n     */\r\n    bool BindAndStartListening(const CService& to, bilingual_str& err_msg);\r\n```",
@@ -11232,6 +11649,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Do we ever want to remove individual entries from `m_listen_permissions` upon disconnect of single peers, long before `.clear()`?\r\n\r\nSame goes for `m_listen`. I'm not claiming `vhListenSocket` was any better before this PR.",
@@ -11285,6 +11703,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Seems like `.emplace()` will [not replace existing entries](https://en.cppreference.com/w/cpp/container/unordered_map/emplace). In the off chance that someone takes a peer offline and then restarts it with other permissions, would it not be better to do this?\r\n```suggestion\r\n    m_listen_permissions[addr] = permissions;\r\n```",
@@ -11338,6 +11757,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In fd81820214e695ba228a954506397c3d781fe3fe:\r\nnit: Possible less mutating simplification (assumes `NetPermissionFlags::None == 0`):\r\n```diff\r\n-     NetPermissionFlags permission_flags = NetPermissionFlags::None;\r\n-     auto it{m_listen_permissions.find(addr_bind)};\r\n-     if (it != m_listen_permissions.end()) {\r\n-         NetPermissions::AddFlag(permission_flags, it->second);\r\n-     }\r\n+     auto it{m_listen_permissions.find(addr_bind)};\r\n+     NetPermissionFlags permission_flags = it != m_listen_permissions.end() ?\r\n+         it->second : NetPermissionFlags::None;\r\n```",
@@ -11391,6 +11811,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: The comment adds no information.\r\n```suggestion\r\n    std::vector<std::shared_ptr<Sock>> m_listen;\r\n```\r\nSame for `m_unused_i2p_sessions_mutex`.",
@@ -11444,6 +11865,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Might have a more precise name since we are releasing references to `shared_ptr`s?\r\n```suggestion\r\nvoid SockMan::ReleaseSockets()\r\n```",
@@ -11497,6 +11919,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Sufficiently critical for a generic error?\r\n```suggestion\r\n        LogError(\"%s\", strError.original);\r\n```\r\n(Can also omit trailing newline here and in other added/modified log lines).",
@@ -11550,6 +11973,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Problem: \" (<CLIENT_NAME> already running?)\"-`string` is untranslated.\r\n\r\nWould suggest bringing back old strings to reduce translation churn, or ensuring the new version is fully translated. Old strings:\r\n```suggestion\r\n        if (err == WSAEADDRINUSE) {\r\n            err_msg = strprintf(_(\"Unable to bind to %s on this computer. %s is probably already running.\"), to.ToStringAddrPort(), CLIENT_NAME);\r\n        } else {\r\n            err_msg = strprintf(_(\"Unable to bind to %s on this computer (bind returned error %s)\"), to.ToStringAddrPort(), NetworkErrorString(nErr));\r\n        }\r\n```",
@@ -11603,6 +12027,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Curious why you changed these to be categorized (used to be `LogPrintf()` without category) - worth noting in commit message?\r\n```suggestion\r\n        LogInfo(\"Cannot set SO_REUSEADDR on %s listen socket: %s, continuing anyway\",\r\n                to.ToStringAddrPort(),\r\n                NetworkErrorString(WSAGetLastError()));\r\n```",
@@ -11656,6 +12081,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: listen to -> listen on?\r\n```suggestion\r\n        errmsg = strprintf(_(\"Cannot listen on %s: %s\"), to.ToStringAddrPort(), NetworkErrorString(WSAGetLastError()));\r\n```",
@@ -11709,6 +12135,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Leftover `struct` for instance and C-style casts post-modernization. Also in `BindAndStartListening`.\r\n\r\n```suggestion\r\n    sockaddr_storage sockaddr_bind;\r\n    socklen_t sockaddr_bind_len = sizeof(sockaddr_bind);\r\n    if (!sock.GetSockName(reinterpret_cast<sockaddr*>(&sockaddr_bind), &sockaddr_bind_len)) {\r\n        addr_bind.SetSockAddr(reinterpret_cast<const sockaddr*>(&sockaddr_bind));\r\n```",
@@ -11762,6 +12189,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Since it's only inherited privately, destructor could be non-`virtual` and `protected` unless we want to destroy by `SockMan`-reference?\r\n\r\nHappy to see you made the virtual methods only called by `SockMan` private. :)",
@@ -11815,6 +12243,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Could replace `return` with `else if` below?",
@@ -11868,6 +12297,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: One plural word is enough?\r\n```suggestion\r\n     * Start the necessary threads for socket IO.\r\n     */\r\n    void StartSocketThreads(const Options& options);\r\n\r\n    /**\r\n     * Join (wait for) the threads started by `StartSocketThreads()` to exit.\r\n     */\r\n    void JoinSocketThreads();\r\n```",
@@ -11921,6 +12351,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Could go with something closer to original?\r\n```C++\r\n    if (auto it{m_nodes.find(id)}; it != m_nodes.end()) {\r\n        auto node{it->second};\r\n        LogDebug(BCLog::NET, \"disconnect by id peer=%d; disconnecting\\n\", id);\r\n        node->fDisconnect = true;\r\n        return true;\r\n    } else {\r\n        return false;\r\n    }\r\n```\r\nSame pattern of `auto it{m_nodes.find(` appearing on it's own line when it could be hoisted into the `if` to reduce scope is repeated elsewhere too.",
@@ -11974,6 +12405,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Seems like a slight behavior change warranting it's own commit or at least a mention in the commit message doing the change?",
@@ -12027,6 +12459,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit:\r\n```suggestion\r\n    for (const auto& [_, node] : connman->TestNodes()) {\r\n```",
@@ -12080,6 +12513,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Why are we now setting the `node_id` so deterministically?",
@@ -12133,6 +12567,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Might want to assert in case a test assigns ids randomly and the birthday paradox occurs on annoyingly rare test-runs.\r\n```suggestion\r\n        auto [_, success] = m_nodes.emplace(node.GetId(), &node);\r\n        Assert(success);\r\n```",
@@ -12186,6 +12621,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "7aca044a932e163445f2fccec7739aa7768cf36e: Why assert this at the beginning of the thread, is it to help linters/sanitizers?",
@@ -12239,6 +12675,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "An issue here is that we return a `CNode*`, unlock `m_nodes_mutex`, then another thread comes along and deletes the node - leaving the caller with a dangling pointer.\r\n\r\nMaybe there are implementation details that make that impossible right now, but it would feel safer to instead have this function require the caller locks `m_nodes_mutex`, or do an `AddRef()` internally and require caller to do `Release()`. (Switching to `shared_ptr` instead of custom ref-counting might be more straight forward but maybe too disruptive).",
@@ -12292,6 +12729,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Could use `span`,  and maybe even `byte`?\r\n```suggestion\r\n    virtual void EventGotData(NodeId node_id, const std::span<std::byte> data) = 0;\r\n```",
@@ -12345,6 +12783,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "248ec2d2687fae47b63688e00b9ef18d4c0c9676 nit: when I run the linter (along with all other tests) on this commit it complains about trailing whitespace.\r\n\r\n```diff\r\ndiff --git a/src/net.cpp b/src/net.cpp\r\nindex 8d0dd84d91..0228ddce57 100644\r\n--- a/src/net.cpp\r\n+++ b/src/net.cpp\r\n@@ -2068,7 +2068,7 @@ void CConnman::EventIOLoopCompletedForAllPeers()\r\n     DisconnectNodes();\r\n     NotifyNumConnectionsChanged();\r\n }\r\n- \r\n+\r\n Sock::EventsPerSock CConnman::GenerateWaitSockets(Span<CNode* const> nodes)\r\n {\r\n     AssertLockNotHeld(m_nodes_mutex);\r\ndiff --git a/src/net.h b/src/net.h\r\nindex 8778bcb88a..6c2c202fbb 100644\r\n--- a/src/net.h\r\n+++ b/src/net.h\r\n@@ -1317,7 +1317,7 @@ private:\r\n \r\n     virtual void EventIOLoopCompletedForAllPeers() override\r\n         EXCLUSIVE_LOCKS_REQUIRED(!m_nodes_mutex, !m_reconnections_mutex);\r\n- \r\n+\r\n     /**\r\n      * Generate a collection of sockets to check for IO readiness.\r\n      * @param[in] nodes Select from these nodes' sockets.\r\n```",
@@ -12398,6 +12837,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit:\r\n```suggestion\r\n    if (auto addr_to{std::get_if<CService>(&to)}) {\r\n```",
@@ -12451,6 +12891,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "f7dd4373b06daf34033fa84fa99408a3938e4ad4: would it make sense to call `MarkAsDisconnectAndCloseConnection` in the connman fuzzer?",
@@ -12504,6 +12945,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In commit 0be688360318511ecebcfc9cbabacfa6960fa5ef:\r\nThe new code has the `ThreadI2PAccept()` -> `NewSockAccepted()` -> `EventNewConnectionAccepted()` which now contains:\r\n```\r\n    const CService addr_bind{MaybeFlipIPv6toCJDNS(addr_bind_)};\r\n    const CService addr{MaybeFlipIPv6toCJDNS(addr_)};\r\n```\r\nIs it okay to combine I2P with CJDNS, is this a bugfix?",
@@ -12557,6 +12999,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "f7dd4373b06daf34033fa84fa99408a3938e4ad4: why plural and not `NodeSocket`?\r\n\r\nDoes the I2P session `sess` also contain a socket? Or does it use `s`?",
@@ -12610,6 +13053,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "f7dd4373b06daf34033fa84fa99408a3938e4ad4: it would be useful to document these two values.",
@@ -12663,6 +13107,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "f7dd4373b06daf34033fa84fa99408a3938e4ad4: maybe add a comment here that both `-1` and `0` still warrant (require?) reaching `EventIOLoopCompletedForNode`, so we can't just have individual `if ... continue` guards for them. ",
@@ -12716,6 +13161,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Forgot to remove `CNode::m_sock_mutex`.",
@@ -12769,6 +13215,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Much whitespace\r\n```suggestion\r\n        std::string errmsg;\r\n        const ssize_t sent{SendBytes(node.GetId(), data, more, errmsg)};\r\n        if (sent > 0) {\r\n```",
@@ -12822,6 +13269,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "nit: Don't you want to rename these arguments to the new interface names from `SockMan` and *net.h*?",
@@ -12875,6 +13323,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Before looking at this PR, I was playing around with the idea of changing the raw access of `CNode::fDisconnect` everywhere into two functions, `QueueDisconnect` and `DisconnectNow`. One would just set the flag and the other would also release the socket reference. My idea was to have both of them require a `reason`-argument and an optional `BCLog::Level`-argument. They would log internally if `fDisconnect` was not already set, instead of having every call site log. `MarkAsDisconnectAndCloseConnection`, seems like an opportunity to do such a thing.\r\n\r\n[WIP disconnecting++ branch](https://github.com/bitcoin/bitcoin/compare/master...hodlinator:bitcoin:2025/01/disconnecting++)\r\n\r\nTotally fine with considering it out of scope for this PR.\r\n```suggestion\r\n                MarkAsDisconnectAndCloseConnection(node, \"socket send error: %s\", err_msg);\r\n```\r\n",
@@ -12928,6 +13377,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Worth double-checking in case it doesn't hold for all third-party `recv()`-implementations?\r\n```suggestion\r\n            default:\r\n                Assert(nrecv > 0); // Should have caught all negative values above.\r\n                EventGotData(node_id, buf, nrecv);\r\n                break;\r\n```",
@@ -12981,6 +13431,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "It's easier to read in doxygen html, and can always be expanded.",
@@ -13034,6 +13485,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "IIUC the difference between release and close is only relevant in edge cases. The main purpose of this function it to close them. I would keep the name, but maybe document the function to point out the edge case.",
@@ -13087,6 +13539,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "According to developer notes, `LogError` is for:\r\n\r\n> severe problems that require the node (or a subsystem) to shut down\r\n  entirely\r\n\r\nAnd IIUC we indeed shut down here.\r\n",
@@ -13140,6 +13593,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`MaybeFlipIPv6toCJDNS` only does something if `addr_(bind_)` `IsIPv6()`, which checks `m_net == NET_IPV6`. \r\n\r\nThis is the default for a `CNetAddr`, however deeply buried in `ThreadI2PAccept` - > `i2p::sam::Session::Accept` -> `DestB64ToAddr` -> `DestBinToAddr` -> `CNetAddr::SetSpecial` -> `SetI2P`  do we find `m_net = NET_I2P`. So the flip won't interfere with an I2P connection (in the case its prefix coincidentally matches the IPv6 CJDNS prefix).\r\n\r\nBut maybe you should add a `Assume(IsI2P(conn.peer))`;\r\n\r\n(in 0be688360318511ecebcfc9cbabacfa6960fa5ef \"net: tweak EventNewConnectionAccepted()\")",
@@ -13193,6 +13647,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In 91d97a198fb57d47870ce094454c3776bc737ba0 \"net: split CConnman::ConnectNode()\": why this new `assert`? If you need it all, maybe make it an `Assume`?",
@@ -13246,6 +13701,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In 91d97a198fb57d47870ce094454c3776bc737ba0 \"net: split CConnman::ConnectNode()\": looking at the body of `ConnectAndMakeNodeId` the code paths with and without proxy are vastly different. They also have separate call sites.\r\n\r\nSo instead of using an `std::variant`, it seems more clear to just have both `ConnectAndMakeNodeId` and `ProxyConnectAndMakeNodeId`.",
@@ -13299,6 +13755,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Changed. This is now `SockMan::Id` and in `net.h`: `using NodeId = SockMan::Id;`. In SockMan comments change the word \"node\" to \"connection\". This caused a lot of mechanical renames within this PR, but it looks better now, thanks!\r\n\r\n`SockMan::GetNewNodeId()` renamed to\r\n`SockMan::GetNewId()`\r\n\r\n`SockMan::EventIOLoopCompletedForNode()` renamed to\r\n`SockMan::EventIOLoopCompletedForOne()`\r\n\r\n`SockMan::EventIOLoopCompletedForAllPeers()` renamed to\r\n`SockMan::EventIOLoopCompletedForAll()`\r\n\r\n`SockMan::ConnectAndMakeNodeId()` renamed to\r\n`SockMan::ConnectAndMakeId()`.\r\n\r\nWill be in next push.",
@@ -13352,6 +13809,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Changed to `EventI2PStatus()` and instead of `bool` it now takes an enum with (currently) two possible values: `START_LISTENING` and `STOP_LISTENING`. Will be in next push.",
@@ -13405,6 +13863,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Fixed.",
@@ -13458,6 +13917,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes, done.",
@@ -13511,6 +13971,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I think libevent might actually use `45` for the `poll()` loop: \r\n\r\nhttps://github.com/libevent/libevent/blob/112421c8fa4840acd73502f2ab6a674fc025de37/http-internal.h#L17-L20\r\n\r\nWhat's the best way to determine this constant? Sockman-based HTTP certainly gets through the functional test suite a lot faster when this value is reduced (I tried `10` here)",
@@ -13564,6 +14025,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes, the I2P session contains a socket:\r\n\r\nhttps://github.com/bitcoin/bitcoin/blob/d6c229d8bd4a6203a7255c140aa35c59fb20378b/src/i2p.h#L251-L260",
@@ -13617,6 +14079,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -13670,6 +14133,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -13723,6 +14187,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "if `WaitMany()` returns false, we would have already waited the duration of `SELECT_TIMEOUT` -- do we need to `sleep_for()` again?",
@@ -13776,6 +14241,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "For example I tried this. I expected a performance boost but didn't really observe one:\r\n\r\n```cpp\r\n\r\n        auto io_readiness{GenerateWaitSockets()};\r\n        if (io_readiness.events_per_sock.empty()) {\r\n            interruptNet.sleep_for(SELECT_TIMEOUT);\r\n        } else {\r\n            // WaitMany() may as well be a static method, the context of the first Sock in the vector is not relevant.\r\n            io_readiness.events_per_sock.begin()->first->WaitMany(SELECT_TIMEOUT,\r\n                                                                   io_readiness.events_per_sock);\r\n        }\r\n```",
@@ -13829,6 +14295,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -13882,6 +14349,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "No, we do not want to remove entries from `m_listen_permissions` or from `m_listen` when disconnecting a single peer. The entries in those two maps are per listening address. E.g. if we listen on `1.1.1.1:8333` and designate that every peer that connects to that address gets `permissions1` and listen on `2.2.2.2:8333` and peers that connect to that address get `permissions2`. This stays unchanged as peers connect and disconnect. We would want to remove entries from those maps if we stop listening - i.e. if we close the listening socket. This is only done at shutdown.",
@@ -13935,6 +14403,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`addr` is our listening address. We can't listen on the same address two times:\r\n\r\nIf I put this in my `bitcoind.conf`:\r\n```\r\nbind=127.0.0.1:20001\r\nbind=127.0.0.1:20002\r\nbind=127.0.0.1:20003\r\nbind=127.0.0.1:20003\r\n```\r\n\r\nI get:\r\n\r\n```\r\n2025-02-07T05:39:56Z [net:info] Bound to and listening on 127.0.0.1:20001\r\n2025-02-07T05:39:56Z [net:info] Bound to and listening on 127.0.0.1:20002\r\n2025-02-07T05:39:56Z [net:info] Bound to and listening on 127.0.0.1:20003\r\n2025-02-07T05:39:56Z [net:error] Cannot bind to 127.0.0.1:20003: Address already in use (48) (Bitcoin Core already running?)\r\n```\r\nand startup is aborted.\r\n\r\nI could add `Assume()` or return an error from here if insertion fails due to an already existent entry?",
@@ -13988,6 +14457,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "The proposed snippet is more elegant and performant, I like it. It relies, however, on `None` being `0` and will break in a subtle way if that is changed. I will leave it as it is. This is executed once per newly accepted connection which is not super-often and the performance gain would be negligible.",
@@ -14041,6 +14511,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Agree, will leave it as it is.",
@@ -14094,6 +14565,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "This method was only dealing with listening sockets, so the name `CloseSockets()` with a comment \"Close all sockets\" was confusing. Renamed to `StopListening()`.",
@@ -14147,6 +14619,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Changed to `LogError()` and removed the newline. I did not know the trailing newlines are now unnecessary (since bbbb2e43ee95c9a8866aa1f65e3f001f752dfed2).",
@@ -14200,6 +14673,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -14253,6 +14727,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -14306,6 +14781,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": ":facepalm: makes total sense, I was thinking about the remote sockets.",
@@ -14359,6 +14835,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yeah, sorry, me confusing sockets again. An `Assume()` would be nice though.",
@@ -14412,6 +14889,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -14465,6 +14943,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Removed `struct` from `BindAndStartListening()` in commit `style: modernize the style of SockMan::BindListenPort()`.\r\n\r\n`GetBindAddress()` was just moved verbatim without any mods from `net.cpp` to `sockman.cpp` in another commit. This makes it easier to review with\r\n```\r\n[diff]  \r\n        colorMoved = dimmed-zebra\r\n        colorMovedWS = allow-indentation-change\r\n```\r\nin `~/.gitconfig`. Will leave it as it is. Don't want to bloat this PR further with one more \"style changing\" commit.",
@@ -14518,6 +14997,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "In general, less indentation makes the code more readable, so I prefer to have `return;` and then the subsequent code to be with less indentation.\r\n\r\nAnyway this code was changed and now uses `switch` (see `CConnman::EventI2PStatus()` after I push).",
@@ -14571,6 +15051,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "```\r\nerror: delete called on non-final 'CConnman' that has virtual functions but non-virtual destructor [-Werror,-Wdelete-non-abstract-non-virtual-dtor]\r\n```",
@@ -14624,6 +15105,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "There are multiple sockets and multiple threads. \"socket threads\" looks like there is one socket and multiple threads. Will leave it as it is.",
@@ -14677,6 +15159,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Less indentation makes the code more readable in general. So I prefer:\r\n\r\n```\r\nif (A) {\r\n    return;\r\n}\r\nCODE;\r\n```\r\nover:\r\n```\r\nif (!A) {\r\n    CODE;\r\n} else {\r\n    return;\r\n}\r\n```\r\n\r\nReduced scope is nice, but I find `if (auto it{m_nodes.find(id)}; it != m_nodes.end()) {` hard to read. Sometimes I confuse it for a for-loop: `for (foo; bar; baz) {`. Also in this particular case the function ends right after this, so the scope of `it` is the same.\r\n\r\nWill leave it as it is.",
@@ -14730,6 +15213,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "There should be no change in behavior. Note that the original code in `master` was very subtle - it required that `ForEachNode()` would iterate the nodes in increasing order of `id`:\r\n\r\n```cpp\r\nstd::pair<NodeId, std::chrono::seconds> youngest_peer{-1, 0}, next_youngest_peer{-1, 0};\r\n\r\nm_connman.ForEachNode([&](CNode* pnode) {\r\n    if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect) return;\r\n    if (pnode->GetId() > youngest_peer.first) {\r\n        next_youngest_peer = youngest_peer;\r\n        youngest_peer.first = pnode->GetId();\r\n        youngest_peer.second = pnode->m_last_block_time;\r\n    }\r\n});\r\n```\r\nThe condition `pnode->GetId() > youngest_peer.first` would be `true` every time. Because of that, this code is equivalent to:\r\n\r\n```cpp\r\nstd::pair<NodeId, std::chrono::seconds> youngest_peer{-1, 0}, next_youngest_peer{-1, 0};\r\n\r\nm_connman.ForEachNode([&](CNode* pnode) {\r\n    if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect) return;\r\n    next_youngest_peer = youngest_peer;\r\n    youngest_peer.first = pnode->GetId();\r\n    youngest_peer.second = pnode->m_last_block_time;\r\n});\r\n```\r\n\r\nThe new code will again select the two youngest peers (the two with the bigger `id`s), but does not require that the iterating is in increasing order of `id`:\r\n\r\n```cpp\r\nstd::pair<NodeId, std::chrono::seconds> youngest_peer{-1, 0}, next_youngest_peer{-1, 0};\r\n\r\nm_connman.ForEachNode([&](CNode* pnode) {\r\n    if (!pnode->IsBlockOnlyConn() || pnode->fDisconnect) return;\r\n    if (pnode->GetId() > next_youngest_peer.first) {\r\n        if (pnode->GetId() > youngest_peer.first) {\r\n            next_youngest_peer = youngest_peer;\r\n            youngest_peer.first = pnode->GetId();\r\n            youngest_peer.second = pnode->m_last_block_time;\r\n        } else {  \r\n            next_youngest_peer.first = pnode->GetId();\r\n            next_youngest_peer.second = pnode->m_last_block_time;\r\n        }\r\n    }\r\n});\r\n```",
@@ -14783,6 +15267,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -14836,6 +15321,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "To avoid overlaps. In `master`, without this PR, this test could generate nodes with duplicate `id`s.",
@@ -14889,6 +15375,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -14942,6 +15429,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Ah, and we can't make `CConnman` `final` while we have `struct ConnmanTestMsg : public CConnman`, got it. Should have tested before suggesting.",
@@ -14995,6 +15483,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "It is for every function, not just \"thread\" ones - `doc/developer-notes.md` says:\r\n\r\n>  - Combine annotations in function declarations with run-time asserts in\r\n>    function definitions ...\r\n\r\nThis means:\r\n\r\n```cpp\r\nvoid f() EXCLUSIVE_LOCKS_REQUIRED(!m);\r\n\r\n...\r\n\r\nvoid f()\r\n{\r\n    AssertLockNotHeld(m);\r\n    ...\r\n}\r\n```\r\n\r\nThe reasoning is that the annotation `EXCLUSIVE_LOCKS_REQUIRED` can be ignored. It is nice that the check is done at compile time, but if the compiler is not clang then it will be ignored, or if the compiler is clang but is running without `-Werror`, then it will only result in a compile warning which is likely to be missed in the build output. In other words, it is possible to create a violating code and compile and run it with both gcc and clang. In that case `AssertLockNotHeld()` will stop the program at runtime.",
@@ -15048,6 +15537,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "`SocketsAndThreads` would be clearer, but I think the current name is fine.",
@@ -15101,6 +15591,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "We open/close sockets, we don't start/join them, so I prefer the current name over adding \"And\".",
@@ -15154,6 +15645,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Ah, so it's done as a general rule even if it makes less logical sense for the function at the root of a thread (as nothing can have taken the lock before it unless the thread is wrapped in some kind of utility that is weird enough to take locks).",
@@ -15207,6 +15699,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Ah, that was subtle, thanks for laying it out so clearly.\r\n\r\nMaybe amend the commit message in \"net: index nodes in CConnman by id\" with something like:\r\n> Change `PeerManagerImpl::EvictExtraOutboundPeers` to account for nodes no longer always being in order. The old code would have failed to update `next_youngest_peer` correctly if `CConnman::m_nodes` hadn't always had node ids in ascending order.",
@@ -15260,6 +15753,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Maybe it is worth doing this: https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2485715952. It is a super good change and normally I would do it, but the reason I didn't is that it will increase the size of this PR which, I am afraid, would turn reviewers away.\r\n\r\nI will proceed to other suggestions and give this some thought...",
@@ -15313,6 +15807,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done, but used `uint8_t` because `ReceiveMsgBytes()` (in `master`) takes a span of that and conversion is not possible.",
@@ -15366,6 +15861,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "> conversion is not possible.\r\n\r\nIt should be possible to convert std::byte* to uint8_t* (and vice-versa). The two are the almost the same anyway (https://en.cppreference.com/w/cpp/types/byte). And a span is just a pointer+size, so conversion between the two span types should also be possible.",
@@ -15419,6 +15915,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "That would make `addr_to` a pointer, so `*addr_to` would have to be used in the 6 places below. I slightly prefer the current \"if holds alternative CService\" because it is dump and easy to follow. Leaving it as it is.",
@@ -15472,6 +15969,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yeah, `EventNewConnectionAccepted()` is generic used also for non-I2P connections and the flip will not do anything on I2P addresses.\r\n\r\n> But maybe you should add a Assume(IsI2P(conn.peer));\r\n\r\nIn which function?",
@@ -15525,6 +16023,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Removed!",
@@ -15578,6 +16077,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -15631,6 +16131,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I think in `ThreadI2PAccept()` right before it calls `NewSockAccepted()` ",
@@ -15684,6 +16185,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -15737,6 +16239,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Hmm, is not straight forward. From all callers of `MarkAsDisconnectAndCloseConnection()`:\r\n\r\n* 3 unconditional `LogDebug(BCLog::NET`\r\n* 1 no log\r\n* 2 conditional `LogDebug(BCLog::NET` based on `fDisconnect`\r\n\r\nSo it is not like all the callers do the same thing. Maybe it is ok to consolidate those into one behavior, but would be a functional change that is not the purpose of this PR. Leaving it as it is, but sounds like something to explore as a followup.",
@@ -15790,6 +16293,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Hmm, if we are worried that `recv(2)` will return a value less than `-1`, then we would better treat that as an error instead of terminating the whole program. Changed the `switch` to `if/else`, treating all negative values as an error.",
@@ -15843,6 +16347,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Because later on in `ConnectAndMakeId()` there is logic that will be confused if the default constructed proxy is valid. But it is better to use a `std::optional` to designate \"no proxy\" instead of default-contructed-and-invalid proxy. Then this assert/Assume is not necessary. Changed.",
@@ -15896,6 +16401,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "But there is still some common code that would have to be duplicated:\r\n\r\n```cpp\r\n{\r\n    AssertLockNotHeld(m_connected_mutex);\r\n    AssertLockNotHeld(m_unused_i2p_sessions_mutex);\r\n\r\n    std::unique_ptr<Sock> sock;\r\n    std::unique_ptr<i2p::sam::Session> i2p_transient_session;\r\n\r\n    Assume(!me.IsValid());\r\n\r\n    if (std::holds_alternative<CService>(to)) {\r\n        ...\r\n    } else {\r\n        ...\r\n    }\r\n\r\n    if (!sock) {\r\n        return std::nullopt;\r\n    }\r\n\r\n    if (!me.IsValid()) {\r\n        me = GetBindAddress(*sock);\r\n    }\r\n\r\n    const Id id{GetNewId()};\r\n\r\n    {\r\n        LOCK(m_connected_mutex);\r\n        m_connected.emplace(id, std::make_shared<ConnectionSockets>(std::move(sock),\r\n                                                                    std::move(i2p_transient_session)));\r\n    }\r\n\r\n    return id;\r\n}\r\n```",
@@ -15949,6 +16455,7 @@
         "received_events_url": "https://api.github.com/users/Sjors/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Everything starting at `if (!sock)` could go into a helper function? FinishConnectStuff()",
@@ -16002,6 +16509,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "(Could still make the `SockMan` destructor `protected` and non-`virtual` if the `CConnman` destructor was made `virtual`, but there is little to gain from it).",
@@ -16055,6 +16563,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I just copied this from `master`:\r\n\r\n```cpp\r\nstatic const uint64_t SELECT_TIMEOUT_MILLISECONDS = 50;\r\n```\r\n\r\nI guess some empirical testing... This constant is used in two places: in `WaitMany()` and in the sleep if no sockets at all, maybe those two should be separate constants (btw the same is in `master`).",
@@ -16108,6 +16617,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "> if WaitMany() returns false, we would have already waited\r\n\r\nNo, `false` means an error, e.g. `poll(2)` returning `-1`. A timeout is signaled by a return value of `true` and all `what[].occurred` returned as `0`.",
@@ -16161,6 +16671,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done, will be in next push.",
@@ -16214,6 +16725,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "By default trying to pass `std::span<std::byte>` to a function that takes `std::span<uint8_t>` gives:\r\n\r\n```\r\nno known conversion from 'span<std::byte>' to 'span<uint8_t>'\r\n```\r\n\r\nIf I really insist then I can convert it like:\r\n\r\n```cpp\r\nvoid f(std::span<uint8_t> s);\r\n...\r\nstd::span<std::byte> a;\r\nf(std::span<uint8_t>{reinterpret_cast<uint8_t*>(a.data()), a.size()});\r\n```\r\n\r\nI find it cleaner to use `uint8_t` because it is already used in the existent code (`ReceiveMsgBytes()`) and avoid such forced coversion.",
@@ -16267,6 +16779,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Certainly won't insist, but another possibility is to use `bit_cast` for trivially constructible types:\r\n```c++\r\nvoid f(std::span<uint8_t> s);\r\n...\r\nstd::span<std::byte> a;\r\nf(std::bit_cast<std::span<uint8_t>>(a));\r\n```",
@@ -16320,6 +16833,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "> `bit_cast`\r\n\r\nWhile this will likely work in practise, I don't think there is any inherent guarantee that the layout of span is identical for all underlying types. So my recommendation would be to just use `std::as_bytes` instead.\r\n\r\n(Same for the reinterpret_cast: While it works, it is a bit verbose and `std::as_bytes` is the existing alias in the std lib, which is already used in the code today.)\r\n\r\nObviously, anything is fine. I just left a comment to say it is possible to convert :sweat_smile: ",
@@ -16373,6 +16887,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Will leave it as `uint8_t` because it is already used in `master` in `ReceiveMsgBytes()` to which we have to pass that variable.",
@@ -16426,6 +16941,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "(Might be worth noting that in commit message for the change that fixes the bug, 60f6cbb9b9f83e25217d30c889147ad517960ec7 / \"net: index nodes in CConnman by id\").",
@@ -16479,6 +16995,7 @@
         "received_events_url": "https://api.github.com/users/hodlinator/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Thanks! (PR summary is out of date, but I understand if you don't want to constantly manually update it).",
@@ -16532,6 +17049,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I am considering this, but just realized that the distinction is not \"proxy vs no-proxy\" because in both cases of the `std::variant` we may end up connecting via the proxy. The logic (as convoluted as it is, it is the same in `master`) is:\r\n\r\n* if connecting to `CService`\r\n  * if to an I2P `CService` then proxy must be used\r\n  * otherwise the proxy is optional, if provided it will be used\r\n* if connecting to string host, then proxy must be used\r\n\r\nSo, if `std::variant` is to be avoided and two functions provided instead of one, then they should be called something like `ConnectToCService()` and `ConnectToString()` :-|\r\n\r\nEdit: or a bunch of functions covering each case:\r\n```cpp\r\nConnectToI2P(CService, proxy); // proxy must be used\r\nConnectDirectly(CService); // no proxy\r\nConnectViaProxy(CService, proxy);\r\nConnectViaProxy(string, proxy); // overload\r\n```",
@@ -16585,6 +17103,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Done.",
@@ -16638,6 +17157,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Added `Assume(IsI2P(conn.peer))` and `Assume(IsI2P(conn.me))` in `ThreadI2PAccept()`.",
@@ -16691,6 +17211,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Since `key_type` here is `std::shared_ptr<const Sock>` shouldn't this map also use the optimized hash/equal functions defined in:\r\n\r\nhttps://github.com/bitcoin/bitcoin/blob/86528937e5c4da2e12c46085fc41e87ed759258e/src/util/sock.h#L208 ",
@@ -16744,6 +17265,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes, done!",
@@ -16797,6 +17319,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "After thinking about this a bit more and doing some changes to the code, I decided to:\r\n\r\n1. Open a separate PR to remove the manual ref counting on `CNode` and replace it with `shared_ptr` and change `CConnman::m_nodes` from `vector<CNode*>` to `unordered_set<shared_ptr<CNode>>`. That PR would be independent from this one.\r\n\r\n2. In this PR, change the communication between `SockMan` and `CConman` to be based on pointer to `CNode` instead of node id. Similarly to https://github.com/bitcoin/bitcoin/pull/30988#issuecomment-2485715952. I will start with a raw pointer and the responsibility of destruction will be in `CConnman`, like it is now. If 1. is merged in the mean time before this PR, then I will just change this PR to use `shared_ptr` instead of a raw pointer.",
@@ -16850,6 +17373,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "I may have a situation in HTTP where SendBytes() is being called from a thread other than the Sockman I/O loop, which would be an \"optimistic send\" directly from a worker thread. `CConnman::PushMessage()` has similar logic, but since p2p doesn't use worker threads I don't think it would cause an issue there. I think this assertion may be the only real conflict for that. `m_connected_mutex` is only used in `GetConnectionSockets()` -- would a little lock-waiting there be so terrible?",
@@ -16903,6 +17427,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Hmm, the assertion is that the mutex is **not** held by the caller of `SendBytes()`. The mutex is private in `SockMan` so it cannot be held by the HTTP code when it calls `SendBytes()`, no?",
@@ -16956,6 +17481,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "If SendBytes() is called from outside the loop then the lock could be held by something else inside the loop, including another call to SendBytes (ie from EventReadyToSend)",
@@ -17009,6 +17535,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Oh wait. AssertLockNotHeld only applies to the caller? It doesn't require that the mutex is open on all threads and available to lock?",
@@ -17062,6 +17589,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Right, only to the caller (same thread). Locked or not by other threads is irrelevant for `AssertLockNotHeld()`.",
@@ -17115,6 +17643,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "\r\n    Mutex protecting m_i2p_sam_sessions. -> Mutex protecting m_unused_i2p_sessions. [The mutex m_unused_i2p_sessions_mutex protects m_unused_i2p_sessions, not m_i2p_sam_session.]\r\n",
@@ -17168,6 +17697,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "~Interesting I'm getting `use-of-uninitialized-value` from [MSan](https://cirrus-ci.com/task/6108635308228608?logs=ci#L2378) running SockMan in a unit test. I'm not sure how you are avoiding it on your branch! I will add a default value of `false`~\r\n\r\nEdit: never mind, the MSan error is unrelated to this `cancel_recv`",
@@ -17221,6 +17751,7 @@
         "received_events_url": "https://api.github.com/users/vasild/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Resolved?",
@@ -17274,6 +17805,7 @@
         "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "body": "Yes",
