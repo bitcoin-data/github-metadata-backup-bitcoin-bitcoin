@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2024-10-22T14:40:28Z",
-    "updated_at": "2025-11-06T19:10:26Z",
+    "updated_at": "2025-11-06T20:18:07Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -298,9 +298,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38165,
-        "stargazers_count": 86670,
-        "watchers_count": 86670,
+        "forks_count": 38167,
+        "stargazers_count": 86674,
+        "watchers_count": 86674,
         "size": 295721,
         "default_branch": "master",
         "open_issues_count": 742,
@@ -322,7 +322,7 @@
         "visibility": "public",
         "pushed_at": "2025-11-05T15:04:55Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-11-06T19:09:18Z",
+        "updated_at": "2025-11-06T20:38:11Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -352,7 +352,7 @@
     "deletions": 1,
     "changed_files": 11,
     "commits": 3,
-    "review_comments": 267,
+    "review_comments": 268,
     "comments": 41
   },
   "events": [
@@ -22150,6 +22150,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2500462588"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31132"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 132,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2500696484",
+      "pull_request_review_id": 3430354624,
+      "id": 2500696484,
+      "node_id": "PRRC_kwDOABII586VDZmk",
+      "diff_hunk": "@@ -0,0 +1,174 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_INPUTFETCHER_H\n+#define BITCOIN_INPUTFETCHER_H\n+\n+#include <attributes.h>\n+#include <coins.h>\n+#include <logging.h>\n+#include <tinyformat.h>\n+#include <util/threadnames.h>\n+\n+#include <algorithm>\n+#include <atomic>\n+#include <barrier>\n+#include <cstdint>\n+#include <stdexcept>\n+#include <thread>\n+#include <utility>\n+#include <vector>\n+\n+/**\n+ * Helper for fetching inputs from the CoinsDB and CoinsTip and inserting them\n+ * into the ephemeral cache used in ConnectBlock.\n+ *\n+ * It spawns a fixed set of worker threads that fetch Coins for each input\n+ * in a block. The Coin is moved into the Input struct and then the ready flag\n+ * is atomically updated to true. The main thread waits on the ready flag\n+ * until it is true and then inserts it into the temporary cache.\n+ *\n+ * Worker threads are synchronized with the main thread using a barrier, which\n+ * is used at the beginning of fetching to start the workers and at the end to\n+ * make sure all workers have exited the work loop.\n+ */\n+class InputFetcher\n+{\n+private:\n+    //! The latest input being fetched. Workers atomically increment this when fetching.\n+    std::atomic_size_t m_input_head{0};\n+\n+    //! The inputs of the block which is being fetched.\n+    struct Input {\n+        //! Workers set this after setting the coin. The main thread tests this before reading the coin.\n+        std::atomic_flag ready{};\n+        //! The outpoint to fetch;\n+        const COutPoint& outpoint;\n+        //! The coin that workers will fetch and main thread will insert into cache.\n+        Coin coin{};\n+\n+        Input(Input&& other) noexcept : outpoint{other.outpoint} {} // Only moved in setup for reallocation.\n+        explicit Input(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}\n+    };\n+    std::vector<Input> m_inputs{};\n+\n+    /**\n+     * The set of first 8 bytes of txids of all txs in the block being fetched.\n+     * Used to filter out inputs that are created and spent in the same block,\n+     * since they will not be in the db or the cache.\n+     */\n+    std::vector<uint64_t> m_txids{};\n+\n+    //! DB coins view to fetch from.\n+    const CCoinsView* m_db{nullptr};\n+    //! The cache to fetch from.\n+    const CCoinsViewCache* m_cache{nullptr};\n+\n+    std::vector<std::thread> m_worker_threads{};\n+    std::barrier<> m_barrier;\n+    bool m_request_stop{false};\n+\n+    /**\n+     * Fetches the next input in the queue. Safe to call from any thread once inside the barrier.\n+     * \n+     * @return true if there are more inputs in the queue to fetch\n+     * @return false if there are no more inputs in the queue to fetch\n+     */\n+    bool FetchCoin() noexcept\n+    {\n+        const size_t i{m_input_head.fetch_add(1, std::memory_order_relaxed)};\n+        if (i >= m_inputs.size()) [[unlikely]] return false;\n+        auto& input{m_inputs[i]};\n+        if (std::binary_search(m_txids.begin(), m_txids.end(), input.outpoint.hash.ToUint256().GetUint64(0))) {\n+            input.ready.test_and_set(std::memory_order_relaxed);\n+            input.ready.notify_one();\n+            return true;\n+        }\n+        auto coin{m_cache->GetPossiblySpentCoinFromCache(input.outpoint)};\n+        if (!coin) {\n+            try {\n+                coin = m_db->GetCoin(input.outpoint);\n+            } catch (const std::runtime_error& e) {\n+                LogPrintLevel(BCLog::VALIDATION, BCLog::Level::Warning, \"InputFetcher failed to fetch input: %s.\\n\", e.what());\n+            }\n+        }\n+        if (coin && !coin->IsSpent()) [[likely]] input.coin = std::move(*coin);\n+        // We need release here, so setting coin above happens before the main thread acquires.\n+        input.ready.test_and_set(std::memory_order_release);\n+        input.ready.notify_one();\n+        return true;\n+    }\n+\n+public:\n+    //! Fetch all block inputs from cache or db, and insert into temp_cache.\n+    void FetchInputs(CCoinsViewCache& temp_cache, const CCoinsViewCache& cache, const CCoinsView& db, const CBlock& block) noexcept\n+    {\n+        if (block.vtx.size() <= 1 || m_worker_threads.size() == 0) return;\n+\n+        // Loop through the inputs of the block and set them in the queue.\n+        // Construct the set of txids to filter, and count the outputs to reserve for temp_cache.\n+        m_txids.reserve(block.vtx.size() - 1);\n+        m_inputs.reserve(2 * block.vtx.size()); // rough guess\n+        auto outputs_count{block.vtx[0]->vout.size()};\n+        for (size_t i{1}; i < block.vtx.size(); ++i) {\n+            const auto& tx{block.vtx[i]};\n+            outputs_count += tx->vout.size();\n+            m_txids.emplace_back(tx->GetHash().ToUint256().GetUint64(0));\n+            for (const auto& input : tx->vin) m_inputs.emplace_back(input.prevout);\n+        }\n+        std::sort(m_txids.begin(), m_txids.end());\n+\n+        // Setup shared pointers and start workers.\n+        m_db = &db;\n+        m_cache = &cache;\n+        m_input_head.store(0, std::memory_order_relaxed);\n+        m_barrier.arrive_and_wait();\n+\n+        // Insert fetched coins into the temp_cache as they are set to ready.\n+        temp_cache.Reserve(temp_cache.GetCacheSize() + m_inputs.size() + outputs_count);\n+        for (auto& input : m_inputs) {\n+            while (!input.ready.test(std::memory_order_acquire)) {\n+                // Work too while we wait",
+      "path": "src/inputfetcher.h",
+      "position": 1,
+      "original_position": 132,
+      "commit_id": "63dde36c1dac94c3e5223aee5ba97e5b2475381c",
+      "original_commit_id": "63dde36c1dac94c3e5223aee5ba97e5b2475381c",
+      "in_reply_to_id": 2499446404,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "We discussed this out of band, here's the summary:\r\n* the main thread is special because it has access to the dbcache, it can insert there without locking the cache.\r\n* the threads each have their inputs now, each of which have a switch to signal when they've fetched the input and move on to the next\r\n* the threads each compete for which input to fetch, marking them one-by-one as ready\r\n* the main thread goes in order, spins until the next one is available, if it needs to wait, it does some fetching itself, rechecks later if the given value is available and if so, it inserts to the dbcache, after which it checks the next value in order.\r\n\r\nThis way the IO and CPU bound work is parallelized, so we don't need to do the heavy rehashing at the end, it's done while the other threads are doing IO work - that's why it's faster.\r\n\r\nI have to think about this, it sounds like we can simplify this further, but this is already an improvement over previous solutions.\r\n\r\n---\r\n\r\nAnd given that the worst thing that can happen for an internal spend is that if there's another input with the same prefix in the same block, we wouldn't fetch it here and it would be fetched during block connection like it was done before.\r\nThis means that we likely don't even need 64 bits for that, likely 32 are enough. Back of the napkin calculations indicate that would mean that 1/1000 blocks would contain transactions that won't be fetched by `InputFetcher` and would need to be fetched during block connection instead on a single thread. As long as 32 bit checks are faster than 64 (which should definitely be the case for the sorted-vector case), this should likely result in an overall speedup. We definitely need to add a test case for that.",
+      "created_at": "2025-11-06T20:18:07Z",
+      "updated_at": "2025-11-06T20:18:07Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31132#discussion_r2500696484",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2500696484"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31132"
