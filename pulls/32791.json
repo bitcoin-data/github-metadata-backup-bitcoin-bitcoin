@@ -37,6 +37,7 @@
       "received_events_url": "https://api.github.com/users/HowHsu/received_events",
       "type": "User",
       "site_admin": false,
+      "name": null,
       "patch_url": null
     },
     "body": "    TL;DR\r\n    This patchset proposes a new design of scriptcheck worker pool with\r\n    atomic variables to leverage more cpu resource on a machine which the\r\n    current mutex version cannot. Achieve about 45% boost in performance.\r\n    \r\n    Main Idea:\r\n    \r\n    The current version of worker pool use mutex to do the synchronization\r\n    between worker threads, which makes the performance downgrade after\r\n    worker_threads_num >= 14. One root cause is the high contention on the\r\n    queue's mutex among worker threads. Workers repeatedly sleep and be woken\r\n    up in short time, leading to heavy context switching.\r\n    The idea is to use atomic variables to protect the queue, workers\r\n    acquire it and increase it with a batch_size(a small number). This\r\n    significantly reduces context switching.\r\n    \r\n    Implementation\r\n    \r\n    To implement it, below changes are made:(enabled in atomic mode)\r\n    - atomic<int> nNext is used to indicate the next available indice in the\r\n      queue\r\n    - atomic<int> nTodo2 is used to indicate the number of tasks left\r\n    - nBatchSize is the batch size of tasks everytime a worker consumes\r\n      it should be small to keep workload balance among workers\r\n    - m_mutex is still used, to protect m_result and conditional vars\r\n    - fAtomic to indicate which mode is enabled\r\n    - about the queue:\r\n    \r\n      - the queue is used as queue, not stacks any more\r\n      - the queue is 'add only', which means only adding tasks to it, don't\r\n        remove used tasks.\r\n    \r\n        the above two are a must to make this idea achievable, and the\r\n        second sacrifices space\r\n    \r\n      - start the workers only after all the tasks have been added to the\r\n        queue\r\n    \r\n        this is a trade-off to make the implementaion simple, a worker can\r\n        compare nNext + nBatchSize to queue.size() to find if there are\r\n        tasks undone in the queue, otherwise another atomic<int> tail is\r\n        needed, and race condition may exist in this way (need more\r\n        investigation). From my test, it's not 100% to say this is a\r\n        'trade-off' since it also brings something good, pros && cons:\r\n        - pros:\r\n            1. no contention among producer and consumers when adding tasks\r\n               to the queue\r\n            2. the adding period is very short compared to the verification\r\n               period\r\n        - cons:\r\n            1. the workers start later\r\n    \r\n    For details, please refer to the worker handler code\r\n    \r\n    Tests:\r\n    \r\n    - Numbers\r\n      - For blocks/s numbers\r\n        `./build/bin/bench_bitcoin --filter=ConnectBlockMixedEcdsaSchnor`\r\n      - For cpu usage numbers\r\n        `NANOBENCH_ENDLESS=ConnectBlockAllEcdsa ./build/bin/bench_bitcoin --filter=ConnectBlockAllEcdsa`\r\n    \r\n      - Some data is missing because the machine was billed by time, and there wasn't\r\n        enough time to complete all measurements.\r\n      - Some cells contain a range instead of a single value due to high fluctuations\r\n      - The numbers represent the average of multiple test runs.\r\n    \r\n               |     mutex verion       |   atomic version\r\n    nr_workers | blocks/s  | cpu usage  | blocks/s  | cpu usage2\r\n    -----------|-----------|------------|-----------|-------------\r\n    0          | 4.22      | 100%       | 4.2       | 100%\r\n    1          | 8.23      | 198%       | 8         | 191.3%\r\n    2          | 12.08     | 293.7%     | 11.6      | 276%\r\n    3          | 16        | 386.7%     | 14.9      | 354.5%\r\n    4          | 19.8      | 476.3%     |           |\r\n    5          | 23.12     | 565.4%     |           |\r\n    6          | 27.3      | 654%       | 23        | 560%\r\n    7          | 28.5      | 738%       |           |\r\n    8          | 33.8      | 809%       |           |\r\n    9          | 33.5      | 868%       | 28.5      | 730%\r\n    10         | 37.4      | 910%       | 30.5      | 777%\r\n    11         | 33~40     | 880%~928%  | 32        | 825%\r\n    12         | 22~39     | 860%~925%  | 32.5      | 830%\r\n    13         | 27.8~37   | 700%~913%  | 34.8      | 928%\r\n    15         | 24.8~38.9 | 640%~719%  | 38        | 1000%\r\n    19         | 18~23     | 370%~510%  | 41        | 1161%\r\n    22         | 7~18      | 270%~400%  |           |\r\n    25         | 6.4       | 260%       | 46        | 1400%\r\n    30         | 5         | 270%       | 49        | 1560%\r\n    60         | 5         | 280%       | 50~58     | 2100%\r\n    \r\n    - Env:\r\n     A virtual machine on cloud\r\n       Architecture:          x86_64\r\n       CPU op-mode(s):        32-bit, 64-bit\r\n       Address sizes:         46 bits physical, 48 bits virtual\r\n       Byte Order:            Little Endian\r\n       CPU(s):                64\r\n       On-line CPU(s) list:   0-63\r\n       Vendor ID:             GenuineIntel\r\n       Model name:            Intel Xeon Processor (Cascadelake)\r\n       CPU family:            6\r\n       Model:                 85\r\n       Thread(s) per core:    2\r\n       Core(s) per socket:    16\r\n       Socket(s):             2\r\n       Stepping:              6\r\n       BogoMIPS:              5985.93\r\n     Virtualization features:\r\n       Hypervisor vendor:     KVM\r\n       Virtualization type:   full\r\n     Caches (sum of all):\r\n       L1d:                   2 MiB (64 instances)\r\n       L1i:                   2 MiB (64 instances)\r\n       L2:                    128 MiB (32 instances)\r\n       L3:                    32 MiB (2 instances)\r\n     NUMA:\r\n       NUMA node(s):          2\r\n       NUMA node0 CPU(s):     0-31\r\n       NUMA node1 CPU(s):     32-63\r\n    \r\n    Signed-off-by: Hao Xu <hao.xu@linux.dev>\r\n",
@@ -52,7 +53,7 @@
       }
     ],
     "created_at": "2025-06-21T12:58:58Z",
-    "updated_at": "2025-09-18T11:06:30Z",
+    "updated_at": "2025-12-16T00:31:57Z",
     "mergeable": false,
     "mergeable_state": "dirty",
     "merged": false,
@@ -77,6 +78,7 @@
         "received_events_url": "https://api.github.com/users/Muaytie666/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     ],
@@ -105,6 +107,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -131,6 +134,7 @@
           "received_events_url": "https://api.github.com/users/HowHsu/received_events",
           "type": "User",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -183,7 +187,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 272017,
+        "size": 277991,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -196,7 +200,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-09-18T11:07:32Z",
+        "pushed_at": "2025-12-14T15:12:39Z",
         "created_at": "2019-07-15T09:53:32Z",
         "updated_at": "2025-07-04T10:01:37Z",
         "allow_forking": true,
@@ -240,6 +244,7 @@
         "received_events_url": "https://api.github.com/users/bitcoin/received_events",
         "type": "Organization",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "repo": {
@@ -266,6 +271,7 @@
           "received_events_url": "https://api.github.com/users/bitcoin/received_events",
           "type": "Organization",
           "site_admin": false,
+          "name": null,
           "patch_url": null
         },
         "private": false,
@@ -315,12 +321,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 37809,
-        "stargazers_count": 85556,
-        "watchers_count": 85556,
-        "size": 293683,
+        "forks_count": 38368,
+        "stargazers_count": 87235,
+        "watchers_count": 87235,
+        "size": 300355,
         "default_branch": "master",
-        "open_issues_count": 797,
+        "open_issues_count": 719,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -337,9 +343,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2025-09-18T10:34:48Z",
+        "pushed_at": "2025-12-15T15:43:03Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2025-09-18T11:58:14Z",
+        "updated_at": "2025-12-15T17:27:00Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -370,7 +376,7 @@
     "changed_files": 10,
     "commits": 7,
     "review_comments": 0,
-    "comments": 18
+    "comments": 19
   },
   "events": [
     {
@@ -397,6 +403,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -424,6 +431,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-2993567990",
@@ -453,6 +461,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -487,6 +496,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -514,6 +524,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-2993606610",
@@ -543,6 +554,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "7d2b002255d3adb2f2c6fe2c4dbadc7b704ed18d",
@@ -573,6 +585,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -600,6 +613,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-2994271363",
@@ -629,6 +643,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "15ca0201205114638d75313a03d50d0460958d99",
@@ -659,6 +674,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "2f9fc5dd6af524a3663bcbc09a50b8f01810681b",
@@ -689,6 +705,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "32f41ba0d05114676869404f6c01d43ae990ffa0",
@@ -719,6 +736,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "a6a694a2b0ebda4108c2e9caad8dbd90e9b3ec9b",
@@ -749,6 +767,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "50a5c2cdd417bb330f6d043bbfc7e8801192aa7c",
@@ -779,6 +798,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "299d5b565262c519c45020ebea64cad50a7a228b",
@@ -809,6 +829,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "a22277944028622bb497e03454738e2ddf2d9e2f",
@@ -839,6 +860,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "f6cbadaec06d51f10a9681a5d787b3781e285daa",
@@ -869,6 +891,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "d4d029497d5da69a649879ac5926f9a538d41dab",
@@ -899,6 +922,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "9501cb7a8781bad4d824a484ff0908f4c3e75fc0",
@@ -929,6 +953,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -956,6 +981,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3008895117",
@@ -985,6 +1011,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1012,6 +1039,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3008935991",
@@ -1041,6 +1069,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1068,6 +1097,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3008939307",
@@ -1097,6 +1127,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1124,6 +1155,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3009069508",
@@ -1153,6 +1185,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1180,6 +1213,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3009089895",
@@ -1209,6 +1243,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1236,6 +1271,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3009103057",
@@ -1265,6 +1301,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1289,6 +1326,7 @@
         "received_events_url": "https://api.github.com/users/Muaytie666/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "review_requester": {
@@ -1310,6 +1348,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       }
     },
@@ -1337,6 +1376,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1364,6 +1404,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3009126452",
@@ -1393,6 +1434,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1420,6 +1462,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3009142588",
@@ -1449,6 +1492,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "f26f6435958bf37089fef7e4be744512ef66687c",
@@ -1479,6 +1523,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "5e51e5f7be9b4a64baf47c76f95d5464037b4842",
@@ -1509,6 +1554,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "c731b70eaded707ab9e25f80eccaade03f88b644",
@@ -1539,6 +1585,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -1573,6 +1620,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "d797d11672e1c600fc1b6251c235495583eea9b6",
@@ -1603,6 +1651,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "a56a4fd4a3bd2ad8c1042a389d34b9264cff08d0",
@@ -1633,6 +1682,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "37dd95f0a6e2069ba3404d0f91e56526daf502a2",
@@ -1663,6 +1713,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "389ae2aa9ae6eca27de7f2bf4737ba6a63641b99",
@@ -1973,6 +2024,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": "8ed42044f8a4ae12813c4f18a9a9ee9b0e2cbc69",
@@ -2003,6 +2055,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2030,6 +2083,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3016695705",
@@ -2059,6 +2113,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2093,6 +2148,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2120,6 +2176,7 @@
         "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3019268489",
@@ -2149,6 +2206,7 @@
         "received_events_url": "https://api.github.com/users/instagibbs/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2176,6 +2234,7 @@
         "received_events_url": "https://api.github.com/users/instagibbs/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3084382725",
@@ -2205,6 +2264,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2232,6 +2292,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3084736836",
@@ -2261,6 +2322,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2288,6 +2350,7 @@
         "received_events_url": "https://api.github.com/users/maflcko/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3084744741",
@@ -2317,6 +2380,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2347,6 +2411,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2374,6 +2439,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3084752079",
@@ -2403,6 +2469,7 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "commit_id": null,
@@ -2430,9 +2497,68 @@
         "received_events_url": "https://api.github.com/users/HowHsu/received_events",
         "type": "User",
         "site_admin": false,
+        "name": null,
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3306849241",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/32791"
+    },
+    {
+      "event": "commented",
+      "id": 3658173508,
+      "node_id": "IC_kwDOABII587aC0xE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3658173508",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2025-12-16T00:31:57Z",
+      "updated_at": "2025-12-16T00:31:57Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--13523179cfe9479db18ec6c5d236f789-->\n⌛ There hasn't been much activity lately and the patch still needs rebase. What is the status here?\n\n* Is it still relevant? ➡️ Please solve the conflicts to make it ready for review and to ensure the CI passes.\n* Is it no longer relevant? ➡️ Please close.\n* Did the author lose interest or time to work on this? ➡️ Please close it and mark it with one of the labels 'Up for grabs' or 'Insufficient Review', so that it can be picked up in the future.\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/32791#issuecomment-3658173508",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/32791"
     }
   ],
