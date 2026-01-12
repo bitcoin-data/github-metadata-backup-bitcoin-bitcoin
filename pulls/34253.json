@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "### Context\r\nThis PR is a follow-up to the stale #32885.\r\n\r\n### Problem\r\n`ChainstateManager::IsInitialBlockDownload()` currently acquires `cs_main` internally, even though most existing call sites already hold the lock. This becomes relevant for proposals like #34054, which would call `IsInitialBlockDownload()` from the scheduler thread without holding `cs_main`, potentially introducing lock contention.\r\n\r\n### Fix\r\nMake `ChainstateManager::IsInitialBlockDownload()` lock-free by caching its result in a single atomic `m_cached_is_ibd` (true while in IBD, latched to false on exit).\r\nMove the IBD exit checks out of `IsInitialBlockDownload()` (reader-side) into a new `ChainstateManager::UpdateIBDStatus()` (writer-side, called under cs_main).\r\n\r\nCall UpdateIBDStatus() at strategic points where IBD exit conditions may change, after active chain tip updates in `ConnectTip()`, `DisconnectTip()`, and `LoadChainTip()`, and after `ImportBlocks()` returns.\r\n\r\nWith this, `IsInitialBlockDownload()` becomes a lock-free atomic read, avoiding internal `cs_main` acquisition on hot paths.",
+    "body": "### Context\r\nThis PR is a follow-up to the stale #32885.\r\n\r\n### Problem\r\n`ChainstateManager::IsInitialBlockDownload()` currently acquires `cs_main` internally, even though most existing call sites already hold the lock. This becomes relevant for proposals like #34054, which would call `IsInitialBlockDownload()` from the scheduler thread without holding `cs_main`, potentially introducing lock contention.\r\n\r\n### Fix\r\nMake `ChainstateManager::IsInitialBlockDownload()` lock-free by caching its result in a single atomic `m_cached_is_ibd` (true while in IBD, latched to false on exit).\r\nMove the IBD exit checks out of `IsInitialBlockDownload()` (reader-side) into a new `ChainstateManager::UpdateIBDStatus()` (writer-side, called under cs_main).\r\n\r\nCall UpdateIBDStatus() at strategic points where IBD exit conditions may change, after active chain tip updates in `ConnectTip()`, `DisconnectTip()`, and `LoadChainTip()`, and after `ImportBlocks()` returns.\r\n\r\nWith this, `IsInitialBlockDownload()` becomes a lock-free atomic read, avoiding internal `cs_main` acquisition on hot paths.\r\n\r\n### Testing and Benchmarks\r\nThis isn't strictly an optimization - though some usecases might benefit from it -, so rather as a sanity check I ran a reindex-chainstate and an AssumeUTXO load (without background validation).\r\n\r\n<details>\r\n<summary>assumeutxo load | 910000 blocks | dbcache 4500 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | xfs | SSD</summary>\r\n\r\n```\r\nCOMMITS=\"595504a43209bead162da54a204df7d140a25f0e 63e822b637f67242e3689adedc0155b34100e651\"; \\\r\nCC=gcc; CXX=g++; \\\r\nBASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/ShallowBitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; UTXO_SNAPSHOT_PATH=\"$BASE_DIR/utxo-910000.dat\"; \\\r\n(echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done; echo \"\") && \\\r\nfor DBCACHE in 4500; do \\\r\n  (echo \"assumeutxo load | 910000 blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(df -T $BASE_DIR | awk 'NR==2{print $2}') | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 0 && echo SSD || echo HDD)\";) &&\\\r\n  hyperfine \\\r\n  --sort command \\\r\n  --runs 3 \\\r\n  --export-json \"$BASE_DIR/assumeutxo-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$DBCACHE-$CC-$(date +%s).json\" \\\r\n  --parameter-list COMMIT ${COMMITS// /,} \\\r\n  --prepare \"killall -9 bitcoind 2>/dev/null; rm -rf $DATA_DIR/blocks $DATA_DIR/chainstate $DATA_DIR/chainstate_snapshot $DATA_DIR/debug.log; git clean -fxd; git reset --hard {COMMIT} && \\\r\n             cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo && ninja -C build bitcoind bitcoin-cli -j2 && \\\r\n             ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=1 -printtoconsole=0; sleep 20 && \\\r\n             ./build/bin/bitcoind -datadir=$DATA_DIR -daemon -blocksonly -connect=0 -dbcache=$DBCACHE -printtoconsole=0; sleep 20\" \\\r\n   --conclude \"build/bin/bitcoin-cli -datadir=$DATA_DIR stop || true; killall bitcoind || true; sleep 10; \\\r\n               echo '{COMMIT} | dbcache=$DBCACHE | chainstate: $(find $DATA_DIR/chainstate_snapshot -type f 2>/dev/null | wc -l) files, $(du -sb $DATA_DIR/chainstate_snapshot 2>/dev/null | cut -f1) bytes' >> $DATA_DIR/debug.log; \\\r\n               cp $DATA_DIR/debug.log $LOG_DIR/debug-assumeutxo-{COMMIT}-dbcache-$DBCACHE-$(date +%s).log\" \\\r\n    \"COMPILER=$CC DBCACHE=$DBCACHE ./build/bin/bitcoin-cli -datadir=$DATA_DIR -rpcclienttimeout=0 loadtxoutset $UTXO_SNAPSHOT_PATH\"; \\\r\ndone\r\n\r\n595504a432 Merge bitcoin/bitcoin#34236: Add sedited to trusted-keys\r\n63e822b637 validation: make `IsInitialBlockDownload()` lock-free\r\n\r\nassumeutxo load | 910000 blocks | dbcache 4500 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | xfs | SSD\r\n\r\nBenchmark 1: COMPILER=gcc DBCACHE=4500 ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/ShallowBitcoinData -rpcclienttimeout=0 loadtxoutset /mnt/my_storage/utxo-910000.dat (COMMIT = 595504a43209bead162da54a204df7d140a25f0e)\r\n  Time (mean ± σ):     418.452 s ±  0.461 s    [User: 0.001 s, System: 0.001 s]\r\n  Range (min … max):   418.070 s … 418.964 s    3 runs\r\n \r\nBenchmark 2: COMPILER=gcc DBCACHE=4500 ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/ShallowBitcoinData -rpcclienttimeout=0 loadtxoutset /mnt/my_storage/utxo-910000.dat (COMMIT = 63e822b637f67242e3689adedc0155b34100e651)\r\n  Time (mean ± σ):     415.994 s ±  0.294 s    [User: 0.001 s, System: 0.001 s]\r\n  Range (min … max):   415.788 s … 416.330 s    3 runs\r\n \r\nRelative speed comparison\r\n        1.01 ±  0.00  COMPILER=gcc DBCACHE=4500 ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/ShallowBitcoinData -rpcclienttimeout=0 loadtxoutset /mnt/my_storage/utxo-910000.dat (COMMIT = 595504a43209bead162da54a204df7d140a25f0e)\r\n        1.00          COMPILER=gcc DBCACHE=4500 ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/ShallowBitcoinData -rpcclienttimeout=0 loadtxoutset /mnt/my_storage/utxo-910000.dat (COMMIT = 63e822b637f67242e3689adedc0155b34100e651)\r\n```\r\n\r\n</details>",
     "labels": [
       {
         "id": 118379652,
@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2026-01-11T15:15:32Z",
-    "updated_at": "2026-01-12T16:01:51Z",
+    "updated_at": "2026-01-12T17:36:26Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -164,7 +164,7 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 281549,
+        "size": 281550,
         "default_branch": "master",
         "open_issues_count": 28,
         "is_template": false,
@@ -177,7 +177,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-01-12T16:40:11Z",
+        "pushed_at": "2026-01-12T17:19:30Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2026-01-10T21:20:48Z",
         "allow_forking": true,
@@ -298,7 +298,7 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38589,
+        "forks_count": 38590,
         "stargazers_count": 87629,
         "watchers_count": 87629,
         "size": 301410,
@@ -322,7 +322,7 @@
         "visibility": "public",
         "pushed_at": "2026-01-11T22:44:29Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-01-12T17:00:14Z",
+        "updated_at": "2026-01-12T17:52:05Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
