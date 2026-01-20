@@ -43,11 +43,11 @@
     "body": "This is part of the effort to remove the libevent dependency from our code base: https://github.com/bitcoin/bitcoin/issues/31194\r\n\r\nThere is a dependency on #32061 but it only really needs one commit which is cherry-picked here in first position (add `LineReader`). I hope that a first chunk of that PR can be sliced off and reviewed independently so this PR here is not blocked by it.\r\n\r\nThe current approach tries to reuse existing code and follows roughly similar design decisions. It replaces the libevent-based async I/O with blocking I/O utilizing the existing `Sock` and `CThreadInterrupt`. The controller runs in a dedicated thread.\r\n\r\nThere are some optional code modernizations thrown in made along the way (namings, constexpr etc.). These are not strictly necessary but make the end result with the new code more consistent.",
     "labels": [],
     "created_at": "2025-12-27T14:20:31Z",
-    "updated_at": "2026-01-19T13:23:49Z",
+    "updated_at": "2026-01-20T18:03:44Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "62e5327d4c24b94e0b355930afcee05c1e5a4583",
+    "merge_commit_sha": "3e27fe97899bccab77c435a31b848348b9ef00f9",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -222,7 +222,7 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 286479,
+        "size": 286525,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -235,7 +235,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-01-18T14:19:44Z",
+        "pushed_at": "2026-01-20T15:31:03Z",
         "created_at": "2019-07-10T18:11:06Z",
         "updated_at": "2024-07-23T22:14:45Z",
         "allow_forking": true,
@@ -356,12 +356,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38703,
-        "stargazers_count": 87704,
-        "watchers_count": 87704,
-        "size": 301977,
+        "forks_count": 38744,
+        "stargazers_count": 87725,
+        "watchers_count": 87725,
+        "size": 302044,
         "default_branch": "master",
-        "open_issues_count": 758,
+        "open_issues_count": 753,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -378,9 +378,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-01-19T11:47:35Z",
+        "pushed_at": "2026-01-20T15:46:17Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-01-19T13:50:08Z",
+        "updated_at": "2026-01-20T18:41:34Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -410,7 +410,7 @@
     "deletions": 292,
     "changed_files": 10,
     "commits": 8,
-    "review_comments": 10,
+    "review_comments": 11,
     "comments": 12
   },
   "events": [
@@ -2861,6 +2861,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2704763440"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34158"
+        }
+      },
+      "start_line": 191,
+      "original_start_line": 196,
+      "start_side": "RIGHT",
+      "line": 195,
+      "original_line": 195,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2709500964",
+      "pull_request_review_id": 3683586241,
+      "id": 2709500964,
+      "node_id": "PRRC_kwDOABII586hf7Qk",
+      "diff_hunk": "@@ -166,41 +99,149 @@ bool TorControlConnection::Connect(const std::string& tor_control_center, const\n         return false;\n     }\n \n-    // Create a new socket, set up callbacks and enable notification bits\n-    b_conn = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);\n-    if (!b_conn) {\n+    // Create a new socket\n+    SOCKET s = socket(control_service->GetSAFamily(), SOCK_STREAM, IPPROTO_TCP);\n+    if (s == INVALID_SOCKET) {\n+        LogWarning(\"tor: Failed to create socket: %s\", NetworkErrorString(WSAGetLastError()));\n+        return false;\n+    }\n+\n+    m_sock = std::make_unique<Sock>(s);\n+\n+    // Connect to Tor control port\n+    if (m_sock->Connect(reinterpret_cast<struct sockaddr*>(&control_address), control_address_len) == SOCKET_ERROR) {\n+        LogWarning(\"tor: Error connecting to address %s: %s\", tor_control_center, NetworkErrorString(WSAGetLastError()));\n+        m_sock.reset();\n         return false;\n     }\n-    bufferevent_setcb(b_conn, TorControlConnection::readcb, nullptr, TorControlConnection::eventcb, this);\n-    bufferevent_enable(b_conn, EV_READ|EV_WRITE);\n-    this->connected = _connected;\n-    this->disconnected = _disconnected;\n-\n-    // Finally, connect to tor_control_center\n-    if (bufferevent_socket_connect(b_conn, reinterpret_cast<struct sockaddr*>(&control_address), control_address_len) < 0) {\n-        LogWarning(\"tor: Error connecting to address %s\", tor_control_center);\n+\n+    // Set non-blocking mode on socket\n+    if (!m_sock->SetNonBlocking()) {\n+        LogWarning(\"tor: Failed to set non-blocking mode: %s\", NetworkErrorString(WSAGetLastError()));\n+        m_sock.reset();\n         return false;\n     }\n+\n+    m_recv_buffer.clear();\n+    m_message.Clear();\n+    m_reply_handlers.clear();\n+\n+    LogDebug(BCLog::TOR, \"Successfully connected to Tor control port\");\n     return true;\n }\n \n void TorControlConnection::Disconnect()\n {\n-    if (b_conn)\n-        bufferevent_free(b_conn);\n-    b_conn = nullptr;\n+    m_sock.reset();\n+    m_recv_buffer.clear();\n+    m_message.Clear();\n+    m_reply_handlers.clear();\n }\n \n-bool TorControlConnection::Command(const std::string &cmd, const ReplyHandlerCB& reply_handler)\n+bool TorControlConnection::IsConnected() const\n {\n-    if (!b_conn)\n+    if (!m_sock) return false;\n+    std::string errmsg;\n+    return m_sock->IsConnected(errmsg);\n+}\n+\n+bool TorControlConnection::WaitForData(std::chrono::milliseconds timeout) const\n+{\n+    if (!m_sock) return false;\n+\n+    Sock::Event event{0};\n+    if (!m_sock->Wait(timeout, Sock::RECV, &event)) {\n         return false;\n-    struct evbuffer *buf = bufferevent_get_output(b_conn);\n-    if (!buf)\n+    }\n+    if (event & Sock::ERR) {\n         return false;\n-    evbuffer_add(buf, cmd.data(), cmd.size());\n-    evbuffer_add(buf, \"\\r\\n\", 2);\n-    reply_handlers.push_back(reply_handler);\n+    }\n+\n+    return true;\n+}\n+\n+bool TorControlConnection::ReceiveAndProcess()\n+{\n+    if (!m_sock) return false;\n+\n+    std::byte buf[4096];\n+    ssize_t nread = m_sock->Recv(buf, sizeof(buf), MSG_DONTWAIT);\n+\n+    if (nread < 0) {\n+        int err = WSAGetLastError();\n+        if (err == WSAEWOULDBLOCK || err == WSAEINTR || err == WSAEINPROGRESS) {\n+            // No data available currently\n+            return true;\n+        }\n+        LogWarning(\"tor: Error reading from socket: %s\", NetworkErrorString(err));\n+        return false;\n+    }\n+\n+    if (nread == 0) {\n+        LogDebug(BCLog::TOR, \"End of stream\");\n+        return false;\n+    }\n+\n+    m_recv_buffer.insert(m_recv_buffer.end(), buf, buf + nread);\n+    return ProcessBuffer();\n+}\n+\n+bool TorControlConnection::ProcessBuffer()\n+{\n+    if (m_recv_buffer.size() > MAX_LINE_LENGTH) {\n+        LogWarning(\"tor: Disconnecting because MAX_LINE_LENGTH exceeded\");\n+        return false;\n+    }\n+\n+    // TODO: Maybe could give this as an option to LineReader instead\n+    auto last_newline = std::find(m_recv_buffer.rbegin(), m_recv_buffer.rend(), std::byte{'\\n'});\n+    if (last_newline == m_recv_buffer.rend()) return true;\n+    size_t complete = last_newline.base() - m_recv_buffer.begin();\n+    util::LineReader reader({m_recv_buffer.data(), complete}, MAX_LINE_LENGTH);",
+      "path": "src/torcontrol.cpp",
+      "position": 251,
+      "original_position": 229,
+      "commit_id": "280898134f962c9e24d8025d4d58396b7293f6cb",
+      "original_commit_id": "c675b6f059dea662d9faa90df261de7bfbca13a1",
+      "in_reply_to_id": 2695742143,
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I'm about to push an update to #34242 that solves this. The patch below fails the partial-send test in `feature_torcontrol.py` with your current `LineReader` but passes when I rebase on the updated version:\r\n\r\n```diff\r\ndiff --git a/src/torcontrol.cpp b/src/torcontrol.cpp\r\nindex 94f925b8f4..bae7ac44a5 100644\r\n--- a/src/torcontrol.cpp\r\n+++ b/src/torcontrol.cpp\r\n@@ -188,12 +188,8 @@ bool TorControlConnection::ReceiveAndProcess()\r\n \r\n bool TorControlConnection::ProcessBuffer()\r\n {\r\n-    // TODO: Maybe could give this as an option to LineReader instead\r\n-    auto last_newline = std::find(m_recv_buffer.rbegin(), m_recv_buffer.rend(), std::byte{'\\n'});\r\n-    if (last_newline == m_recv_buffer.rend()) return true;\r\n-    size_t complete = last_newline.base() - m_recv_buffer.begin();\r\n-    util::LineReader reader({m_recv_buffer.data(), complete}, MAX_LINE_LENGTH);\r\n-\r\n+    util::LineReader reader(m_recv_buffer, MAX_LINE_LENGTH);\r\n+    auto start = reader.it;\r\n     while (auto line = reader.ReadLine()) {\r\n         // Skip short lines\r\n         if (line->size() < 4) continue;\r\n@@ -220,7 +216,7 @@ bool TorControlConnection::ProcessBuffer()\r\n         }\r\n     }\r\n \r\n-    m_recv_buffer.erase(m_recv_buffer.begin(), m_recv_buffer.begin() + complete);\r\n+    m_recv_buffer.erase(m_recv_buffer.begin(), m_recv_buffer.begin() + std::distance(start, reader.it));\r\n     return true;\r\n }\r\n \r\n```",
+      "created_at": "2026-01-20T18:03:44Z",
+      "updated_at": "2026-01-20T18:03:44Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34158#discussion_r2709500964",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2709500964"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34158"
