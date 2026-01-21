@@ -1,0 +1,814 @@
+{
+  "type": "pull",
+  "pull": {
+    "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34374",
+    "id": 3196609350,
+    "node_id": "PR_kwDOABII586-iGNG",
+    "html_url": "https://github.com/bitcoin/bitcoin/pull/34374",
+    "diff_url": "https://github.com/bitcoin/bitcoin/pull/34374.diff",
+    "patch_url": "https://github.com/bitcoin/bitcoin/pull/34374.patch",
+    "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34374",
+    "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34374/commits",
+    "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34374/comments",
+    "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
+    "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34374/comments",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/e1a58bcaaacd63e13eb7af74d95f4dc2066c0448",
+    "number": 34374,
+    "state": "open",
+    "locked": false,
+    "maintainer_can_modify": true,
+    "title": "kernel: use structured logging and simplify logging interface",
+    "user": {
+      "login": "stickies-v",
+      "id": 69010457,
+      "node_id": "MDQ6VXNlcjY5MDEwNDU3",
+      "avatar_url": "https://avatars.githubusercontent.com/u/69010457?v=4",
+      "gravatar_id": "",
+      "url": "https://api.github.com/users/stickies-v",
+      "html_url": "https://github.com/stickies-v",
+      "followers_url": "https://api.github.com/users/stickies-v/followers",
+      "following_url": "https://api.github.com/users/stickies-v/following%7B/other_user%7D",
+      "gists_url": "https://api.github.com/users/stickies-v/gists%7B/gist_id%7D",
+      "starred_url": "https://api.github.com/users/stickies-v/starred%7B/owner%7D%7B/repo%7D",
+      "subscriptions_url": "https://api.github.com/users/stickies-v/subscriptions",
+      "organizations_url": "https://api.github.com/users/stickies-v/orgs",
+      "repos_url": "https://api.github.com/users/stickies-v/repos",
+      "events_url": "https://api.github.com/users/stickies-v/events%7B/privacy%7D",
+      "received_events_url": "https://api.github.com/users/stickies-v/received_events",
+      "type": "User",
+      "site_admin": false,
+      "name": null,
+      "patch_url": null
+    },
+    "body": "tl;dr: kernel logging is cumbersome. This PR enables structured logging and a much simplified kernel logging interface. Closes #34062.\r\n\r\n## Motivation\r\n\r\nThe `bitcoinkernel` library (#27587) [exposes](https://github.com/bitcoin/bitcoin/blob/b26762bdcb941096ccc6f53c3fb5a7786ad735e7/src/kernel/bitcoinkernel.h#L698-L778) functionality to interface with the kernel logging. This includes registering callbacks for log statements, level/category filtering, string formatting options, and more.\r\n\r\nKernel logging has a few problems:\r\n- [callbacks](https://github.com/bitcoin/bitcoin/blob/b26762bdcb941096ccc6f53c3fb5a7786ad735e7/src/kernel/bitcoinkernel.h#L304) operate on formatted strings, so users need to parse the string to get the timestamp, category, level, ... based on which options are set. This is cumbersome, brittle, and inefficient.\r\n- the [filtering interface](https://github.com/bitcoin/bitcoin/blob/b26762bdcb941096ccc6f53c3fb5a7786ad735e7/src/kernel/bitcoinkernel.h#L737) is not really intuitive, requiring users to call combinations of `btck_logging_set_level_category` and `btck_logging_enable_category` when they want to produce `debug` or `trace` logs. The level/category system makes sense for node, because it directly controls what gets written to disk and stdout, and there are quite a lot more categories producing logs. Kernel doesn't really need this - users control what happens to the logs, and can do any filtering/manipulation in the callback they provide.\r\n- the node logging infrastructure has quite a bit more functionality than is necessary for a library, including ratelimiting, log formatting, outputting, buffering, ... This introduces unnecessary code and interface complexity.\r\n\r\n## Approach\r\n\r\nMost of the logic in `logging.h` is not necessary for `bitcoinkernel`, so we first separate it into `util/log.h` and `logging.h` (`common`), then upgrade the `bitcoinkernel` logging interface, and finally remove the `logging.cpp` dependency from kernel entirely.\r\n\r\n1. **Separate log generation**: Add a minimal `util::log::Dispatcher` that is used to generate logs, and forwards structured log entries to registered callbacks. No formatting, rate-limiting, or output handling - that's the consumer's responsibility. Dispatcher can be configured with a `filter` predicate (e.g. `WillLogCategoryLevel()` for `node`, or a simpler levels-based filter for `bitcoinkernel`) to avoid unnecessary string formatting and other overhead.\r\n2. **Register `BCLog::Logger` on Dispatcher**: Register a callback on the global Dispatcher to receive entries and handle node-specific concerns (formatting, rate-limiting, file output) without changing most of its logic.\r\n3. **Move logging macros to `util/log.h`**: Allows the entire codebase (including kernel code) to use the same macros without depending on `logging.h`.\r\n4. **Update bitcoinkernel C API**: Replace the string-based callback with `btck_LogEntry` containing full metadata. Remove `btck_LoggingOptions` and category enable/disable functions. Add `btck_logging_set_min_level()` for early filtering.\r\n5. Move **`logging.cpp` to `common`**: remove it as a kernel dependency entirely.\r\n\r\n## Appendix\r\n\r\n### `bitcoinkernel` C logging interface\r\n\r\n```c\r\nstruct btck_LogEntry {\r\n    const char* message;       //!< Log message\r\n    size_t message_len;        //!< Log message length\r\n    const char* file_name;     //!< Source file name\r\n    size_t file_name_len;      //!< Source file name length\r\n    const char* function_name; //!< Source function name\r\n    size_t function_name_len;  //!< Source function name length\r\n    const char* thread_name;   //!< Thread name\r\n    size_t thread_name_len;    //!< Thread name length\r\n    int64_t timestamp_ns;      //!< Timestamp in nanoseconds since epoch\r\n    uint32_t line;             //!< Source line number\r\n    btck_LogLevel level;       //!< Log level\r\n    btck_LogCategory category; //!< Log category\r\n};\r\n\r\ntypedef void (*btck_LogCallback)(void* user_data, const btck_LogEntry* entry);\r\n\r\nBITCOINKERNEL_API void btck_logging_set_min_level(btck_LogLevel level);\r\n\r\nBITCOINKERNEL_API btck_LoggingConnection* BITCOINKERNEL_WARN_UNUSED_RESULT btck_logging_connection_create(\r\n    btck_LogCallback log_callback,\r\n    void* user_data,\r\n    btck_DestroyCallback user_data_destroy_callback) BITCOINKERNEL_ARG_NONNULL(1);\r\n\r\nBITCOINKERNEL_API void btck_logging_connection_destroy(btck_LoggingConnection* logging_connection);\r\n```\r\n\r\n",
+    "labels": [
+      {
+        "id": 118379652,
+        "node_id": "MDU6TGFiZWwxMTgzNzk2NTI=",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Validation",
+        "name": "Validation",
+        "color": "6060aa",
+        "default": false
+      }
+    ],
+    "created_at": "2026-01-21T19:56:44Z",
+    "updated_at": "2026-01-21T19:58:06Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
+    "merged": false,
+    "merge_commit_sha": "02ff9ff38850b410a62d096a5a9558e4dd96e1ed",
+    "assignees": [],
+    "requested_reviewers": [],
+    "requested_teams": [],
+    "rebaseable": true,
+    "head": {
+      "label": "stickies-v:2026-01/kernel-logging-layering-predicate",
+      "ref": "2026-01/kernel-logging-layering-predicate",
+      "sha": "e1a58bcaaacd63e13eb7af74d95f4dc2066c0448",
+      "user": {
+        "login": "stickies-v",
+        "id": 69010457,
+        "node_id": "MDQ6VXNlcjY5MDEwNDU3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/69010457?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/stickies-v",
+        "html_url": "https://github.com/stickies-v",
+        "followers_url": "https://api.github.com/users/stickies-v/followers",
+        "following_url": "https://api.github.com/users/stickies-v/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/stickies-v/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/stickies-v/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/stickies-v/subscriptions",
+        "organizations_url": "https://api.github.com/users/stickies-v/orgs",
+        "repos_url": "https://api.github.com/users/stickies-v/repos",
+        "events_url": "https://api.github.com/users/stickies-v/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/stickies-v/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "repo": {
+        "id": 431644530,
+        "node_id": "R_kgDOGbpfcg",
+        "name": "bitcoin",
+        "full_name": "stickies-v/bitcoin",
+        "owner": {
+          "login": "stickies-v",
+          "id": 69010457,
+          "node_id": "MDQ6VXNlcjY5MDEwNDU3",
+          "avatar_url": "https://avatars.githubusercontent.com/u/69010457?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/stickies-v",
+          "html_url": "https://github.com/stickies-v",
+          "followers_url": "https://api.github.com/users/stickies-v/followers",
+          "following_url": "https://api.github.com/users/stickies-v/following%7B/other_user%7D",
+          "gists_url": "https://api.github.com/users/stickies-v/gists%7B/gist_id%7D",
+          "starred_url": "https://api.github.com/users/stickies-v/starred%7B/owner%7D%7B/repo%7D",
+          "subscriptions_url": "https://api.github.com/users/stickies-v/subscriptions",
+          "organizations_url": "https://api.github.com/users/stickies-v/orgs",
+          "repos_url": "https://api.github.com/users/stickies-v/repos",
+          "events_url": "https://api.github.com/users/stickies-v/events%7B/privacy%7D",
+          "received_events_url": "https://api.github.com/users/stickies-v/received_events",
+          "type": "User",
+          "site_admin": false,
+          "name": null,
+          "patch_url": null
+        },
+        "private": false,
+        "html_url": "https://github.com/stickies-v/bitcoin",
+        "description": "Bitcoin Core integration/staging tree",
+        "fork": true,
+        "url": "https://api.github.com/repos/stickies-v/bitcoin",
+        "archive_url": "https://api.github.com/repos/stickies-v/bitcoin/%7Barchive_format%7D%7B/ref%7D",
+        "assignees_url": "https://api.github.com/repos/stickies-v/bitcoin/assignees%7B/user%7D",
+        "blobs_url": "https://api.github.com/repos/stickies-v/bitcoin/git/blobs%7B/sha%7D",
+        "branches_url": "https://api.github.com/repos/stickies-v/bitcoin/branches%7B/branch%7D",
+        "collaborators_url": "https://api.github.com/repos/stickies-v/bitcoin/collaborators%7B/collaborator%7D",
+        "comments_url": "https://api.github.com/repos/stickies-v/bitcoin/comments%7B/number%7D",
+        "commits_url": "https://api.github.com/repos/stickies-v/bitcoin/commits%7B/sha%7D",
+        "compare_url": "https://api.github.com/repos/stickies-v/bitcoin/compare/%7Bbase%7D...%7Bhead%7D",
+        "contents_url": "https://api.github.com/repos/stickies-v/bitcoin/contents/%7B+path%7D",
+        "contributors_url": "https://api.github.com/repos/stickies-v/bitcoin/contributors",
+        "deployments_url": "https://api.github.com/repos/stickies-v/bitcoin/deployments",
+        "downloads_url": "https://api.github.com/repos/stickies-v/bitcoin/downloads",
+        "events_url": "https://api.github.com/repos/stickies-v/bitcoin/events",
+        "forks_url": "https://api.github.com/repos/stickies-v/bitcoin/forks",
+        "git_commits_url": "https://api.github.com/repos/stickies-v/bitcoin/git/commits%7B/sha%7D",
+        "git_refs_url": "https://api.github.com/repos/stickies-v/bitcoin/git/refs%7B/sha%7D",
+        "git_tags_url": "https://api.github.com/repos/stickies-v/bitcoin/git/tags%7B/sha%7D",
+        "git_url": "git://github.com/stickies-v/bitcoin.git",
+        "issue_comment_url": "https://api.github.com/repos/stickies-v/bitcoin/issues/comments%7B/number%7D",
+        "issue_events_url": "https://api.github.com/repos/stickies-v/bitcoin/issues/events%7B/number%7D",
+        "issues_url": "https://api.github.com/repos/stickies-v/bitcoin/issues%7B/number%7D",
+        "keys_url": "https://api.github.com/repos/stickies-v/bitcoin/keys%7B/key_id%7D",
+        "labels_url": "https://api.github.com/repos/stickies-v/bitcoin/labels%7B/name%7D",
+        "languages_url": "https://api.github.com/repos/stickies-v/bitcoin/languages",
+        "merges_url": "https://api.github.com/repos/stickies-v/bitcoin/merges",
+        "milestones_url": "https://api.github.com/repos/stickies-v/bitcoin/milestones%7B/number%7D",
+        "notifications_url": "https://api.github.com/repos/stickies-v/bitcoin/notifications%7B?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/stickies-v/bitcoin/pulls%7B/number%7D",
+        "releases_url": "https://api.github.com/repos/stickies-v/bitcoin/releases%7B/id%7D",
+        "ssh_url": "git@github.com:stickies-v/bitcoin.git",
+        "stargazers_url": "https://api.github.com/repos/stickies-v/bitcoin/stargazers",
+        "statuses_url": "https://api.github.com/repos/stickies-v/bitcoin/statuses/%7Bsha%7D",
+        "subscribers_url": "https://api.github.com/repos/stickies-v/bitcoin/subscribers",
+        "subscription_url": "https://api.github.com/repos/stickies-v/bitcoin/subscription",
+        "tags_url": "https://api.github.com/repos/stickies-v/bitcoin/tags",
+        "teams_url": "https://api.github.com/repos/stickies-v/bitcoin/teams",
+        "trees_url": "https://api.github.com/repos/stickies-v/bitcoin/git/trees%7B/sha%7D",
+        "clone_url": "https://github.com/stickies-v/bitcoin.git",
+        "hooks_url": "https://api.github.com/repos/stickies-v/bitcoin/hooks",
+        "svn_url": "https://github.com/stickies-v/bitcoin",
+        "homepage": "https://bitcoincore.org/en/download",
+        "language": "C++",
+        "forks_count": 1,
+        "stargazers_count": 3,
+        "watchers_count": 3,
+        "size": 291227,
+        "default_branch": "master",
+        "open_issues_count": 0,
+        "is_template": false,
+        "topics": [],
+        "has_issues": false,
+        "has_projects": true,
+        "has_wiki": false,
+        "has_pages": false,
+        "has_downloads": false,
+        "archived": false,
+        "disabled": false,
+        "visibility": "public",
+        "pushed_at": "2026-01-21T19:56:11Z",
+        "created_at": "2021-11-24T22:26:41Z",
+        "updated_at": "2025-10-10T05:07:04Z",
+        "allow_forking": true,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "html_url": null,
+          "description": null,
+          "implementation": null,
+          "permissions": null,
+          "conditions": null,
+          "limitations": null,
+          "body": null,
+          "featured": null
+        }
+      }
+    },
+    "base": {
+      "label": "bitcoin:master",
+      "ref": "master",
+      "sha": "3ea2b6fe180e51e410836f58e15f463296aeffe8",
+      "user": {
+        "login": "bitcoin",
+        "id": 528860,
+        "node_id": "MDEyOk9yZ2FuaXphdGlvbjUyODg2MA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/528860?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/bitcoin",
+        "html_url": "https://github.com/bitcoin",
+        "followers_url": "https://api.github.com/users/bitcoin/followers",
+        "following_url": "https://api.github.com/users/bitcoin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/bitcoin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/bitcoin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/bitcoin/subscriptions",
+        "organizations_url": "https://api.github.com/users/bitcoin/orgs",
+        "repos_url": "https://api.github.com/users/bitcoin/repos",
+        "events_url": "https://api.github.com/users/bitcoin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/bitcoin/received_events",
+        "type": "Organization",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "repo": {
+        "id": 1181927,
+        "node_id": "MDEwOlJlcG9zaXRvcnkxMTgxOTI3",
+        "name": "bitcoin",
+        "full_name": "bitcoin/bitcoin",
+        "owner": {
+          "login": "bitcoin",
+          "id": 528860,
+          "node_id": "MDEyOk9yZ2FuaXphdGlvbjUyODg2MA==",
+          "avatar_url": "https://avatars.githubusercontent.com/u/528860?v=4",
+          "gravatar_id": "",
+          "url": "https://api.github.com/users/bitcoin",
+          "html_url": "https://github.com/bitcoin",
+          "followers_url": "https://api.github.com/users/bitcoin/followers",
+          "following_url": "https://api.github.com/users/bitcoin/following%7B/other_user%7D",
+          "gists_url": "https://api.github.com/users/bitcoin/gists%7B/gist_id%7D",
+          "starred_url": "https://api.github.com/users/bitcoin/starred%7B/owner%7D%7B/repo%7D",
+          "subscriptions_url": "https://api.github.com/users/bitcoin/subscriptions",
+          "organizations_url": "https://api.github.com/users/bitcoin/orgs",
+          "repos_url": "https://api.github.com/users/bitcoin/repos",
+          "events_url": "https://api.github.com/users/bitcoin/events%7B/privacy%7D",
+          "received_events_url": "https://api.github.com/users/bitcoin/received_events",
+          "type": "Organization",
+          "site_admin": false,
+          "name": null,
+          "patch_url": null
+        },
+        "private": false,
+        "html_url": "https://github.com/bitcoin/bitcoin",
+        "description": "Bitcoin Core integration/staging tree",
+        "fork": false,
+        "url": "https://api.github.com/repos/bitcoin/bitcoin",
+        "archive_url": "https://api.github.com/repos/bitcoin/bitcoin/%7Barchive_format%7D%7B/ref%7D",
+        "assignees_url": "https://api.github.com/repos/bitcoin/bitcoin/assignees%7B/user%7D",
+        "blobs_url": "https://api.github.com/repos/bitcoin/bitcoin/git/blobs%7B/sha%7D",
+        "branches_url": "https://api.github.com/repos/bitcoin/bitcoin/branches%7B/branch%7D",
+        "collaborators_url": "https://api.github.com/repos/bitcoin/bitcoin/collaborators%7B/collaborator%7D",
+        "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/comments%7B/number%7D",
+        "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/commits%7B/sha%7D",
+        "compare_url": "https://api.github.com/repos/bitcoin/bitcoin/compare/%7Bbase%7D...%7Bhead%7D",
+        "contents_url": "https://api.github.com/repos/bitcoin/bitcoin/contents/%7B+path%7D",
+        "contributors_url": "https://api.github.com/repos/bitcoin/bitcoin/contributors",
+        "deployments_url": "https://api.github.com/repos/bitcoin/bitcoin/deployments",
+        "downloads_url": "https://api.github.com/repos/bitcoin/bitcoin/downloads",
+        "events_url": "https://api.github.com/repos/bitcoin/bitcoin/events",
+        "forks_url": "https://api.github.com/repos/bitcoin/bitcoin/forks",
+        "git_commits_url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits%7B/sha%7D",
+        "git_refs_url": "https://api.github.com/repos/bitcoin/bitcoin/git/refs%7B/sha%7D",
+        "git_tags_url": "https://api.github.com/repos/bitcoin/bitcoin/git/tags%7B/sha%7D",
+        "git_url": "git://github.com/bitcoin/bitcoin.git",
+        "issue_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments%7B/number%7D",
+        "issue_events_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events%7B/number%7D",
+        "issues_url": "https://api.github.com/repos/bitcoin/bitcoin/issues%7B/number%7D",
+        "keys_url": "https://api.github.com/repos/bitcoin/bitcoin/keys%7B/key_id%7D",
+        "labels_url": "https://api.github.com/repos/bitcoin/bitcoin/labels%7B/name%7D",
+        "languages_url": "https://api.github.com/repos/bitcoin/bitcoin/languages",
+        "merges_url": "https://api.github.com/repos/bitcoin/bitcoin/merges",
+        "milestones_url": "https://api.github.com/repos/bitcoin/bitcoin/milestones%7B/number%7D",
+        "notifications_url": "https://api.github.com/repos/bitcoin/bitcoin/notifications%7B?since,all,participating}",
+        "pulls_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls%7B/number%7D",
+        "releases_url": "https://api.github.com/repos/bitcoin/bitcoin/releases%7B/id%7D",
+        "ssh_url": "git@github.com:bitcoin/bitcoin.git",
+        "stargazers_url": "https://api.github.com/repos/bitcoin/bitcoin/stargazers",
+        "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/%7Bsha%7D",
+        "subscribers_url": "https://api.github.com/repos/bitcoin/bitcoin/subscribers",
+        "subscription_url": "https://api.github.com/repos/bitcoin/bitcoin/subscription",
+        "tags_url": "https://api.github.com/repos/bitcoin/bitcoin/tags",
+        "teams_url": "https://api.github.com/repos/bitcoin/bitcoin/teams",
+        "trees_url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees%7B/sha%7D",
+        "clone_url": "https://github.com/bitcoin/bitcoin.git",
+        "hooks_url": "https://api.github.com/repos/bitcoin/bitcoin/hooks",
+        "svn_url": "https://github.com/bitcoin/bitcoin",
+        "homepage": "https://bitcoincore.org/en/download",
+        "language": "C++",
+        "forks_count": 38755,
+        "stargazers_count": 87734,
+        "watchers_count": 87734,
+        "size": 302168,
+        "default_branch": "master",
+        "open_issues_count": 752,
+        "is_template": false,
+        "topics": [
+          "bitcoin",
+          "c-plus-plus",
+          "cryptocurrency",
+          "cryptography",
+          "p2p"
+        ],
+        "has_issues": true,
+        "has_projects": true,
+        "has_wiki": false,
+        "has_pages": false,
+        "has_downloads": false,
+        "archived": false,
+        "disabled": false,
+        "visibility": "public",
+        "pushed_at": "2026-01-21T16:42:24Z",
+        "created_at": "2010-12-19T15:16:43Z",
+        "updated_at": "2026-01-21T19:32:03Z",
+        "allow_forking": true,
+        "license": {
+          "key": "mit",
+          "name": "MIT License",
+          "node_id": "MDc6TGljZW5zZTEz",
+          "spdx_id": "MIT",
+          "url": "https://api.github.com/licenses/mit",
+          "html_url": null,
+          "description": null,
+          "implementation": null,
+          "permissions": null,
+          "conditions": null,
+          "limitations": null,
+          "body": null,
+          "featured": null
+        }
+      }
+    },
+    "_links": {
+      "self": {
+        "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34374"
+      }
+    },
+    "author_association": "CONTRIBUTOR",
+    "draft": false,
+    "additions": 878,
+    "deletions": 473,
+    "changed_files": 45,
+    "commits": 9,
+    "review_comments": 0,
+    "comments": 1
+  },
+  "events": [
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDM4OGQwOGNmYzhiYzdiMmYxMjc5NjVjZjRlNTdhMmZiNDc5Yzc2OTI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/388d08cfc8bc7b2f127965cf4e57a2fb479c7692",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/388d08cfc8bc7b2f127965cf4e57a2fb479c7692",
+      "tree": {
+        "sha": "9cbb276272f4b0346fd4d753a2b41bdda9ca4c47",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9cbb276272f4b0346fd4d753a2b41bdda9ca4c47"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 9cbb276272f4b0346fd4d753a2b41bdda9ca4c47\nparent c84c752506d750e0d9c87a58ada9cbc19fc7a83b\nauthor stickies-v <stickies-v@protonmail.com> 1765899441 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769020121 +0000\n\nutil: add log::Dispatcher for structured log dispatch\n\nAdd a minimal, callback-based dispatcher that forwards structured log\nentries to registered callbacks. This provides the foundation for\nseparating log generation from log consumption, enabling different\nconsumers (node sink, kernel C API) to receive the same log entries.\nThe Dispatcher handles optional filtering and message formatting, while\nconsumers handle rate limiting and output.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxGuUACgkQXLHObl5m\np1dx1w//VUxMkmotR3gu41lVl9Cuj1k4reI0D3ybvB4wVrmIgPpTDSWXwLYfHSaR\nQIlHqoIxIag0twEpz77lH1ygisp/QLz9QNBYr2z2qTs8UrGaPGQvDUjCZQjc0uZF\nZgy9msX+KMxqo4ZetybGfhKkHJrQvhbUYah7im+0cLYdJ5NVIxsHNYPsJG2+COeV\nkNFcOG1V3mUm/slcYRadXQxM9/YkZzVWtiBuIBggltkD7/qyZaJh28zj84zJucVj\n4KNiy93r5eNOY/KZsinj7ET5nNRqZtC51XqGg9etz2jbMIO6VOmTkKgALecPo4km\nNaq5y9Xcn85AoIEIrEissuuYo3KjcgVKhMmiZLLIe/YeqAm4EM5NyxnNWGvf+4o2\nJCnayvgAFH4I4Ve8qh1NH75ouE6v/4IhigJA3uK5+Vymtov1z2Q1GDT7hYt/C2Uf\n18ulOS1gKrLt5sWDvkMTa9YIVsdergUsW0t9DVCCMpLDKHAe5hNt2I29U6M93Yqi\nZFPhQJnjzap9qQMHfR34Ict/Nf8Ee//wM7V3IgmhMpdUggeaDysblgQLBRRPxqSD\nxq/v52IEWVSfAIDrpAfPilq9OIaJAV09jSEBl1DmJpg93KQ1ua2C943GYXGxgNID\nThZct+SGVMh/wYr+gdwPrneXL2pFboIBHKmCj6/gMGT/tOy6oGQ=\n=2re0\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c84c752506d750e0d9c87a58ada9cbc19fc7a83b",
+          "sha": "c84c752506d750e0d9c87a58ada9cbc19fc7a83b",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c84c752506d750e0d9c87a58ada9cbc19fc7a83b"
+        }
+      ],
+      "message": "util: add log::Dispatcher for structured log dispatch\n\nAdd a minimal, callback-based dispatcher that forwards structured log\nentries to registered callbacks. This provides the foundation for\nseparating log generation from log consumption, enabling different\nconsumers (node sink, kernel C API) to receive the same log entries.\nThe Dispatcher handles optional filtering and message formatting, while\nconsumers handle rate limiting and output.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:28:41Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2025-12-16T15:37:21Z"
+      },
+      "sha": "388d08cfc8bc7b2f127965cf4e57a2fb479c7692"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGNlZWQ3ZWJhOTNhODczMGNmZDQ0MjVmYjdhMmYyMDc4YzI4ODdhZjk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ceed7eba93a8730cfd4425fb7a2f2078c2887af9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ceed7eba93a8730cfd4425fb7a2f2078c2887af9",
+      "tree": {
+        "sha": "f83d38b55cd48a51d9706f91f6d402718d6bb86e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f83d38b55cd48a51d9706f91f6d402718d6bb86e"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree f83d38b55cd48a51d9706f91f6d402718d6bb86e\nparent 388d08cfc8bc7b2f127965cf4e57a2fb479c7692\nauthor stickies-v <stickies-v@protonmail.com> 1769019098 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769020133 +0000\n\nlogging: add Dispatcher to Logger and introduce global dispatcher\n\nPreparatory work for the next commit where the logging macros are moved\nto the util library. The macros require a single global entry point to\ndispatch log entries.\n\nMake BCLog::Logger aware of util::log::Dispatcher by giving it ownership\nof a Dispatcher instance which it can register callbacks on.\n\nCurrently, only a single sink (i.e. BCLog::Logger) exists, but in future\ncommits this will change as kernel removes its dependency on logging.cpp\nand introduces its own global logging sink.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxGuUACgkQXLHObl5m\np1di/RAAon17bNcZYTXX9gRU8z7C8cySl8RA7jkhb5UKhDixVCmAwaHfMzZSpElr\nG7+9gTfnrMAgVcaYup9hz4lNKdM6PrKnuBjJ4RFxISFEGHQtYZ/Ccc9a229aqRLL\nrWXSFJAtMrPqUX83DSYKILTsM6+4EH09kcAnuRWYmjJzGW51vY28jSqoC9FmWQYE\nbpnuM12H5+KewiJwv3aTwy5wC7xkmmY6wdcBSBtssgrRUqEqe0qr+wYuYqI+kw9u\naY7kzaxTRbakCvMYpxaiGVB01caMNY8KHPgK9ZMjURvowtw/ZxufUhV0AKUAdHMY\nFkZdOXzNedbUyepjygz0NyXUqYLrZ2KtwuSMNFUriAk0l6MuulbkzgakzAxLDZz6\nt6jM/TqYTlPhVnGGh6jVgPt6E91tUXsdW2DnyAG5AFEa9aidOpUsjb8Qm9hjmRCu\nA4WlBTXbKrxj6HVCFHdB2tIB7U1Smi3bArFD4BsdsiWu/K5EKahq3JVP8Oc6fxXr\nnVDkXfOqqgYLx7uYHG144TjM7B0Sc11DoSh1oXxzzk11jjMGWwyeaTeGgZTSM7DO\ntaFyh5nMBql/3HGwBIErJRQjx0v2t7hpzPap+fpsj205qKI/1x264kljiW2pFu2a\nxCMog44VHhbUFJPCZULCh4JCNAObq0ri+1GlheQaOFKbkzcx2DM=\n=mr+r\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/388d08cfc8bc7b2f127965cf4e57a2fb479c7692",
+          "sha": "388d08cfc8bc7b2f127965cf4e57a2fb479c7692",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/388d08cfc8bc7b2f127965cf4e57a2fb479c7692"
+        }
+      ],
+      "message": "logging: add Dispatcher to Logger and introduce global dispatcher\n\nPreparatory work for the next commit where the logging macros are moved\nto the util library. The macros require a single global entry point to\ndispatch log entries.\n\nMake BCLog::Logger aware of util::log::Dispatcher by giving it ownership\nof a Dispatcher instance which it can register callbacks on.\n\nCurrently, only a single sink (i.e. BCLog::Logger) exists, but in future\ncommits this will change as kernel removes its dependency on logging.cpp\nand introduces its own global logging sink.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:28:53Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:11:38Z"
+      },
+      "sha": "ceed7eba93a8730cfd4425fb7a2f2078c2887af9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDIzODhiZWViODgzNWVhNWIxYTM0NDY0MGQ0ODJmYjEyMDQxZTVjNzY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2388beeb8835ea5b1a344640d482fb12041e5c76",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/2388beeb8835ea5b1a344640d482fb12041e5c76",
+      "tree": {
+        "sha": "1d6e072dfc1ee486eb297fee9e4ba47a6017858a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1d6e072dfc1ee486eb297fee9e4ba47a6017858a"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 1d6e072dfc1ee486eb297fee9e4ba47a6017858a\nparent ceed7eba93a8730cfd4425fb7a2f2078c2887af9\nauthor stickies-v <stickies-v@protonmail.com> 1768478748 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769020133 +0000\n\nlogging: route log macros through Dispatcher\n\nLog macros now call util::log::GetDispatcher().Log() directly instead of\ngoing through LogInstance(). BCLog::Logger registers a callback on its\nDispatcher to receive entries and handle formatting, rate limiting, and\noutput.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxGuUACgkQXLHObl5m\np1cQXBAAm7Mw6/g9kUPKI02auwE/8I3R4WVGD1DmOGTZxXWovfIvo1xEqQtNxubJ\njUjfxKhnpjaWrWhWx7yKuq4PvkWVpIn0UGQWX1tPgTZYRowPC2DC/Ixhbr5w1zCz\nHWDLqMStAyJmwC6a+CtPtqoagZLxYC2QqNzVHMQy2O2NVec3qR6xUhCD0idSoyer\nLlw41PbKqVx1ulWkC0dU1yR2AjVn2odo+JdQQYnvoGpqshDjysrJudawSmqAdCTG\n7lHtrcm8vDvPZSADI8ljNWVsCO5zJsg6GnlXVND0Jxn/RFmrxQbhGHJ28Vb2yeJ6\nFhIBahqNxwfkTU2F+kfL715jy1FrcQXZv7hfNNej8WaQKKDvaYLf/AQ7oQhQACt4\nMqQ8mMr5+oLTj2W4OuLIQVQRD0y4dSO91g0VWgOoguzaABZgTl4J7AnUyGoy4kyd\np+iAkzPeT1tQRk5+rxv0P5oqKjEebOY/a9px1+qU80M+NIZHfKzgbk8T+Eq4toAm\nFiRWNfIiirVcwoeBFewKZt6Hz1Ys9mdNTW5CE2PvW4EJBsxs2mNGIsEO1nJ+vk/k\ns4WrrMXBb5N348MfKljiln2flSIaMxDLpisbBhIX+YrDjP9yF3u1fXU9c+LZlm2X\necIxULZyG1rOfE+seE5kWkDcUt6pJVRYEeZVHr4iZy2J69JFFgo=\n=/bmc\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ceed7eba93a8730cfd4425fb7a2f2078c2887af9",
+          "sha": "ceed7eba93a8730cfd4425fb7a2f2078c2887af9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ceed7eba93a8730cfd4425fb7a2f2078c2887af9"
+        }
+      ],
+      "message": "logging: route log macros through Dispatcher\n\nLog macros now call util::log::GetDispatcher().Log() directly instead of\ngoing through LogInstance(). BCLog::Logger registers a callback on its\nDispatcher to receive entries and handle formatting, rate limiting, and\noutput.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:28:53Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-15T12:05:48Z"
+      },
+      "sha": "2388beeb8835ea5b1a344640d482fb12041e5c76"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQ2NjRjM2Q5MDZmZDBmZjBjMGU5NTdkNmEzYWRhZTY1NmJjMjVjMzg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d664c3d906fd0ff0c0e957d6a3adae656bc25c38",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d664c3d906fd0ff0c0e957d6a3adae656bc25c38",
+      "tree": {
+        "sha": "d48e66f1e5aeab7e1ea900a5c10f8fa9cf34d066",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d48e66f1e5aeab7e1ea900a5c10f8fa9cf34d066"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree d48e66f1e5aeab7e1ea900a5c10f8fa9cf34d066\nparent 2388beeb8835ea5b1a344640d482fb12041e5c76\nauthor stickies-v <stickies-v@protonmail.com> 1768575409 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769020133 +0000\n\nkernel: add log level/category name getters\n\nExpose btck_log_level_get_name and btck_log_category_get_name to allow\nlibrary users to get string representations of log levels and categories.\n\nUse constexpr lookup tables as a single source of truth for mapping\nbtck types to both BCLog equivalents and string names.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxGuUACgkQXLHObl5m\np1dijQ/+Ox0fuQEQKagmlXmbtsHKv748ATzghZF1hf9SH77YszIteKofYkAXLVSs\nTtGyQ38In1HGmGH8sX6tDao7CN2JcJ6ZqmQlA1x4K5VwajkJrzFYCwJsAF12lcJU\nb38DMZfipOCB+dkCDiFLGocGgUzyPkaZsLKQ7YhBUWHNBvD8l7GtBpLShppBPlp4\nePwh+gFnNBDcynwppyjgPDVXtdABY+ziYak8ZR7FuPTsLsHphSDcH66rijXZyIY0\nRzGzxuQjYoSJeGJm/Fo8DLRbnBz1J9KmSdwW+yjtHgXAtDiCg9vgLKjnektDy1oF\npG1Tf0g7QQnqB6pYEtVjFhQ5JH+rQFWbv7xtZwYGYXBoQNP3RvSaxMTQ3R1lXZza\nSS9OR4J71rJdCmvIYDI6nA+M8Lidijjq+b3i87bHHjgRwasdZ/6KQjE4dKHc2TcN\nAAc/CmHfcYxuXN2hNLoYYR2G8ooNz0frRaut20MUmTAKKzZQUt2J3U/rZ24XovQs\nXASPaqH44ZCrWP7ynvPQczL+GqvTDKQIt67iv1E0YvZaBbHjSQUx1IJ83JS0edDE\nxPE4SyYDk3+AlWbLvAfQfxTaR4Dy7mdEfZx6kJtQUNQtZUw6HhydhCc99lxtcZWy\nP9jHssKTMTRR9NqutGcBexzDJCEr8Pdk6AB5h0hNw1HXyW072qY=\n=vWRA\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2388beeb8835ea5b1a344640d482fb12041e5c76",
+          "sha": "2388beeb8835ea5b1a344640d482fb12041e5c76",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/2388beeb8835ea5b1a344640d482fb12041e5c76"
+        }
+      ],
+      "message": "kernel: add log level/category name getters\n\nExpose btck_log_level_get_name and btck_log_category_get_name to allow\nlibrary users to get string representations of log levels and categories.\n\nUse constexpr lookup tables as a single source of truth for mapping\nbtck types to both BCLog equivalents and string names.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:28:53Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-16T14:56:49Z"
+      },
+      "sha": "d664c3d906fd0ff0c0e957d6a3adae656bc25c38"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMzNTVmNGVmYmE0Y2ViYmJlNjZhN2YyZTIyM2JlYzA1OGNjZDM4N2U",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c355f4efba4cebbbe66a7f2e223bec058ccd387e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c355f4efba4cebbbe66a7f2e223bec058ccd387e",
+      "tree": {
+        "sha": "7f3c084f30be90ed840e270bc74a0d2bf05ba95e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/7f3c084f30be90ed840e270bc74a0d2bf05ba95e"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 7f3c084f30be90ed840e270bc74a0d2bf05ba95e\nparent d664c3d906fd0ff0c0e957d6a3adae656bc25c38\nauthor stickies-v <stickies-v@protonmail.com> 1768585661 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769021390 +0000\n\nkernel: implement structured logging C API\n\nReplace the string-based logging callback with btck_LogEntry containing\nfull metadata (message, source location, timestamp, level, category).\nThis lets consumers format and filter logs as needed.\n\nAdd btck_logging_set_min_level() for early filtering and remove functions\nthat are no longer needed (category enable/disable, formatting options).\nBuffering is removed from bitcoinkernel logging, messages are discarded when\nno callbacks are registered at the time they are produced.\n\nIntroduce KernelLogInit to create a minimal global Dispatcher for the\nkernel library, separate from BCLog::Logger used by the node. Add\nWARNING/ERROR log levels and ESTIMATEFEE/TXPACKAGES categories.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxIFQACgkQXLHObl5m\np1fKnw/9GgaarYtke93CeEPFjVS1rcMpwWk2BZajsNC6vqtrLl1vDicqtpP/wJf+\nLHUmhEs2xdLQmE23dZ4WjuLPFOrTD74Xp93C4egKkvwaz4sEdfBUlUvyEntliWSY\nxhL5ESQ5L5Ag5nX88mnFM7bi89UzhRKAGsNW4d6Qz2xYyrzF2BpF6OYu971XnsgD\n9s6f4g4llzDHM/e2FW0ZYXOUAEMmSjIxYDar/hF5npASbHQzqAMYwci5OQhfRelc\nZsiQGma8oZYeZhUVUEcei51xy4Zvon9a4UW9wYYn/5A9ySUUG2/N2MjQ7/beL2qL\nslTX680BviWA/1KcLioYEisAQoKoLJHdMaW+8ihvACzTpRsZz9luS48DWfTSxL6R\njyE3nyQTyNOIDCMXhx4PDZEZQsBkWuhcweD/g50qyax33nxyygqzXmQU5Bszbbw2\nJI3Hv+aQ7ONcMikID+eMliKn77k2cWEW7POkEquwYU64MscCpQW4i1xYRroewMHU\nXNf4ol9D2C080fSaNWwRkG0ziKegXg2VigtLpvuZs6guPYg+7ttaqUfFdrrbvKKg\nvkRiqh8wKu7eBmtRvx42UJyAePudkCDC7nr2eQPFM2nHXQRrvig1z18ZRzaoLEUo\nupd3jHzxl9XHqFcoluxkUybSf9dXs3PJrolkOTa3HVPADG5zGJg=\n=C09v\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d664c3d906fd0ff0c0e957d6a3adae656bc25c38",
+          "sha": "d664c3d906fd0ff0c0e957d6a3adae656bc25c38",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d664c3d906fd0ff0c0e957d6a3adae656bc25c38"
+        }
+      ],
+      "message": "kernel: implement structured logging C API\n\nReplace the string-based logging callback with btck_LogEntry containing\nfull metadata (message, source location, timestamp, level, category).\nThis lets consumers format and filter logs as needed.\n\nAdd btck_logging_set_min_level() for early filtering and remove functions\nthat are no longer needed (category enable/disable, formatting options).\nBuffering is removed from bitcoinkernel logging, messages are discarded when\nno callbacks are registered at the time they are produced.\n\nIntroduce KernelLogInit to create a minimal global Dispatcher for the\nkernel library, separate from BCLog::Logger used by the node. Add\nWARNING/ERROR log levels and ESTIMATEFEE/TXPACKAGES categories.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:49:50Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-16T17:47:41Z"
+      },
+      "sha": "c355f4efba4cebbbe66a7f2e223bec058ccd387e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDFkOGFiZjhkNzY4N2I4YzhmN2FlMTRjZTMyZGQwZGQ5NjBkZGI2ZWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee",
+      "tree": {
+        "sha": "e3aaa10eac72dcbb5edbf60fef83fc4673601eaa",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/e3aaa10eac72dcbb5edbf60fef83fc4673601eaa"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree e3aaa10eac72dcbb5edbf60fef83fc4673601eaa\nparent c355f4efba4cebbbe66a7f2e223bec058ccd387e\nauthor stickies-v <stickies-v@protonmail.com> 1768837129 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769021525 +0000\n\nmove-only: move logging categories to separate header\n\nLogging categories are currently shared between node and kernel. This\nseparation allows future commits to completely remove kernel's\ndependency on logging.h.\n\nAlso applies clang-format suggestions to the moved code.\n\nReview with --color-moved=dimmed-zebra --color-moved-ws=ignore-all-space\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxIFUACgkQXLHObl5m\np1eocw/+LBNhBb8oJuuZJ28Jz+d/O1UY9querCY7iwtXn0IGPO13cdA6kAdz1+Kf\nb+byFLNFwL2AWAxiIi0/JHg8pqBvFi4CuGARv7B4czsf7W+6PP6EWRaIHky4yAnp\nwaKw9vTY1RJj7ui0XycqA9yLwmQBltFthoJj6CWEahXf0gzbtXJgtwMFanAecdxr\noRN7wWrzBaxOXtxAcUW4s6vqlChs/SvflBxIc+k4nGDFhIrlF+UxlNNKwC6qTNny\ni9vQ9w6OSF2UnFs8u8ODibcBVWJD0aiiqQKYaNJsRZMHGzKw4fq6bMwDWxe+X71a\nSMtCZeOQ7y0O7uDjS0Ho6v2QX2QKAwBP6ENsl38km0VoFz6bRUu3VETg4gRRcrEi\nN+aLSIWJfkSmA+TerqZloxDolhuT+kh5B/Ugfh1I23QhBo5R8So14EvR2jjJHlzf\n/RpjDHuw71ViEXw+OsKxgzDRO3Up3/NiyPq0yAr+MY52RYtdU+cC4Ywk/2UYLK80\nlMfvSNV+IE/IOhjX6/HTf1g2Xec648QvtkpTCDXfFIvpynAbJYTRJaRrE7qDCNyq\nVPlRiodbDr6EEPiI8oapM5uOQgyNdCrfWxADmw4Ul4ZtrGTXhFGzK+wmdzmai5zg\nmU1cgVa4Ilyx2RPTAMqbuIPhJalmFJezmCKh9WP+llk6P7XAFRY=\n=s/EZ\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c355f4efba4cebbbe66a7f2e223bec058ccd387e",
+          "sha": "c355f4efba4cebbbe66a7f2e223bec058ccd387e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c355f4efba4cebbbe66a7f2e223bec058ccd387e"
+        }
+      ],
+      "message": "move-only: move logging categories to separate header\n\nLogging categories are currently shared between node and kernel. This\nseparation allows future commits to completely remove kernel's\ndependency on logging.h.\n\nAlso applies clang-format suggestions to the moved code.\n\nReview with --color-moved=dimmed-zebra --color-moved-ws=ignore-all-space",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:52:05Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-19T15:38:49Z"
+      },
+      "sha": "1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDExMjJjNjllYzI4MmFjZWQxNDA1MzE1YzdlNTllMzQ3NWZhMTY1NDM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1122c69ec282aced1405315c7e59e3475fa16543",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/1122c69ec282aced1405315c7e59e3475fa16543",
+      "tree": {
+        "sha": "377dc1ae7ecfa637bb66c47d8ad3c6d36f8cc6d1",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/377dc1ae7ecfa637bb66c47d8ad3c6d36f8cc6d1"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 377dc1ae7ecfa637bb66c47d8ad3c6d36f8cc6d1\nparent 1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee\nauthor stickies-v <stickies-v@protonmail.com> 1768926889 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769021525 +0000\n\nlogging: move LogAcceptCategory to util\n\nBoth kernel and node logic use this function to check whether\na log statement will actually be produced. Move it to util so kernel\ncode can continue using it without requiring logging.h.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxIFUACgkQXLHObl5m\np1eWQBAAgopL9oFiuw9zsFMzjt0PhGHBSBtVAR8RYioCZndrLGTDF+6RIbO4APP1\ncz1znbP9zSkA+y5DOm164P52a9Ei7ackRNh7+YNPsyl3mI//XQqzICU+DX1CnXsh\nIipZjDkH8e+TlrXfe4aEuPk05zzeCiNogc422N2yuoBe8IZpU5bPw3iIE3k2dXp0\nh1av8mQRUa1eGglvdRw52pOyu4q2goT91y4MiyAov/+GmXhdzI4LaL9TsVIEuTHb\n+0JYwowBDLyrIZt6PeXvslO+2pQInpkKdoS5quhgeGUdKMU+35fZL82qqe8cu1QA\ny1xky3HNQ8pGOFwU33jhzYX+I2cP9CYPlRk3zegoMMwgJNRjV8PQ3oyS1J0JxE81\nEolS8r3ut/Z5UrxEzY5ZOPGuejfb4GGyDClcJiueNbarS6tdzs1Jumx+Tpsr4qIs\nFSSmxZt/cVgY1BWJVbgJSteI33Ns5Nz+piF8yXvuT3oOEwzcRIfKU11gLkWR1X8a\nkJ2hgGjJbxCNxC024sIDit8JuHF/64q8WSYREWBx4bGrxG5Nf5PtzYSJbSkO6zBi\nJogwhvjOe2RLNmOgGqqCa58/VbcifZANVjRsZm442dAapb730mdwF74RJe0QgJRd\nW9dlW1tsqxke+dwwqeRVEKtKHmqyMbrO7mFDXGG8Bwvpe0orWfU=\n=I7gT\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee",
+          "sha": "1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/1d8abf8d7687b8c8f7ae14ce32dd0dd960ddb6ee"
+        }
+      ],
+      "message": "logging: move LogAcceptCategory to util\n\nBoth kernel and node logic use this function to check whether\na log statement will actually be produced. Move it to util so kernel\ncode can continue using it without requiring logging.h.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:52:05Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-20T16:34:49Z"
+      },
+      "sha": "1122c69ec282aced1405315c7e59e3475fa16543"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDJjYzg4MDE3MjA2YjJiMTFmZjkyYmE5OTE5MDJhNGYyNzRjOTgxOGQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2cc88017206b2b11ff92ba991902a4f274c9818d",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/2cc88017206b2b11ff92ba991902a4f274c9818d",
+      "tree": {
+        "sha": "2b3e5eb52c3884029d3d32cead0bc7b61c0718c7",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2b3e5eb52c3884029d3d32cead0bc7b61c0718c7"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 2b3e5eb52c3884029d3d32cead0bc7b61c0718c7\nparent 1122c69ec282aced1405315c7e59e3475fa16543\nauthor stickies-v <stickies-v@protonmail.com> 1768931459 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769021525 +0000\n\nlogging: move macros to util\n\nMove logging macros to util/log.h so the entire codebase can use the same\nmacros. Since (un)conditional logging is a node concept, it is no longer\nmentioned in the util macros. BCLog::Logger still maintains its logic to\nensure the log level never drops below Info.\n\nLogAcceptCategory is now called for all logging levels as an early-exit\ncheck, not just for Debug and Trace.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxIFUACgkQXLHObl5m\np1ciqhAAn8Sf73fJ8xFWWf16SPd7xcYBctNRFrTuEPvX6UmzypgVh5Ge6+ZU4ie5\nRNsF1Fpsu3DRYC00Bo8la62jz+0BAjms+E13IkGLiSes39xluPDHZoPONvPJgzZz\nkhR1iVemdW1YIQcMMO8dEnfdiQDLG6xUMWsPrMMOJrBleigKApxbupJoQ7HyK1Wv\nqc9hYRLAcWB80bMpXiXrJYZ2vRazxoQjKWK9WrsJamAabEI+91SHq9tmECI2mNI0\nug7wAXEUkHkPtkEWzJlMfY6GXlB4zB/atqXgg94GCpuJ6gqWyDfyk5p6p5/0Q9yT\n1WWfnPzg2bZ1HuHAhrBReRIe0cwTKWuAKc4Df5QD3NBYjhVW3u8QeCGgCIlYOn10\nnb8MyLXwxx1/LDSrnDaK/Sesin+NUb0zP1uMouwu9nuCTn1J1CmVh/vXzM6Z8KFW\nwksH3TQao591N6FtAs1kDoLqa2pmYQ7eJLy1djGP62G7k26hLe/Na/7XFqyTbbEP\naeo+wKrENCdUMy5U04Lr4kDw4i1TgmZzUd/5wmcSd/bun64ktFWrrSnOEj1zEaar\n91B+Li+HerTvySJFq2ivM8w3kGz08YISrTuJVqFJDAjfgEn/fBFFRxHUJO3o6Q7N\nyB6QCve1ToXsRaa6rn4a+j6v61uzIF3cPWyInu02H9yTqzSE3e0=\n=7DJP\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1122c69ec282aced1405315c7e59e3475fa16543",
+          "sha": "1122c69ec282aced1405315c7e59e3475fa16543",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/1122c69ec282aced1405315c7e59e3475fa16543"
+        }
+      ],
+      "message": "logging: move macros to util\n\nMove logging macros to util/log.h so the entire codebase can use the same\nmacros. Since (un)conditional logging is a node concept, it is no longer\nmentioned in the util macros. BCLog::Logger still maintains its logic to\nensure the log level never drops below Info.\n\nLogAcceptCategory is now called for all logging levels as an early-exit\ncheck, not just for Debug and Trace.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T18:52:05Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-20T17:50:59Z"
+      },
+      "sha": "2cc88017206b2b11ff92ba991902a4f274c9818d"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGUxYTU4YmNhYWFjZDYzZTEzZWI3YWY3NGQ5NWY0ZGMyMDY2YzA0NDg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e1a58bcaaacd63e13eb7af74d95f4dc2066c0448",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e1a58bcaaacd63e13eb7af74d95f4dc2066c0448",
+      "tree": {
+        "sha": "a527a25cfbef4a8f81a2be7fac5c1d82f1e6850b",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a527a25cfbef4a8f81a2be7fac5c1d82f1e6850b"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree a527a25cfbef4a8f81a2be7fac5c1d82f1e6850b\nparent 2cc88017206b2b11ff92ba991902a4f274c9818d\nauthor stickies-v <stickies-v@protonmail.com> 1768932359 +0000\ncommitter stickies-v <stickies-v@protonmail.com> 1769022499 +0000\n\nkernel: remove logging.cpp from library\n\nSince kernel code no longer requires logging.h, remove logging.cpp from\nthe kernel library, move it from util to common,  and update includes\nfrom logging.h to util/log.h.\n\nWith logging.cpp no longer linked into the kernel, SetDispatcher can now\nenforce that it is called exactly once.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEE5g/ggIZt5fccjfOgXLHObl5mp1cFAmlxJE4ACgkQXLHObl5m\np1dRkBAAm1lOnFGiIAkWYVf2vv1jhlR1+ClmTJbca0zBAqVKs4PMT2r7+JxRQNRK\nKua5Uw1yrM2AYW36uiecV+eIOfF4nZQozJcpyROUtDGioqFAT38u1vhRmggEo8kQ\noHA5TKggTv0aGsgoqJyj/faEUPukPoMpYz0OEbIPRc9JoYK9hRLF4j3hcoC46c/f\n9ewQondoU5G1kBbb6IXODFfToKFnyjOFE5gXG77ifdIhYroxtxMYgtpWO5TJedsj\ngfS67gjFEwsHIFH4qm6Zpq54ftKdIQMcKTQhjdjwibKvOowaYyQhvgnVg0Jthe3e\nx553cqwXNvnHLZeii4zqTtxu83QGp8d/cOp9t8wNFgNdvxc+UiArvser4Xog/YoP\nw/nhFyRjQJLvbhmkTiiSi8hM+X3EQC5c9pPO/ZLJnO2USj/3OnHnb25cCnc6cgWy\noC46tzqBTIiP8oN5q+czeavPpxbMpWp5hpN+D1amxAigjq6342zhhZofeUJPJ5TG\nkQhnciuBiHt+MHlXsTu6P44r0WfQmji21v/N+yiCl0nQLCIOTMIhMM7AhVdHF40O\nx7ZJ3R1bxgGeVIZiXb4hsbUVvan8jZNoFTy5Cx2QYMsq1bLRUWcfDR/wFOqNolr6\nXsLjirf/8lV6Y/S9mU2ydplCOwJoHkl9VaOuG7VhsI44OQIT1IM=\n=99Ej\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2cc88017206b2b11ff92ba991902a4f274c9818d",
+          "sha": "2cc88017206b2b11ff92ba991902a4f274c9818d",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/2cc88017206b2b11ff92ba991902a4f274c9818d"
+        }
+      ],
+      "message": "kernel: remove logging.cpp from library\n\nSince kernel code no longer requires logging.h, remove logging.cpp from\nthe kernel library, move it from util to common,  and update includes\nfrom logging.h to util/log.h.\n\nWith logging.cpp no longer linked into the kernel, SetDispatcher can now\nenforce that it is called exactly once.",
+      "committer": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-21T19:08:19Z"
+      },
+      "author": {
+        "name": "stickies-v",
+        "email": "stickies-v@protonmail.com",
+        "date": "2026-01-20T18:05:59Z"
+      },
+      "sha": "e1a58bcaaacd63e13eb7af74d95f4dc2066c0448"
+    },
+    {
+      "event": "labeled",
+      "id": 22197860716,
+      "node_id": "LE_lADOABII587k3qzYzwAAAAUrGHls",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/22197860716",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-01-21T19:56:49Z",
+      "label": {
+        "name": "Validation",
+        "color": "6060aa"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 3780876862,
+      "node_id": "IC_kwDOABII587hW5o-",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3780876862",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-01-21T19:56:55Z",
+      "updated_at": "2026-01-21T19:58:06Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/34374.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\nA summary of reviews will appear here.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible places where named args for integral literals may be used (e.g. `func(x, /*named_arg=*/0)` in C++, and `func(x, named_arg=0)` in Python):\n\n- dispatcher.Log(Level::Trace, 0, __func__, false, \"trace\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Info, 0, __func__, false, \"info\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Error, 0, __func__, false, \"error\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Trace, 0, __func__, false, \"skipped\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Debug, 0, __func__, false, \"logged\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Info, test_category, {__func__}, /*should_ratelimit=*/true, \"test message %d\", 123) in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Info, 0, __func__, false, \"test\") in src/test/util_log_tests.cpp\n- dispatcher.Log(Level::Info, 0, __func__, /*should_ratelimit=*/false, \"test\") in src/test/util_log_tests.cpp\n\n(Note: these are calls added in tests where the 4th (and later) positional argument is a literal like true/false.)\n\n\n\n<sup>2026-01-21</sup>\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34374#issuecomment-3780876862",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34374"
+    }
+  ],
+  "comments": []
+}
