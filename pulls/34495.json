@@ -43,7 +43,7 @@
     "body": "This drops our dependency on `boost::signals2`, leaving `boost::multi_index` as the only remaining boost dependency for bitcoind.\r\n\r\n`boost::signals2` is a complex beast, but we only use a small portion of it. Namely: it's a way for multiple subscribers to connect to the same event, and the ability to later disconnect individual subscribers from that event.\r\n\r\n`btcsignals` adheres to the subset of the `boost::signals2` API that we currently use, and thus is a drop-in replacement. Rather than implementing a complex `slot` tracking class that we never used anyway (and which was much more useful in the days before std::function existed), callbacks are simply wrapped directly in `std::function`s.\r\n\r\nThe new tests work with either `boost::signals2` or the new `btcsignals` implementation. Reviewers can verify\r\nfunctional equivalency by running the tests in the commit that introduces them against `boost::signals2`, then again with `btcsignals`.\r\n\r\nThe majority of the commits in this PR are preparation and cleanup. Once `boost::signals2` is no longer needed, it is removed from depends. Additionally, a few CMake targets no longer need boost includes as they were previously only required for signals.\r\n\r\nI think this is actually pretty straightforward to review. I kept things simple, including keeping types unmovable/uncopyable where possible rather than trying to define those semantics. In doing so, the new implementation has even fewer type requirements than boost, which I believe is due to a boost bug. I've opened a PR upstream for that to attempt to maintain parity between the implementations.\r\n\r\nSee individual commits for more details.\r\n\r\nCloses #26442.",
     "labels": [],
     "created_at": "2026-02-03T21:27:43Z",
-    "updated_at": "2026-02-13T00:59:26Z",
+    "updated_at": "2026-02-13T01:16:07Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -343,7 +343,7 @@
     "deletions": 77,
     "changed_files": 20,
     "commits": 13,
-    "review_comments": 12,
+    "review_comments": 14,
     "comments": 22
   },
   "events": [
@@ -3617,6 +3617,114 @@
       "start_side": null,
       "line": 245,
       "original_line": 245,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2801803349",
+      "pull_request_review_id": 3794547267,
+      "id": 2801803349,
+      "node_id": "PRRC_kwDOABII586nACBV",
+      "diff_hunk": "@@ -0,0 +1,255 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#ifndef BITCOIN_BTCSIGNALS_H\n+#define BITCOIN_BTCSIGNALS_H\n+\n+#include <sync.h>\n+\n+#include <functional>\n+#include <memory>\n+#include <optional>\n+#include <vector>\n+\n+/**\n+ * btcsignals is a simple mechanism for signaling events to multiple subscribers.\n+ * It is api-compatible with a minimal subset of boost::signals2.\n+ *\n+ * Rather than using a custom slot type, and the features/complexity that they\n+ * imply, std::function is used to store the callbacks. Lifetime management of\n+ * the callbacks is left up to the user.\n+ *\n+ * All usage is thread-safe except for interacting with a connection while\n+ * copying/moving it on another thread.\n+ */\n+\n+namespace btcsignals {\n+\n+/*\n+ * optional_last_value is the default and only supported combiner.\n+ * As such, its behavior is embedded into the signal functor.\n+ *\n+ * Because optional<void> is undefined, void must be special-cased.\n+ */\n+\n+template <typename T>\n+class optional_last_value\n+{\n+public:\n+    using result_type = std::conditional_t<std::is_void_v<T>, void, std::optional<T>>;\n+};\n+\n+template <typename Signature, typename Combiner = optional_last_value<typename std::function<Signature>::result_type>>\n+class signal;\n+\n+/*\n+ * State object representing the liveness of a registered callback.\n+ * signal::connect() returns an enabled connection which can be held and\n+ * disabled in the future.\n+ */\n+class connection\n+{\n+    template <typename Signature, typename Combiner>\n+    friend class signal;\n+\n+    /*\n+     * Tag for the constructor used by signal.\n+     */\n+    struct enabled_tag_type {\n+    };\n+    static constexpr enabled_tag_type enabled_tag{};\n+\n+    /**\n+     * connections have shared_ptr-like copy and move semantics.\n+     */\n+    std::shared_ptr<std::atomic_bool> m_connected{};\n+\n+    /**\n+     * Only a signal can create an enabled connection.\n+     */\n+    explicit connection(enabled_tag_type /*unused*/) : m_connected{std::make_shared<std::atomic_bool>(true)} {}\n+\n+public:\n+    /**\n+     * The default constructor creates a connection with no associated signal\n+     */\n+    constexpr connection() noexcept = default;\n+\n+    /**\n+     * If a callback is associated with this connection, prevent it from being\n+     * called in the future.\n+     *\n+     * If a connection is disabled as part of a signal's callback function, it\n+     * will _not_ be executed in the current signal invocation.\n+     *\n+     * Note that disconnected callbacks are not removed from their owning\n+     * signals here. They are garbage collected in signal::connect().\n+     */\n+    void disconnect()\n+    {\n+        if (m_connected) {\n+            m_connected->store(false);\n+        }\n+    }\n+\n+    /**\n+     * Returns true if this connection was created by a signal and has not been\n+     * disabled.\n+     */\n+    bool connected() const\n+    {\n+        return m_connected && m_connected->load();\n+    }\n+};\n+\n+/*\n+ * RAII-style connection management\n+ */\n+class scoped_connection\n+{\n+    connection m_conn;\n+\n+public:\n+    scoped_connection(connection rhs) noexcept : m_conn{std::move(rhs)} {}\n+\n+    scoped_connection(scoped_connection&&) noexcept = default;\n+    scoped_connection& operator=(scoped_connection&&) noexcept = delete;\n+\n+    /**\n+     * For simplicity, disable copy assignment and construction.\n+     */\n+    scoped_connection& operator=(const scoped_connection&) = delete;\n+    scoped_connection(const scoped_connection&) = delete;\n+\n+    void disconnect()\n+    {\n+        m_conn.disconnect();\n+    }\n+\n+    ~scoped_connection()\n+    {\n+        disconnect();\n+    }\n+};\n+\n+/*\n+ * Functor for calling zero or more connected callbacks\n+ */\n+template <typename Signature, typename Combiner>\n+class signal\n+{\n+    using function_type = std::function<Signature>;\n+\n+    static_assert(std::is_same_v<Combiner, optional_last_value<typename function_type::result_type>>, \"only the optional_last_value combiner is supported\");\n+\n+    /*\n+     * Helper struct for maintaining a callback and its associated connection\n+     */\n+    struct connection_holder {\n+        template <typename Callable>\n+        connection_holder(Callable&& callback) noexcept : m_callback{std::forward<Callable>(callback)}",
+      "path": "src/btcsignals.h",
+      "position": 151,
+      "original_position": 151,
+      "commit_id": "5e088b91b2e4b1c949a7425dc9f96fc28649133c",
+      "original_commit_id": "5e088b91b2e4b1c949a7425dc9f96fc28649133c",
+      "in_reply_to_id": 2801745971,
+      "user": {
+        "login": "theuni",
+        "id": 417043,
+        "node_id": "MDQ6VXNlcjQxNzA0Mw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/417043?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/theuni",
+        "html_url": "https://github.com/theuni",
+        "followers_url": "https://api.github.com/users/theuni/followers",
+        "following_url": "https://api.github.com/users/theuni/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/theuni/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/theuni/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/theuni/subscriptions",
+        "organizations_url": "https://api.github.com/users/theuni/orgs",
+        "repos_url": "https://api.github.com/users/theuni/repos",
+        "events_url": "https://api.github.com/users/theuni/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/theuni/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "No, but looking again, I suppose the callback's move ctor could. I'll make this change to be safe.",
+      "created_at": "2026-02-13T01:15:37Z",
+      "updated_at": "2026-02-13T01:15:37Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34495#discussion_r2801803349",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2801803349"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34495"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 151,
+      "original_line": 151,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2801804705",
+      "pull_request_review_id": 3794549613,
+      "id": 2801804705,
+      "node_id": "PRRC_kwDOABII586nACWh",
+      "diff_hunk": "@@ -0,0 +1,281 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <btcsignals.h>\n+#include <test/util/setup_common.h>\n+\n+#include <boost/test/unit_test.hpp>\n+\n+namespace {\n+\n+\n+struct moveonly_data\n+{\n+    moveonly_data(int data) : m_data(data){}\n+    moveonly_data(moveonly_data&&) = default;\n+\n+    moveonly_data& operator=(moveonly_data&&) = delete;\n+    moveonly_data(const moveonly_data&) = delete;\n+    moveonly_data& operator=(const moveonly_data&) = default;",
+      "path": "src/test/btcsignals_tests.cpp",
+      "position": 20,
+      "original_position": 20,
+      "commit_id": "5e088b91b2e4b1c949a7425dc9f96fc28649133c",
+      "original_commit_id": "5e088b91b2e4b1c949a7425dc9f96fc28649133c",
+      "in_reply_to_id": 2801754527,
+      "user": {
+        "login": "theuni",
+        "id": 417043,
+        "node_id": "MDQ6VXNlcjQxNzA0Mw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/417043?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/theuni",
+        "html_url": "https://github.com/theuni",
+        "followers_url": "https://api.github.com/users/theuni/followers",
+        "following_url": "https://api.github.com/users/theuni/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/theuni/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/theuni/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/theuni/subscriptions",
+        "organizations_url": "https://api.github.com/users/theuni/orgs",
+        "repos_url": "https://api.github.com/users/theuni/repos",
+        "events_url": "https://api.github.com/users/theuni/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/theuni/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Looks right, thanks.",
+      "created_at": "2026-02-13T01:16:07Z",
+      "updated_at": "2026-02-13T01:16:07Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34495#discussion_r2801804705",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2801804705"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34495"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 20,
+      "original_line": 20,
       "side": "RIGHT"
     }
   ]
