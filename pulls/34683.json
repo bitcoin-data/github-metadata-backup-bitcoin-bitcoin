@@ -43,13 +43,15 @@
     "body": "Ref #29912.\r\n\r\nThis draft PR adds a machine-readable[ OpenRPC](https://www.open-rpc.org/) 1.3.2 specification of out JSON-RPC interface, auto-generated from existing `RPCHelpMan` metadata.\r\n\r\nThere is currently no formal, machine-readable specification of the RPC API. As discussed in #29912, this has knock-on consequences:\r\n\r\n- Client libraries re-implement the API manually, leading to bugs like unit mistakes (sats vs BTC, vB vs kvB) and missing/incorrect argument types. No existing client library fully and correctly implements the API in a type-safe manner.\r\n- When the API changes, every downstream client must manually discover and adapt, creating downstream maintenance burden. There is no artifact they can diff between releases.\r\n- Implementing a new client in a new language requires reading C++ source or help text and transcribing it, which is error-prone and tedious, and represents an on-going porting cost.\r\n- Existing documentation is either stale or not machine-readable. The developer.bitcoin.org docs are wrong/outdated in places, and the bitcoincore.org/en/doc/ pages are rendered from help output but not in a standard schema format.\r\n- (new/extra) AI/LLM tooling increasingly builds on structured API specifications. A standard spec format enables AI-assisted client generation and integration without the ambiguity of parsing human-readable help text.\r\n\r\nThis draft builds on prior art by @casey and the observations by @laanwj, @stickies-v, @kilianmh, @hodlinator, and @cdecker in #29912. Casey's work demonstrated that RPCHelpMan already contains all the structured information needed, which makes this feasible without duplicating any API definitions.\r\n\r\nThis differs from Casey's branches in two ways: i) it uses the OpenRPC standard rather than an ad-hoc format or raw JSON Schema, and ii) it generates a static artifact checked into the repo rather than exposing a new RPC command.\r\n\r\n### Why OpenRPC\r\n\r\nI seletced OpenRPC for a number of reasons:\r\n\r\n- It's purpose-built for JSON-RPC APIs (suggested by @stickies-v, @nflatrea, and @kilianmh).\r\n- It wraps JSON schema for params/results, so consumers get both the method-level structure and the type-level schemas.\r\n- Unlike OpenAPI, it is not path-centric, which better fits our single-endpoint JSON-RPC model (concern raised by @hodlinator).\r\n  - Although it therefore does not cover our REST interface.\r\n- It's _kind of_ a standard format with (_some_) existing tooling for type generation (TypeScript, Rust, Python, Go) and client scaffolding, though maturity varies by language. More importantly though, IMO, a ~standardised format is inherently more useful than any ad-hoc one: any JSON Schema validator works, any LLM can consume it directly, and anyone can write a bespoke generator against a known schema rather than parsing help text.\r\n\r\n### Approach\r\n\r\nC++ `RPCHelpMan` definitions\r\n    → `ToDescriptionValue()` methods (new)\r\n    → `help dump_all_command_descriptions` (new internal RPC)\r\n    → Python gen-openrpc.py\r\n    → doc/openrpc.json (the artifact that gets committed)\r\n\r\nThe Python generator is a pure transformer from Bitcoin Core's internal type vocabulary to OpenRPC/JSON Schema and the single source of truth therefore remains as the C++ `RPCHelpMan` definitions.\r\n\r\nThe rationale for implementing this as using a python transformer, rather than adding a native rpc which emits openrpc schema directly, is mainly that I consider the openrpc format/schema to not really belong in the bitcoin core binary, much like e.g. manpage generation. Also, it's much easier to transform in python than using univalue in cpp :) The tradeoff is that being able to emit the \"active spec\" from a running binary, which admittedly would be pretty nice.\r\n\r\n#### Does this belong in this repo?\r\n\r\nThis begs the question: does this belong in bitcoin/bitcoin at all? Perhaps not. We could choose take only the cpp changes here, and support the new `dump_all_command_descriptions` RPC, and move the python generator functions into a seperate repo. Which is quite a nice option from a maintenance PoV, especially considering I added a function test, which could irritate devs changing RPCs (see below).\r\n\r\n### Tradeoffs\r\n\r\nvs an ad-hoc format OpenRPC gives us interoperability with the (admittedly surprisingly limited) tooling, documentation generators, code generators, and validators, at the cost of needing x-bitcoin-* extensions for Bitcoin-specific concepts. As Casey noted after trying both approaches, JSON Schema \"is probably not a great fit\". OpenRPC's method-level framing on top of JSON Schema addresses the ergonomic issues while keeping the schema benefits. After testing both, I think I agree.\r\n\r\nStatic artifact vs live RPC: As noted above, the spec is a living commited file in the repo. This means at checkout (or release) the file will always match, although it does not consider when optional modules are not built (e.g. wallet, external signer, zmq). it could also cause more work for devs who change an rpc, as the workflow may involve:\r\n\r\n```bash\r\nchange rpc -> notice rpc_openrpc.py test failure -> copy/commit updated schema from failure dump -> re-run\r\n```\r\n\r\nI haven't thought of a good way around this yet, other than not testing the spec file, and relying on remembering to update it at release time... Having this be a \"live rpc\" would generally avoid this.\r\n\r\nTypes: JSON Schema cannot natively express units like \"BTC/kvB\" or semantic distinctions like \"this hex string is a txid.\" These are preserved in description text and x-bitcoin-type-str extensions, but are *not* machine-enforceable from the schema alone. This was recognized as a fundamental limitation by several commenters in the issue. Future work could enrich the x-bitcoin-* extensions with a more structured unit vocabulary.\r\n\r\nSome RPCs return different types depending on argument values (e.g. verbosity levels). These are represented as `oneOf` in the result schema with free-text condition descriptions. This is accurate but not fully machine-parseable — a code generator cannot automatically determine which result variant corresponds to which argument value without parsing the description. I still we have enough information to satisfy humans an agents alike though.\r\n\r\n### Regenerating the spec\r\n\r\nWhen any RPC method's signature, arguments, or results change, the rpc_openrpc.py functional test will fail. To regenerate, something like the following can be run:\r\n\r\n```bash\r\ncmake -B build --preset dev-mode\r\ncmake --build build -j$(nproc)\r\n./build/bin/bitcoind -daemon\r\ncontrib/devtools/gen-openrpc.py --output doc/openrpc.json -c ./build/bin/bitcoin-cli\r\n./build/bin/bitcoin-cli stop\r\n```\r\n\r\nThe build must have wallet, ZMQ, and external signer enabled (the default dev-mode preset works).\r\n\r\nIf the failure is emitted from CI, where all modules are already built, the test is currently programmed to emit what it believes the correct spec is, which the author can copy, diff, and commit if in agreement.\r\n\r\nThe idea is to try ang guarantee that the spec never silently drifts from the implementation, make RPC changes self-documenting, and catch missing regeneration before merge.\r\n\r\nHowever, this adds a manual regeneration step to the workflow when modifying RPCs. This mirrors the existing pattern for gen-manpages.py and gen-bitcoin-conf.sh, although these don't have tests that fail on PRs...\r\n\r\n### Discussion questions\r\n\r\n- Is this valuable/wanted?\r\n- If so, should it live in this repo?\r\n- Do we like openrpc format? (less relevant if we don't want this in this repo, as another repo could generate one or many definitions).\r\n\r\nMy personal thoughts are that this is very nice to have, but we might want to consider housing the python and json in a different repo, although having the schema tightly-coupled to any commit in this repo, is quite nice.",
     "labels": [],
     "created_at": "2026-02-26T15:22:35Z",
-    "updated_at": "2026-02-27T11:47:17Z",
-    "mergeable_state": "unknown",
+    "updated_at": "2026-02-27T12:17:25Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
     "merged": false,
     "merge_commit_sha": "99162e91be40c682db53eb20063c65ee2c6f2edd",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
+    "rebaseable": true,
     "head": {
       "label": "willcl-ark:json-rpc-schema",
       "ref": "json-rpc-schema",
@@ -290,9 +292,9 @@
         "forks_count": 38773,
         "stargazers_count": 88287,
         "watchers_count": 88287,
-        "size": 306077,
+        "size": 306101,
         "default_branch": "master",
-        "open_issues_count": 717,
+        "open_issues_count": 716,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -309,9 +311,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-02-27T11:59:15Z",
+        "pushed_at": "2026-02-27T12:15:16Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-02-27T11:59:24Z",
+        "updated_at": "2026-02-27T12:21:13Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -341,8 +343,8 @@
     "deletions": 1,
     "changed_files": 13,
     "commits": 4,
-    "review_comments": 2,
-    "comments": 4
+    "review_comments": 3,
+    "comments": 5
   },
   "events": [
     {
@@ -1247,6 +1249,64 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/34683#issuecomment-3970664154",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34683"
+    },
+    {
+      "event": "commented",
+      "id": 3972643262,
+      "node_id": "IC_kwDOABII587sybm-",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/3972643262",
+      "actor": {
+        "login": "ajtowns",
+        "id": 127186,
+        "node_id": "MDQ6VXNlcjEyNzE4Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/127186?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ajtowns",
+        "html_url": "https://github.com/ajtowns",
+        "followers_url": "https://api.github.com/users/ajtowns/followers",
+        "following_url": "https://api.github.com/users/ajtowns/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ajtowns/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ajtowns/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ajtowns/subscriptions",
+        "organizations_url": "https://api.github.com/users/ajtowns/orgs",
+        "repos_url": "https://api.github.com/users/ajtowns/repos",
+        "events_url": "https://api.github.com/users/ajtowns/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ajtowns/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-02-27T12:15:10Z",
+      "updated_at": "2026-02-27T12:15:10Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "> → Python gen-openrpc.py\r\n> → doc/openrpc.json (the artifact that gets committed)\r\n\r\nI don't really see why it wouldn't be better to have a `getopenrpcinfo` command that returns the json directly, giving you a direct report of the interface your bitcoind supports (whether the wallet or zmq is compiled in or not). Is there any reason you need python code to do the conversion rather than having it be built in to the bitcoind binary?\r\n\r\nIf people want to grab the artifact from the web instead of their node, then providing a url on bitcoincore.org (like https://bitcoincore.org/en/doc/30.0.0/rpc/network/disconnectnode/ eg) seems plausible enough.\r\n\r\nHaving the json output in the repo just seems annoying to me; more data, more conflicts, more diffs to check, more things you have to manually mess around with that could be automated.\r\n\r\nFor the test suite, picking a rarely updated but somewhat interesting RPC, and checking that the \"getopenrpcinfo\" result for that command matches a fixed value, and that the commands listed match the output of \"help\" is probably fine, or at least seems like it would be to me.\r\n\r\nOpenRPC seems fine to me; doesn't seem like there's much benefit in worrying about the details, beyond getting something that's moderately machine readable.",
+      "user": {
+        "login": "ajtowns",
+        "id": 127186,
+        "node_id": "MDQ6VXNlcjEyNzE4Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/127186?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ajtowns",
+        "html_url": "https://github.com/ajtowns",
+        "followers_url": "https://api.github.com/users/ajtowns/followers",
+        "following_url": "https://api.github.com/users/ajtowns/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ajtowns/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ajtowns/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ajtowns/subscriptions",
+        "organizations_url": "https://api.github.com/users/ajtowns/orgs",
+        "repos_url": "https://api.github.com/users/ajtowns/repos",
+        "events_url": "https://api.github.com/users/ajtowns/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ajtowns/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34683#issuecomment-3972643262",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34683"
     }
   ],
   "comments": [
@@ -1346,6 +1406,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2863949407"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34683"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 36,
+      "original_line": 36,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2864067775",
+      "pull_request_review_id": 3866651670,
+      "id": 2864067775,
+      "node_id": "PRRC_kwDOABII586qtjS_",
+      "diff_hunk": "@@ -0,0 +1,45 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026 The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Check that doc/openrpc.json is in sync with RPC metadata.\"\"\"\n+\n+import json\n+import sys\n+from pathlib import Path\n+\n+from test_framework.test_framework import BitcoinTestFramework\n+\n+\n+class OpenRPCDocTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+\n+    def skip_test_if_missing_module(self):\n+        self.skip_if_no_wallet()\n+        self.skip_if_no_bitcoind_zmq()\n+        self.skip_if_no_external_signer()\n+\n+    def run_test(self):\n+        srcdir = Path(self.config[\"environment\"][\"SRCDIR\"])\n+        sys.path.insert(0, str(srcdir / \"contrib\" / \"devtools\"))\n+        from openrpc import build_openrpc  # ty: ignore[unresolved-import]\n+\n+        self.log.info(\"Collecting structured RPC command descriptions\")\n+        descriptions = self.nodes[0].help(\"dump_all_command_descriptions\")\n+        generated = build_openrpc(descriptions)\n+\n+        openrpc_path = srcdir / \"doc\" / \"openrpc.json\"\n+        committed = json.loads(openrpc_path.read_text(encoding=\"utf-8\"))\n+\n+        if generated != committed:\n+            self.log.info(\"Generated doc/openrpc.json:\\n%s\",",
+      "path": "test/functional/rpc_openrpc.py",
+      "position": 36,
+      "original_position": 36,
+      "commit_id": "2846fab06d2c5f8da3bfe5fc98f72553c117cbc1",
+      "original_commit_id": "2846fab06d2c5f8da3bfe5fc98f72553c117cbc1",
+      "in_reply_to_id": 2860133219,
+      "user": {
+        "login": "maflcko",
+        "id": 6399679,
+        "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I am also thinking about devs on platforms that do not support a full build (IIRC external signer was not present on  Windows for some time?). I guess they could manually undo the hunk that removes the $feature-related RPC from the json, or copy-paste the full json output from the CI log somehow.\r\n\r\nIn any case, either way seems fine and should be trivial to adjust post-merge. This is just a nit.",
+      "created_at": "2026-02-27T12:17:25Z",
+      "updated_at": "2026-02-27T12:17:25Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34683#discussion_r2864067775",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2864067775"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34683"
