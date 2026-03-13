@@ -43,7 +43,7 @@
     "body": "This is an alternative approach to implement `dumptxoutset` with rollback that was discussed a few times. It does not rely on `invalidateblock` and `reconsiderblock` and instead creates a temporary copy of the coins DB, modifies this copy by rolling back as many blocks as necessary and then creating the dump from this temp copy DB. See also https://github.com/bitcoin/bitcoin/pull/29553#issuecomment-1978480989, https://github.com/bitcoin/bitcoin/issues/32817#issuecomment-3012406102 and #29565 discussions.\r\n\r\nThe nice side-effects of this are that forks can not interfere with the rollback and network activity does not have to be suspended. But there are also some downsides when comparing to the current approach: this does require some additional disk space for the copied coins DB and performance is slower (master took 3m 17s vs 9m 16s in my last test with the code here, rolling back ~1500 blocks). However, there is also not much code being added here, network can stay active throughout and performance would stay constant with this approach while it would impact master if there were forks that needed to be invalidated as well (see #33444 for the alternative approach), so this could still be considered a good trade-off.",
     "labels": [],
     "created_at": "2025-09-24T21:15:11Z",
-    "updated_at": "2026-03-13T11:50:05Z",
+    "updated_at": "2026-03-13T19:05:33Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -200,7 +200,7 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 292765,
+        "size": 292784,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -334,12 +334,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38817,
-        "stargazers_count": 88462,
-        "watchers_count": 88462,
+        "forks_count": 38823,
+        "stargazers_count": 88465,
+        "watchers_count": 88465,
         "size": 309875,
         "default_branch": "master",
-        "open_issues_count": 691,
+        "open_issues_count": 694,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -358,7 +358,7 @@
         "visibility": "public",
         "pushed_at": "2026-03-13T10:17:11Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-03-13T11:54:53Z",
+        "updated_at": "2026-03-13T18:53:25Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -388,7 +388,7 @@
     "deletions": 117,
     "changed_files": 3,
     "commits": 3,
-    "review_comments": 25,
+    "review_comments": 26,
     "comments": 14
   },
   "events": [
@@ -3225,6 +3225,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2930710051"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33477"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3207,
+      "original_line": 3207,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2933248472",
+      "pull_request_review_id": 3946372449,
+      "id": 2933248472,
+      "node_id": "PRRC_kwDOABII586u1dHY",
+      "diff_hunk": "@@ -3208,6 +3134,152 @@ static RPCHelpMan dumptxoutset()\n     };\n }\n \n+/**\n+ * RAII class that creates a temporary database directory in its constructor\n+ * and removes it in its destructor.\n+ */\n+class TemporaryUTXODatabase\n+{\n+    fs::path m_path;\n+public:\n+    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {\n+        fs::create_directories(m_path);\n+    }\n+    ~TemporaryUTXODatabase() {\n+        try {\n+            fs::remove_all(m_path);\n+        } catch (...) {\n+            LogInfo(\"Failed to clean up temporary UTXO database at %s, please remove it manually.\",\n+                    fs::PathToString(m_path));\n+        }\n+    }\n+};\n+\n+UniValue CreateRolledBackUTXOSnapshot(\n+    NodeContext& node,\n+    Chainstate& chainstate,\n+    const CBlockIndex* target,\n+    AutoFile&& afile,\n+    const fs::path& path,\n+    const fs::path& tmppath)\n+{\n+    // Create a temporary leveldb to store the UTXO set that is being rolled back\n+    std::string temp_db_name{strprintf(\"temp_utxo_%d\", target->nHeight)};\n+    fs::path temp_db_path{fsbridge::AbsPathJoin(tmppath.parent_path(), fs::u8path(temp_db_name))};\n+    TemporaryUTXODatabase temp_db_cleaner{temp_db_path};\n+\n+    // Create temporary database\n+    DBParams db_params{\n+        .path = temp_db_path,\n+        .cache_bytes = size_t(1) << 24,  // 16MB cache\n+        .memory_only = false,\n+        .wipe_data = true,\n+        .obfuscate = false,\n+        .options = DBOptions{}\n+    };\n+\n+    std::unique_ptr<CCoinsViewDB> temp_db = std::make_unique<CCoinsViewDB>(\n+        std::move(db_params),\n+        CoinsViewOptions{}\n+    );\n+\n+    LogInfo(\"Copying current UTXO set to temporary database.\");\n+    {\n+        WITH_LOCK(::cs_main, chainstate.ForceFlushStateToDisk());\n+        CCoinsViewCache temp_cache(temp_db.get());\n+        temp_cache.SetBestBlock(chainstate.m_chain.Tip()->GetBlockHash());\n+\n+        std::unique_ptr<CCoinsViewCursor> cursor;\n+        WITH_LOCK(::cs_main, cursor = chainstate.CoinsDB().Cursor());\n+\n+        size_t coins_count = 0;\n+        while (cursor->Valid()) {\n+            node.rpc_interruption_point();\n+\n+            COutPoint key;\n+            Coin coin;\n+            if (cursor->GetKey(key) && cursor->GetValue(coin)) {\n+                temp_cache.AddCoin(key, std::move(coin), false);\n+                coins_count++;\n+\n+                // Log every 10M coins (optimized for mainnet)\n+                if (coins_count % 10'000'000 == 0) {\n+                    LogInfo(\"Copying UTXO set: %uM coins copied.\", coins_count / 1'000'000);",
+      "path": "src/rpc/blockchain.cpp",
+      "position": 233,
+      "original_position": 233,
+      "commit_id": "9da705c471c2ef50aa1adda5b0a3608688262a19",
+      "original_commit_id": "fde5f967774f84a534e7048386673a7b6d10a77e",
+      "in_reply_to_id": 2926506077,
+      "user": {
+        "login": "theStack",
+        "id": 91535,
+        "node_id": "MDQ6VXNlcjkxNTM1",
+        "avatar_url": "https://avatars.githubusercontent.com/u/91535?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/theStack",
+        "html_url": "https://github.com/theStack",
+        "followers_url": "https://api.github.com/users/theStack/followers",
+        "following_url": "https://api.github.com/users/theStack/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/theStack/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/theStack/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/theStack/subscriptions",
+        "organizations_url": "https://api.github.com/users/theStack/orgs",
+        "repos_url": "https://api.github.com/users/theStack/repos",
+        "events_url": "https://api.github.com/users/theStack/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/theStack/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I agree that none of the mentioned ideas are worth it the additional code complexity / performance penalty just for nicer log messages (though it's interesting to reason about them, even if they are dirty :-)). Forgot to mention that in my review yesterday, but for the rollback a progress could be added though, as in that case the necessary information is available, e.g. \"Rolled back 500/52000 blocks\" (maybe even show the percentage if we want to be extra fancy). But even that I would consider a non-blocking nit.",
+      "created_at": "2026-03-13T19:05:33Z",
+      "updated_at": "2026-03-13T19:08:40Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33477#discussion_r2933248472",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2933248472"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33477"
