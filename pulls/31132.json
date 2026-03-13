@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2024-10-22T14:40:28Z",
-    "updated_at": "2026-03-13T11:33:48Z",
+    "updated_at": "2026-03-13T15:14:44Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -298,12 +298,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38817,
-        "stargazers_count": 88462,
-        "watchers_count": 88462,
+        "forks_count": 38822,
+        "stargazers_count": 88464,
+        "watchers_count": 88464,
         "size": 309875,
         "default_branch": "master",
-        "open_issues_count": 691,
+        "open_issues_count": 693,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -322,7 +322,7 @@
         "visibility": "public",
         "pushed_at": "2026-03-13T10:17:11Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-03-13T11:54:53Z",
+        "updated_at": "2026-03-13T13:19:27Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -352,7 +352,7 @@
     "deletions": 23,
     "changed_files": 6,
     "commits": 12,
-    "review_comments": 460,
+    "review_comments": 462,
     "comments": 85
   },
   "events": [
@@ -40515,6 +40515,114 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2927292589"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31132"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 736,
+      "original_line": 736,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2931851204",
+      "pull_request_review_id": 3944762284,
+      "id": 2931851204,
+      "node_id": "PRRC_kwDOABII586uwH_E",
+      "diff_hunk": "@@ -527,24 +541,269 @@ class CCoinsViewCache : public CCoinsViewBacked\n };\n \n /**\n- * CCoinsViewCache overlay that avoids populating/mutating parent cache layers on cache misses.\n+ * CCoinsViewCache subclass that asynchronously fetches all block inputs in parallel during ConnectBlock without\n+ * mutating the base cache.\n+ *\n+ * Only used in ConnectBlock to pass as an ephemeral view that can be reset if the block is invalid.\n+ * It provides the same interface as CCoinsViewCache. It overrides all methods that mutate base,\n+ * stopping threads before calling superclass.\n+ * It adds an additional StartFetching method to provide the block.\n+ *\n+ * When a block is passed to StartFetching, the inputs of the block are flattened into a vector of InputToFetch\n+ * objects. A sorted vector of \"quick hashes\" of all block txids (m_txids) is also constructed. StartFetching then\n+ * submits worker tasks to a ThreadPool and keeps the returned futures alive until fetching is stopped.\n+ *\n+ * ProcessInput() atomically fetches and increments m_input_head, so each thread can only access a single element of the\n+ * m_inputs vector at a time. Workers race to claim inputs, so they may fetch elements in any order. If the fetched\n+ * index is greater than the size of m_inputs, no more inputs can be fetched and false is returned.\n+ *\n+ * The worker claims the InputToFetch at this index. Before fetching, it checks if the input's txid quick hash matches\n+ * any quick hash in the sorted vector using binary search. If there is a match, the input is spending a coin created\n+ * earlier in the same block and won't be in the base cache, so fetching is skipped. Otherwise, the coin is fetched\n+ * from the base cache and moved to the InputToFetch object. The ready flag is then set with a release memory order.\n+ * This allows the ready flag to be used as a memory fence, guaranteeing the coin being written to the object will\n+ * have happened before another thread tests the flag with an acquire memory order.\n+ *\n+ * When a coin is requested from the cache on the main thread and is not already in cacheCoins map, the coin is first\n+ * looked up from the m_inputs vector instead of the base cache. The vector is scanned beginning at the element at\n+ * m_input_tail. If the InputToFetch object has the same outpoint as requested, m_input_tail is advanced to the next\n+ * index so the previous inputs do not need to be scanned again. The InputToFetch object's ready flag is tested with\n+ * an acquire memory order. If the object is ready, the background worker has completed and the coin can be moved\n+ * from the InputToFetch. If the object is not ready, the main thread will call ProcessInput() itself\n+ * until the requested coin becomes ready. This allows the main thread to keep making progress (by fetching other\n+ * inputs) rather than blocking on a specific worker.\n+ *\n+ * StopFetching() is called before mutating operations (Flush/Sync/Reset/SetBackend). It stops fetching by moving\n+ * m_input_head to the end of m_inputs (so workers quickly exit), then waits for all futures to complete and clears the\n+ * per-block state (m_inputs/m_txids).\n+ *\n+ *       Workers advance m_input_head to fetch inputs. Main thread advances m_input_tail to consume.\n  *\n- * This is achieved by fetching coins from the base view using PeekCoin() instead of GetCoin(),\n- * so intermediate CCoinsViewCache layers are not filled.\n+ *       Before workers start:\n  *\n- * Used during ConnectBlock() as an ephemeral, resettable top-level view that is flushed only\n- * on success, so invalid blocks don't pollute the underlying cache.\n+ *                 m_input_head\n+ *                 m_input_tail\n+ *                      │\n+ *                      ▼\n+ *                 ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n+ *       m_inputs: │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │\n+ *                 │         │         │         │         │         │         │         │         │         │\n+ *                 └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘\n+ *\n+ *       After workers start:\n+ *\n+ *                                       Worker 2            Worker 0  Worker 3  Worker 1  m_input_head\n+ *                                          │                   │         │         │         │\n+ *                                          ▼                   ▼         ▼         ▼         ▼\n+ *                 ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n+ *       m_inputs: │  ready  │  ready  │fetching │  ready  │fetching │fetching │fetching │ waiting │ waiting │\n+ *                 │consumed │    ✓    │    ●    │    ✓    │    ●    │    ●    │    ●    │         │         │\n+ *                 └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘\n+ *                                ▲\n+ *                                │\n+ *                           m_input_tail\n  */\n class CoinsViewOverlay : public CCoinsViewCache\n {\n private:\n+    //! The latest input not yet being fetched. Workers atomically increment this when fetching.\n+    mutable std::atomic_uint32_t m_input_head{0};\n+    //! The latest input not yet accessed by a consumer. Only the main thread increments this.\n+    mutable uint32_t m_input_tail{0};\n+\n+    //! The inputs of the block which is being fetched.\n+    struct InputToFetch {\n+        //! Workers set this after setting the coin. The main thread tests this before reading the coin.\n+        std::atomic_flag ready{};\n+        //! The outpoint of the input to fetch.\n+        const COutPoint& outpoint;\n+        //! The coin that workers will fetch and main thread will insert into cache.\n+        std::optional<Coin> coin{std::nullopt};\n+\n+        /**\n+         * The move constructor is only used if m_inputs reallocates during StartFetching.\n+         * In StartFetching ready and coin will all have default values, so we don't need to move them.\n+         */\n+        InputToFetch(InputToFetch&& other) noexcept : outpoint{other.outpoint} {}\n+        explicit InputToFetch(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}\n+    };\n+    //! Must only be mutated when m_futures is empty. Elements may be mutated when m_futures is not empty.\n+    mutable std::vector<InputToFetch> m_inputs{};\n+\n+    class QuickHashHasher\n+    {\n+        uint64_t m_key[4];\n+\n+    public:\n+        explicit QuickHashHasher(bool deterministic) noexcept\n+        {\n+            FastRandomContext rng;\n+            for (auto& k : m_key) k = deterministic ? 0 : rng.rand64();\n+        }\n+\n+#if defined(__clang__)\n+        __attribute__((no_sanitize(\"unsigned-integer-overflow\")))\n+#endif\n+        uint64_t operator()(const Txid& txid) const noexcept\n+        {\n+            const auto& hash_input{txid.ToUint256()};\n+            uint64_t out{0};\n+            for (const auto i : std::views::iota(0, 4)) out += hash_input.GetUint64(i) ^ m_key[i];\n+            return out;\n+        }\n+    };\n+    QuickHashHasher m_hasher;\n+\n+    /**\n+     * The sorted quick hash of txids of all txs in the block being fetched. This is used to filter out inputs that\n+     * are created earlier in the same block, since they will not be in the db or the cache.\n+     * Using an 8 byte quick hash is a performance improvement, versus storing the entire 32 bytes. In case of a\n+     * collision of an input being spent having the same quick hash as a txid of a tx elsewhere in the block,\n+     * the input will not be fetched in the background. The input will still be fetched later on the main thread.\n+     * Using a sorted vector and binary search lookups is a performance improvement. It is faster than\n+     * using std::unordered_set with salted hash or std::set.\n+     * Must only be mutated when m_futures is empty.\n+     */\n+    std::vector<uint64_t> m_txids{};\n+\n+    /**\n+     * Claim and fetch the next input in the queue. Safe to call from any thread.\n+     *\n+     * @return true if there are more inputs in the queue to fetch\n+     * @return false if there are no more inputs in the queue to fetch\n+     */\n+    bool ProcessInput() const noexcept\n+    {\n+        const auto i{m_input_head.fetch_add(1, std::memory_order_relaxed)};\n+        if (i >= m_inputs.size()) [[unlikely]] return false;\n+\n+        auto& input{m_inputs[i]};\n+        // Inputs spending a coin from a tx earlier in the block won't be in the cache or db\n+        if (std::ranges::binary_search(m_txids, m_hasher(input.outpoint.hash))) {\n+            // We can use relaxed ordering here since we don't write the coin.\n+            input.ready.test_and_set(std::memory_order_relaxed);\n+            input.ready.notify_one();\n+            return true;\n+        }\n+\n+        if (auto coin{base->PeekCoin(input.outpoint)}) [[likely]] input.coin.emplace(std::move(*coin));\n+        // We need release here, so writing coin in the line above happens before the main thread acquires.\n+        input.ready.test_and_set(std::memory_order_release);\n+        input.ready.notify_one();\n+        return true;",
+      "path": "src/coins.h",
+      "position": 228,
+      "original_position": 228,
+      "commit_id": "551050628c0a4e17a72180353888ddeeab7e4030",
+      "original_commit_id": "551050628c0a4e17a72180353888ddeeab7e4030",
+      "in_reply_to_id": 2927190357,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "This would only have an effect on a single thread. The other 3 threads would all call `ProcessInput()` an extra time.",
+      "created_at": "2026-03-13T15:11:18Z",
+      "updated_at": "2026-03-13T15:11:18Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31132#discussion_r2931851204",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2931851204"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31132"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 693,
+      "original_line": 693,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2931875301",
+      "pull_request_review_id": 3944788980,
+      "id": 2931875301,
+      "node_id": "PRRC_kwDOABII586uwN3l",
+      "diff_hunk": "@@ -527,24 +541,269 @@ class CCoinsViewCache : public CCoinsViewBacked\n };\n \n /**\n- * CCoinsViewCache overlay that avoids populating/mutating parent cache layers on cache misses.\n+ * CCoinsViewCache subclass that asynchronously fetches all block inputs in parallel during ConnectBlock without\n+ * mutating the base cache.\n+ *\n+ * Only used in ConnectBlock to pass as an ephemeral view that can be reset if the block is invalid.\n+ * It provides the same interface as CCoinsViewCache. It overrides all methods that mutate base,\n+ * stopping threads before calling superclass.\n+ * It adds an additional StartFetching method to provide the block.\n+ *\n+ * When a block is passed to StartFetching, the inputs of the block are flattened into a vector of InputToFetch\n+ * objects. A sorted vector of \"quick hashes\" of all block txids (m_txids) is also constructed. StartFetching then\n+ * submits worker tasks to a ThreadPool and keeps the returned futures alive until fetching is stopped.\n+ *\n+ * ProcessInput() atomically fetches and increments m_input_head, so each thread can only access a single element of the\n+ * m_inputs vector at a time. Workers race to claim inputs, so they may fetch elements in any order. If the fetched\n+ * index is greater than the size of m_inputs, no more inputs can be fetched and false is returned.\n+ *\n+ * The worker claims the InputToFetch at this index. Before fetching, it checks if the input's txid quick hash matches\n+ * any quick hash in the sorted vector using binary search. If there is a match, the input is spending a coin created\n+ * earlier in the same block and won't be in the base cache, so fetching is skipped. Otherwise, the coin is fetched\n+ * from the base cache and moved to the InputToFetch object. The ready flag is then set with a release memory order.\n+ * This allows the ready flag to be used as a memory fence, guaranteeing the coin being written to the object will\n+ * have happened before another thread tests the flag with an acquire memory order.\n+ *\n+ * When a coin is requested from the cache on the main thread and is not already in cacheCoins map, the coin is first\n+ * looked up from the m_inputs vector instead of the base cache. The vector is scanned beginning at the element at\n+ * m_input_tail. If the InputToFetch object has the same outpoint as requested, m_input_tail is advanced to the next\n+ * index so the previous inputs do not need to be scanned again. The InputToFetch object's ready flag is tested with\n+ * an acquire memory order. If the object is ready, the background worker has completed and the coin can be moved\n+ * from the InputToFetch. If the object is not ready, the main thread will call ProcessInput() itself\n+ * until the requested coin becomes ready. This allows the main thread to keep making progress (by fetching other\n+ * inputs) rather than blocking on a specific worker.\n+ *\n+ * StopFetching() is called before mutating operations (Flush/Sync/Reset/SetBackend). It stops fetching by moving\n+ * m_input_head to the end of m_inputs (so workers quickly exit), then waits for all futures to complete and clears the\n+ * per-block state (m_inputs/m_txids).\n+ *\n+ *       Workers advance m_input_head to fetch inputs. Main thread advances m_input_tail to consume.\n  *\n- * This is achieved by fetching coins from the base view using PeekCoin() instead of GetCoin(),\n- * so intermediate CCoinsViewCache layers are not filled.\n+ *       Before workers start:\n  *\n- * Used during ConnectBlock() as an ephemeral, resettable top-level view that is flushed only\n- * on success, so invalid blocks don't pollute the underlying cache.\n+ *                 m_input_head\n+ *                 m_input_tail\n+ *                      │\n+ *                      ▼\n+ *                 ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n+ *       m_inputs: │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │ waiting │\n+ *                 │         │         │         │         │         │         │         │         │         │\n+ *                 └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘\n+ *\n+ *       After workers start:\n+ *\n+ *                                       Worker 2            Worker 0  Worker 3  Worker 1  m_input_head\n+ *                                          │                   │         │         │         │\n+ *                                          ▼                   ▼         ▼         ▼         ▼\n+ *                 ┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐\n+ *       m_inputs: │  ready  │  ready  │fetching │  ready  │fetching │fetching │fetching │ waiting │ waiting │\n+ *                 │consumed │    ✓    │    ●    │    ✓    │    ●    │    ●    │    ●    │         │         │\n+ *                 └─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘\n+ *                                ▲\n+ *                                │\n+ *                           m_input_tail\n  */\n class CoinsViewOverlay : public CCoinsViewCache\n {\n private:\n+    //! The latest input not yet being fetched. Workers atomically increment this when fetching.\n+    mutable std::atomic_uint32_t m_input_head{0};\n+    //! The latest input not yet accessed by a consumer. Only the main thread increments this.\n+    mutable uint32_t m_input_tail{0};\n+\n+    //! The inputs of the block which is being fetched.\n+    struct InputToFetch {\n+        //! Workers set this after setting the coin. The main thread tests this before reading the coin.\n+        std::atomic_flag ready{};\n+        //! The outpoint of the input to fetch.\n+        const COutPoint& outpoint;\n+        //! The coin that workers will fetch and main thread will insert into cache.\n+        std::optional<Coin> coin{std::nullopt};\n+\n+        /**\n+         * The move constructor is only used if m_inputs reallocates during StartFetching.\n+         * In StartFetching ready and coin will all have default values, so we don't need to move them.\n+         */\n+        InputToFetch(InputToFetch&& other) noexcept : outpoint{other.outpoint} {}\n+        explicit InputToFetch(const COutPoint& o LIFETIMEBOUND) noexcept : outpoint{o} {}\n+    };\n+    //! Must only be mutated when m_futures is empty. Elements may be mutated when m_futures is not empty.\n+    mutable std::vector<InputToFetch> m_inputs{};\n+\n+    class QuickHashHasher\n+    {\n+        uint64_t m_key[4];\n+\n+    public:\n+        explicit QuickHashHasher(bool deterministic) noexcept\n+        {\n+            FastRandomContext rng;\n+            for (auto& k : m_key) k = deterministic ? 0 : rng.rand64();\n+        }\n+\n+#if defined(__clang__)\n+        __attribute__((no_sanitize(\"unsigned-integer-overflow\")))\n+#endif\n+        uint64_t operator()(const Txid& txid) const noexcept\n+        {\n+            const auto& hash_input{txid.ToUint256()};\n+            uint64_t out{0};\n+            for (const auto i : std::views::iota(0, 4)) out += hash_input.GetUint64(i) ^ m_key[i];\n+            return out;\n+        }\n+    };\n+    QuickHashHasher m_hasher;\n+\n+    /**\n+     * The sorted quick hash of txids of all txs in the block being fetched. This is used to filter out inputs that\n+     * are created earlier in the same block, since they will not be in the db or the cache.\n+     * Using an 8 byte quick hash is a performance improvement, versus storing the entire 32 bytes. In case of a\n+     * collision of an input being spent having the same quick hash as a txid of a tx elsewhere in the block,\n+     * the input will not be fetched in the background. The input will still be fetched later on the main thread.\n+     * Using a sorted vector and binary search lookups is a performance improvement. It is faster than\n+     * using std::unordered_set with salted hash or std::set.\n+     * Must only be mutated when m_futures is empty.\n+     */\n+    std::vector<uint64_t> m_txids{};\n+\n+    /**\n+     * Claim and fetch the next input in the queue. Safe to call from any thread.\n+     *\n+     * @return true if there are more inputs in the queue to fetch\n+     * @return false if there are no more inputs in the queue to fetch\n+     */\n+    bool ProcessInput() const noexcept\n+    {\n+        const auto i{m_input_head.fetch_add(1, std::memory_order_relaxed)};\n+        if (i >= m_inputs.size()) [[unlikely]] return false;\n+\n+        auto& input{m_inputs[i]};\n+        // Inputs spending a coin from a tx earlier in the block won't be in the cache or db\n+        if (std::ranges::binary_search(m_txids, m_hasher(input.outpoint.hash))) {\n+            // We can use relaxed ordering here since we don't write the coin.\n+            input.ready.test_and_set(std::memory_order_relaxed);\n+            input.ready.notify_one();\n+            return true;\n+        }\n+\n+        if (auto coin{base->PeekCoin(input.outpoint)}) [[likely]] input.coin.emplace(std::move(*coin));\n+        // We need release here, so writing coin in the line above happens before the main thread acquires.\n+        input.ready.test_and_set(std::memory_order_release);\n+        input.ready.notify_one();\n+        return true;\n+    }\n+\n+    //! Stop all worker threads and clear fetching data.\n+    void StopFetching() noexcept\n+    {\n+        if (m_futures.empty()) return;\n+        // Skip fetching the rest of the inputs by moving the head to the end.\n+        m_input_head.store(m_inputs.size(), std::memory_order_relaxed);\n+        // Wait for all threads to stop.\n+        for (auto& future : m_futures) future.wait();\n+        m_futures.clear();\n+        m_inputs.clear();\n+        m_input_head.store(0, std::memory_order_relaxed);\n+        m_input_tail = 0;\n+        m_txids.clear();\n+    }\n+\n     std::optional<Coin> FetchCoinFromBase(const COutPoint& outpoint) const override\n     {\n+        // This assumes ConnectBlock accesses all inputs in the same order as they are added to m_inputs\n+        // in StartFetching. Some outpoints are not accessed because they are created by the block, so we scan until we\n+        // come across the requested input.\n+        for (const auto i : std::views::iota(m_input_tail, m_inputs.size())) [[likely]] {\n+            auto& input{m_inputs[i]};\n+            if (input.outpoint != outpoint) continue;\n+            // We advance the tail since the input is cached and not accessed through this method again.\n+            m_input_tail = i + 1;\n+            // Check if the coin is ready to be read. We need acquire so we match the worker thread's release.\n+            while (!input.ready.test(std::memory_order_acquire)) {\n+                // Work instead of waiting if the coin is not ready\n+                if (!ProcessInput()) {\n+                    // No more work, just wait\n+                    input.ready.wait(/*old=*/false, std::memory_order_acquire);\n+                    break;\n+                }\n+            }\n+            // We can move the coin since we won't access this input again.\n+            if (input.coin) [[likely]] return std::move(*input.coin);\n+            // If we get here, then this block has missing or spent inputs or there is a txid quick hash collision.\n+            break;\n+        }\n+\n+        // We will only get here for BIP30 checks, txid quick hash collisions or a block with missing or spent inputs.",
+      "path": "src/coins.h",
+      "position": 271,
+      "original_position": 271,
+      "commit_id": "551050628c0a4e17a72180353888ddeeab7e4030",
+      "original_commit_id": "551050628c0a4e17a72180353888ddeeab7e4030",
+      "in_reply_to_id": 2927292589,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "This comment only reflects production code.\r\nThere is also a unit test to specifically access a coin that is not in the block, and of course fuzz tests will be able to hit here as well. Would it be helpful to clarify these are the only reasons in non-test code?\r\n\r\n> invalid blocks may try to access it too\r\n\r\nI think it's more specific to say `a block with missing or spent inputs`. Other types of invalid blocks will not get here.\r\n\r\nEdit: Actually, a block spending its own coinbase outputs would get here too.",
+      "created_at": "2026-03-13T15:14:43Z",
+      "updated_at": "2026-03-13T15:18:15Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/31132#discussion_r2931875301",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2931875301"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/31132"
