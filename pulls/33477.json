@@ -43,7 +43,7 @@
     "body": "This is an alternative approach to implement `dumptxoutset` with rollback that was discussed a few times. It does not rely on `invalidateblock` and `reconsiderblock` and instead creates a temporary copy of the coins DB, modifies this copy by rolling back as many blocks as necessary and then creating the dump from this temp copy DB. See also https://github.com/bitcoin/bitcoin/pull/29553#issuecomment-1978480989, https://github.com/bitcoin/bitcoin/issues/32817#issuecomment-3012406102 and #29565 discussions.\r\n\r\nThe nice side-effects of this are that forks can not interfere with the rollback and network activity does not have to be suspended. But there are also some downsides when comparing to the current approach: this does require some additional disk space for the copied coins DB and performance is slower (master took 3m 17s vs 9m 16s in my last test with the code here, rolling back ~1500 blocks). However, there is also not much code being added here, network can stay active throughout and performance would stay constant with this approach while it would impact master if there were forks that needed to be invalidated as well (see #33444 for the alternative approach), so this could still be considered a good trade-off.",
     "labels": [],
     "created_at": "2025-09-24T21:15:11Z",
-    "updated_at": "2026-03-17T08:53:10Z",
+    "updated_at": "2026-03-17T09:52:51Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -339,7 +339,7 @@
         "watchers_count": 88512,
         "size": 309955,
         "default_branch": "master",
-        "open_issues_count": 687,
+        "open_issues_count": 688,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -388,7 +388,7 @@
     "deletions": 111,
     "changed_files": 6,
     "commits": 5,
-    "review_comments": 33,
+    "review_comments": 35,
     "comments": 15
   },
   "events": [
@@ -2640,6 +2640,45 @@
         "name": "CI failed",
         "color": "cccccc"
       }
+    },
+    {
+      "event": "reviewed",
+      "id": 3959339595,
+      "node_id": "PRR_kwDOABII587r_rpL",
+      "url": null,
+      "actor": null,
+      "commit_id": "e3410e68560a8eb595d0e8b9e59e78d91a9c2a31",
+      "commit_url": null,
+      "created_at": null,
+      "updated_at": "2026-03-17T09:52:51Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "This looks good to me, but I would recommend splitting the `DeletePruneLock` from the last commit and adding a unit test for it. To me it would also make sense to just squash it into the commit changing the rest of the rollback logic.",
+      "user": {
+        "login": "sedited",
+        "id": 8421793,
+        "node_id": "MDQ6VXNlcjg0MjE3OTM=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/8421793?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sedited",
+        "html_url": "https://github.com/sedited",
+        "followers_url": "https://api.github.com/users/sedited/followers",
+        "following_url": "https://api.github.com/users/sedited/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sedited/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sedited/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sedited/subscriptions",
+        "organizations_url": "https://api.github.com/users/sedited/orgs",
+        "repos_url": "https://api.github.com/users/sedited/repos",
+        "events_url": "https://api.github.com/users/sedited/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sedited/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33477#pullrequestreview-3959339595",
+      "submitted_at": "2026-03-17T09:52:51Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33477"
     }
   ],
   "comments": [
@@ -4099,6 +4138,114 @@
       "start_side": null,
       "line": 3279,
       "original_line": 3239,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2945474099",
+      "pull_request_review_id": 3959339595,
+      "id": 2945474099,
+      "node_id": "PRRC_kwDOABII586vkF4z",
+      "diff_hunk": "@@ -3208,6 +3164,164 @@ static RPCHelpMan dumptxoutset()\n     };\n }\n \n+/**\n+ * RAII class that creates a temporary database directory in its constructor\n+ * and removes it in its destructor.\n+ */\n+class TemporaryUTXODatabase\n+{\n+    fs::path m_path;\n+public:\n+    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {\n+        fs::create_directories(m_path);\n+    }\n+    ~TemporaryUTXODatabase() {\n+        try {\n+            fs::remove_all(m_path);\n+        } catch (...) {\n+            LogInfo(\"Failed to clean up temporary UTXO database at %s, please remove it manually.\",\n+                    fs::PathToString(m_path));\n+        }\n+    }\n+};\n+\n+UniValue CreateRolledBackUTXOSnapshot(\n+    NodeContext& node,\n+    Chainstate& chainstate,\n+    const CBlockIndex* target,\n+    AutoFile&& afile,\n+    const fs::path& path,\n+    const fs::path& tmppath,\n+    const bool in_memory)\n+{\n+    // Create a temporary leveldb to store the UTXO set that is being rolled back\n+    std::string temp_db_name{strprintf(\"temp_utxo_%d\", target->nHeight)};\n+    fs::path temp_db_path{fsbridge::AbsPathJoin(tmppath.parent_path(), fs::u8path(temp_db_name))};\n+\n+    // Only create the on-disk temp directory when not using in-memory mode\n+    std::optional<TemporaryUTXODatabase> temp_db_cleaner;\n+    if (!in_memory) {\n+        temp_db_cleaner.emplace(temp_db_path);\n+    } else {\n+        LogInfo(\"Using in-memory database for UTXO-set rollback (this may require significant RAM).\");\n+    }\n+\n+    // Create temporary database\n+    DBParams db_params{\n+        .path = temp_db_path,\n+        .cache_bytes = 0,\n+        .memory_only = in_memory,\n+        .wipe_data = true,\n+        .obfuscate = false,\n+        .options = DBOptions{}\n+    };\n+\n+    std::unique_ptr<CCoinsViewDB> temp_db = std::make_unique<CCoinsViewDB>(\n+        std::move(db_params),\n+        CoinsViewOptions{}\n+    );\n+\n+    LogInfo(\"Copying current UTXO set to temporary database.\");\n+    {\n+        WITH_LOCK(::cs_main, chainstate.ForceFlushStateToDisk());",
+      "path": "src/rpc/blockchain.cpp",
+      "position": 252,
+      "original_position": 252,
+      "commit_id": "e3410e68560a8eb595d0e8b9e59e78d91a9c2a31",
+      "original_commit_id": "e3410e68560a8eb595d0e8b9e59e78d91a9c2a31",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "sedited",
+        "id": 8421793,
+        "node_id": "MDQ6VXNlcjg0MjE3OTM=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/8421793?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sedited",
+        "html_url": "https://github.com/sedited",
+        "followers_url": "https://api.github.com/users/sedited/followers",
+        "following_url": "https://api.github.com/users/sedited/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sedited/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sedited/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sedited/subscriptions",
+        "organizations_url": "https://api.github.com/users/sedited/orgs",
+        "repos_url": "https://api.github.com/users/sedited/repos",
+        "events_url": "https://api.github.com/users/sedited/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sedited/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Should we retain the cache here?",
+      "created_at": "2026-03-17T09:32:58Z",
+      "updated_at": "2026-03-17T09:52:51Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33477#discussion_r2945474099",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2945474099"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33477"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3226,
+      "original_line": 3226,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2945576522",
+      "pull_request_review_id": 3959339595,
+      "id": 2945576522,
+      "node_id": "PRRC_kwDOABII586vke5K",
+      "diff_hunk": "@@ -3208,6 +3164,164 @@ static RPCHelpMan dumptxoutset()\n     };\n }\n \n+/**\n+ * RAII class that creates a temporary database directory in its constructor\n+ * and removes it in its destructor.\n+ */\n+class TemporaryUTXODatabase\n+{\n+    fs::path m_path;\n+public:\n+    TemporaryUTXODatabase(const fs::path& path) : m_path(path) {\n+        fs::create_directories(m_path);\n+    }\n+    ~TemporaryUTXODatabase() {\n+        try {\n+            fs::remove_all(m_path);\n+        } catch (...) {\n+            LogInfo(\"Failed to clean up temporary UTXO database at %s, please remove it manually.\",\n+                    fs::PathToString(m_path));\n+        }\n+    }\n+};\n+\n+UniValue CreateRolledBackUTXOSnapshot(\n+    NodeContext& node,\n+    Chainstate& chainstate,\n+    const CBlockIndex* target,\n+    AutoFile&& afile,\n+    const fs::path& path,\n+    const fs::path& tmppath,\n+    const bool in_memory)\n+{\n+    // Create a temporary leveldb to store the UTXO set that is being rolled back\n+    std::string temp_db_name{strprintf(\"temp_utxo_%d\", target->nHeight)};",
+      "path": "src/rpc/blockchain.cpp",
+      "position": 224,
+      "original_position": 224,
+      "commit_id": "e3410e68560a8eb595d0e8b9e59e78d91a9c2a31",
+      "original_commit_id": "e3410e68560a8eb595d0e8b9e59e78d91a9c2a31",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "sedited",
+        "id": 8421793,
+        "node_id": "MDQ6VXNlcjg0MjE3OTM=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/8421793?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sedited",
+        "html_url": "https://github.com/sedited",
+        "followers_url": "https://api.github.com/users/sedited/followers",
+        "following_url": "https://api.github.com/users/sedited/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sedited/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sedited/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sedited/subscriptions",
+        "organizations_url": "https://api.github.com/users/sedited/orgs",
+        "repos_url": "https://api.github.com/users/sedited/repos",
+        "events_url": "https://api.github.com/users/sedited/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sedited/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "How about adding a few random characters to this? Might that prevent a collision bug where a re-org takes place in case we are dumping close to the tip height?",
+      "created_at": "2026-03-17T09:50:20Z",
+      "updated_at": "2026-03-17T09:52:51Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/33477#discussion_r2945576522",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/2945576522"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/33477"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 3198,
+      "original_line": 3198,
       "side": "RIGHT"
     }
   ]
