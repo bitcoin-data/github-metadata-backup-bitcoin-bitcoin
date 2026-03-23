@@ -41,9 +41,19 @@
       "patch_url": null
     },
     "body": "## Summary\r\n\r\nAdd an experimental backpressure mechanism that defers low-priority P2P message processing when the RPC work queue is under pressure, improving RPC tail latency under sustained P2P load.\r\n\r\n## Problem\r\n\r\nThe single-threaded message handler (`-msghand` thread) processes all P2P messages sequentially. Under sustained low-priority P2P traffic (tx relay, addr gossip), RPC tail latency degrades significantly because:\r\n\r\n1. **Single-threaded bottleneck** - The msghand thread can saturate a single CPU core at 100%, leaving other cores idle\r\n2. **No priority differentiation** - Low-priority P2P messages (INV, TX, ADDR) compete equally with RPC work\r\n3. **RPC starvation** - When RPC work queue fills up, new requests are rejected with \"Work queue depth exceeded\"\r\n\r\nThis affects users running RPC-heavy workloads (wallets, block explorers, Lightning nodes) alongside P2P relay.\r\n\r\n## Solution\r\n\r\nIntroduce a minimal, opt-in backpressure policy:\r\n\r\n### Request Flow\r\n\r\n```mermaid\r\nsequenceDiagram\r\n    participant Peer as P2P Peer\r\n    participant PM as PeerManager\r\n    participant Monitor as RpcLoadMonitor\r\n    participant HTTP as HTTP Server\r\n    participant RPC as RPC Client\r\n\r\n    Note over HTTP,Monitor: RPC queue fills up\r\n    RPC->>HTTP: Multiple RPC requests\r\n    HTTP->>Monitor: OnQueueDepthSample(depth=80, cap=100)\r\n    Monitor->>Monitor: State: NORMAL → ELEVATED\r\n\r\n    Note over Peer,PM: P2P message arrives\r\n    Peer->>PM: INV (tx announcements)\r\n    PM->>Monitor: GetState()\r\n    Monitor-->>PM: ELEVATED\r\n    PM->>PM: IsLowPriorityMessage(\"inv\") = true\r\n    PM->>PM: RequeueMessageForProcessing()\r\n    Note over PM: Message deferred to back of queue\r\n\r\n    Note over Peer,PM: Critical message arrives\r\n    Peer->>PM: HEADERS\r\n    PM->>Monitor: GetState()\r\n    Monitor-->>PM: ELEVATED\r\n    PM->>PM: IsLowPriorityMessage(\"headers\") = false\r\n    PM->>PM: ProcessMessage()\r\n    Note over PM: Critical messages always processed\r\n\r\n    Note over HTTP,Monitor: RPC queue drains\r\n    HTTP->>Monitor: OnQueueDepthSample(depth=40, cap=100)\r\n    Monitor->>Monitor: State: ELEVATED → NORMAL\r\n    Note over PM: Resume normal P2P processing\r\n```\r\n\r\n### Components\r\n\r\n1. **RpcLoadMonitor** - A lock-free state machine that tracks RPC queue depth and exposes load state (`NORMAL`, `ELEVATED`, `CRITICAL`) with hysteresis to prevent oscillation.\r\n\r\n2. **Backpressure Gate** - A check in `PeerManagerImpl::ProcessMessages()` that defers low-priority P2P messages when RPC load is elevated.\r\n\r\n3. **Message Classification** - Clear separation between:\r\n   - **Low-priority (deferrable):** `TX`, `INV` (tx), `GETDATA` (tx), `MEMPOOL`, `ADDR`, `ADDRV2`, `GETADDR`\r\n   - **Critical (never throttled):** `HEADERS`, `BLOCK`, `CMPCTBLOCK`, `BLOCKTXN`, `GETHEADERS`, `GETBLOCKS`, handshake/control messages\r\n\r\n4. **Defer-to-tail** - Deferred messages are requeued to the back of the peer's message queue, not dropped. This preserves eventual delivery while prioritizing RPC responsiveness.\r\n\r\n## Changes\r\n\r\n### New Files\r\n- `src/node/rpc_load_monitor.h` - `RpcLoadState` enum, `RpcLoadMonitor` interface, `AtomicRpcLoadMonitor` implementation\r\n\r\n### Modified Files\r\n- `src/net_processing.h` - Add `experimental_rpc_priority` and `rpc_load_monitor` to `PeerManager::Options`\r\n- `src/net_processing.cpp` - Backpressure gate in `ProcessMessages()`, `IsLowPriorityMessage()` helper\r\n- `src/net.h` - Add `RequeueMessageForProcessing()` to `CNode`\r\n- `src/net.cpp` - Implement `RequeueMessageForProcessing()`\r\n- `src/httpserver.h` - Add `SetHttpServerRpcLoadMonitor()`\r\n- `src/httpserver.cpp` - Call `OnQueueDepthSample()` at enqueue/dispatch points\r\n- `src/node/peerman_args.cpp` - Parse `-experimental-rpc-priority` flag\r\n- `src/init.cpp` - Create `RpcLoadMonitor`, wire to HTTP server and PeerManager\r\n\r\n### New Flag\r\n```\r\n-experimental-rpc-priority=<0|1>  (default: 0)\r\n    Enable experimental RPC-aware P2P backpressure policy.\r\n    When enabled, low-priority P2P messages may be deferred\r\n    during RPC queue overload to improve RPC latency.\r\n```\r\n\r\n## Policy Details\r\n\r\n### State Machine\r\n\r\n```mermaid\r\nstateDiagram-v2\r\n    [*] --> NORMAL\r\n    \r\n    NORMAL --> ELEVATED : queue ≥ 75%\r\n    NORMAL --> CRITICAL : queue ≥ 90%\r\n    \r\n    ELEVATED --> CRITICAL : queue ≥ 90%\r\n    ELEVATED --> NORMAL : queue < 50%\r\n    \r\n    CRITICAL --> ELEVATED : queue < 70%\r\n    \r\n    note right of NORMAL : Process all messages\r\n    note right of ELEVATED : Defer low-priority P2P\r\n    note right of CRITICAL : Defer low-priority P2P\r\n```\r\n\r\nHysteresis prevents rapid state oscillation under fluctuating load.\r\n\r\n### Thresholds\r\n| Transition | Condition |\r\n|------------|-----------|\r\n| NORMAL → ELEVATED | queue_depth ≥ 75% capacity |\r\n| NORMAL → CRITICAL | queue_depth ≥ 90% capacity |\r\n| ELEVATED → CRITICAL | queue_depth ≥ 90% capacity |\r\n| ELEVATED → NORMAL | queue_depth < 50% capacity |\r\n| CRITICAL → ELEVATED | queue_depth < 70% capacity |\r\n\r\n### Behavior by State\r\n| State | Low-priority P2P | Critical P2P | RPC |\r\n|-------|------------------|--------------|-----|\r\n| NORMAL | Process normally | Process normally | Process normally |\r\n| ELEVATED | Defer to tail | Process normally | Process normally |\r\n| CRITICAL | Defer to tail | Process normally | Process normally |\r\n\r\n## Performance Results\r\n\r\nA/B test with concurrent P2P INV flood (~108K entries) and RPC workload (12 threads, 45s duration):\r\n\r\n### Baseline (flag=0)\r\n| Metric | Value |\r\n|--------|-------|\r\n| RPC p50 | 1.925ms |\r\n| RPC p95 | 9.320ms |\r\n| RPC p99 | 17.974ms |\r\n| RPC calls/sec | 3,919 |\r\n| P2P INV msgs | 3,394 |\r\n\r\n### With Policy (flag=1)\r\n| Metric | Value |\r\n|--------|-------|\r\n| RPC p50 | 1.845ms |\r\n| RPC p95 | 7.755ms |\r\n| RPC p99 | 15.977ms |\r\n| RPC calls/sec | 4,286 |\r\n| P2P INV msgs | 3,372 |\r\n\r\n### Improvement\r\n| Metric | Change |\r\n|--------|--------|\r\n| RPC p50 | -4.2% (better) |\r\n| RPC p95 | **-16.79%** (better) |\r\n| RPC p99 | **-11.11%** (better) |\r\n| Throughput | **+9.4%** |\r\n\r\n## Testing\r\n\r\n### Unit Tests (`src/test/rpc_load_monitor_tests.cpp`)\r\n- `rpc_load_monitor_tests` suite (12 tests):\r\n  - State transitions (normal→elevated→critical)\r\n  - Hysteresis behavior\r\n  - Thread safety\r\n  - Edge cases (zero/negative capacity)\r\n  - Custom threshold configuration\r\n\r\n### Functional Test (`test/functional/feature_rpc_p2p_backpressure_ab.py`)\r\n- A/B comparison with P2P INV flood workload\r\n- Measures RPC latency percentiles (p50/p95/p99)\r\n- Verifies no RPC errors under load\r\n- Outputs JSON metrics for analysis\r\n\r\n### Test Commands\r\n```bash\r\n# Unit tests\r\nbuild/bin/test_bitcoin --run_test=rpc_load_monitor_tests\r\n\r\n# Functional A/B test\r\npython3 test/functional/feature_rpc_p2p_backpressure_ab.py\r\n```\r\n\r\n## Limitations and Future Work\r\n\r\n1. **Experimental** - Feature is opt-in and may change based on feedback\r\n2. **Overhead** - Without P2P pressure, policy adds ~1% overhead from state checks\r\n3. **Tuning** - Threshold values are initial estimates; may need adjustment based on real-world data\r\n4. **Message granularity** - Currently classifies by message type; could be refined to inspect INV/GETDATA contents\r\n\r\n## Backwards Compatibility\r\n\r\n- No consensus changes\r\n- No P2P protocol changes\r\n- No behavior change when flag is disabled (default)\r\n- Existing tests pass\r\n\r\n## Historical Context\r\n\r\nThis problem has been discussed in various forms:\r\n- Mining pools (AntPool) reported ProcessMessage CPU saturation causing block delays\r\n- Requests to split the msghand thread into multiple threads\r\n- Analysis of CPU time spent in ProcessMessages() per peer\r\n\r\nThis PR provides a lightweight, opt-in mitigation without requiring architectural changes to the message handler threading model.\r\n",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2026-03-23T09:47:49Z",
-    "updated_at": "2026-03-23T09:55:41Z",
+    "updated_at": "2026-03-23T10:41:27Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -154,7 +164,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 310327,
+        "size": 310330,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -167,7 +177,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-03-23T09:55:16Z",
+        "pushed_at": "2026-03-23T10:06:35Z",
         "created_at": "2026-03-23T06:05:27Z",
         "updated_at": "2026-03-23T06:05:28Z",
         "allow_forking": true,
@@ -289,8 +299,8 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 38863,
-        "stargazers_count": 88577,
-        "watchers_count": 88577,
+        "stargazers_count": 88578,
+        "watchers_count": 88578,
         "size": 310353,
         "default_branch": "master",
         "open_issues_count": 691,
@@ -312,7 +322,7 @@
         "visibility": "public",
         "pushed_at": "2026-03-23T06:57:27Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-03-23T09:37:18Z",
+        "updated_at": "2026-03-23T10:50:23Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -523,6 +533,41 @@
         "date": "2026-03-23T09:55:04Z"
       },
       "sha": "afb0c61462d98939f9e5a6625baffd7550ceeea5"
+    },
+    {
+      "event": "labeled",
+      "id": 23808832803,
+      "node_id": "LE_lADOABII5871jCbLzwAAAAWLHfUj",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/23808832803",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-03-23T10:41:27Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": []
