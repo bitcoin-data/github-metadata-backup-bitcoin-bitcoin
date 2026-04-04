@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35004/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35004/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/fc75025002b305508d46e148b5e0c2627a0ec526",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/48226827345b0fd01e86c833fac2da5723d15c29",
     "number": 35004,
     "state": "open",
     "locked": false,
@@ -41,13 +41,23 @@
       "patch_url": null
     },
     "body": "# contrib: USDT-based TxGraph tracing pipeline                                   \r\n                                                                                 \r\n## Summary                                                                       \r\n                                                                                 \r\nAdd a complete tracing pipeline for TxGraph based on USDT tracepoints:           \r\n                                                                                 \r\n- **27 USDT tracepoints** covering every public TxGraph API (mutations, staging, queries, maintenance)\r\n- **BCC recording script** that attaches to all tracepoints via eBPF and writes a binary TXGTRACE trace file\r\n- **Analysis script** that parses trace files and reports cluster size distribution, chain-shaped topology classification, and dependency statistics\r\n- **Replay tool** that reads trace files, reconstructs TxGraph API calls, and reports per-entry-point timing — used to compare TxGraph performance across different implementations\r\n                                                                                 \r\n## Motivation                                                                    \r\n                                                                                 \r\nWhen optimizing TxGraph internals, we need tools to:                             \r\n                                                                                 \r\n1. **Capture real workloads**: record the exact sequence of TxGraph operations from a live mainnet node\r\n2. **Understand mempool structure**: analyze cluster topology (size distribution, chain vs non-chain, dependency density)\r\n3. **Compare implementations**: replay the same trace on different branches for fair, reproducible performance comparison\r\n                                                                                 \r\nThe USDT-based approach requires no wrapper class and has negligible overhead when no tracer is attached (one branch check per tracepoint, predicted not-taken).\r\n                                                                                 \r\n## Commits                                                                       \r\n                                                                                 \r\n### 1. `txgraph: add USDT tracepoints for all TxGraph API operations`            \r\n                                                                                 \r\nAdds 27 USDT tracepoints to `src/txgraph.cpp` and one `txgraph:init` tracepoint in `src/txmempool.cpp` (at the `MakeTxGraph` call site).\r\n                                                                                 \r\nVariable-length operations (`get_ancestors_union`, `get_descendants_union`, `count_distinct_clusters`) use `TRACEPOINT_ACTIVE` to conditionally build a fixed-size stack buffer of indices, passed as a pointer for eBPF to read via `bpf_probe_read_user`.\r\n                                                                                 \r\nAll arguments are explicitly cast to 64-bit types to work around a BCC 0.31.0 bug where `bpf_usdt_readarg` fails to read sub-8-byte stack arguments (`4@offset(%rsp)` descriptors always return zero; only `8@` descriptors work correctly).\r\n                                                                                 \r\n### 2. `contrib: add BCC script to record TxGraph traces via USDT`               \r\n                                                                                 \r\n`contrib/tracing/txgraph/txgraph_trace_recorder.py` — a BCC Python script that attaches to all 27 tracepoints and writes events to a TXGTRACE binary file.\r\n                                                                                 \r\nEach eBPF handler is generated as a standalone C function from Python data definitions (BCC does not allow its builtins inside C macro expansions).\r\n                                                                                 \r\nFor complete traces, bitcoind should be started with `TXGRAPH_WAIT_FOR_TRACER=1` environment variable.\r\n                                                                                 \r\n### 3. `contrib: add trace analysis script for cluster topology`                 \r\n                                                                                 \r\n`contrib/tracing/txgraph/analyze_trace.py` — parses TXGTRACE files and reports peak/final mempool state, cluster size distribution, chain-shaped cluster classification, and edge sanity checks. Correctly handles staged mutations.\r\n                                                                                 \r\n### 4. `contrib: add txgraph-replay trace replay tool`                           \r\n                                                                                 \r\n`contrib/tracing/txgraph/txgraph_replay.cpp` — standalone C++ tool. Replays all operations from a trace file, timing query/trigger operations while leaving mutations untimed. Reports per-entry-point statistics.\r\n                                                                                 \r\nBuilt separately from Bitcoin Core via `contrib/tracing/txgraph/build_replay.sh`, which links against pre-built Bitcoin Core libraries. No changes to Bitcoin Core's CMake build system are required.\r\n                                                                                 \r\nWhen started with `TXGRAPH_WAIT_FOR_TRACER=1`, bitcoind waits for a tracer to attach before mempool initialization (with a 2-second grace period for the BCC perf buffer to become ready), ensuring the trace captures every event from the start.\r\n                                                                                 \r\n## Usage                                                                         \r\n                                                                                 \r\n```bash                                                                          \r\n# Build Bitcoin Core (standard build, no special flags needed)                   \r\ncmake -B build                                                                   \r\ncmake --build build -j$(nproc)                                                   \r\n                                                                                 \r\n# Build txgraph-replay tool separately                                           \r\ncontrib/tracing/txgraph/build_replay.sh                                          \r\n                                                                                 \r\n# Start bitcoind (with env var to wait for tracer)                               \r\nTXGRAPH_WAIT_FOR_TRACER=1 bitcoind -datadir=...                                  \r\n                                                                                 \r\n# Record trace (in another terminal)                                             \r\nsudo python3 contrib/tracing/txgraph/txgraph_trace_recorder.py \\                 \r\n    -p $(pidof bitcoind) -o trace.bin                                            \r\n                                                                                 \r\n# Analyze cluster topology                                                       \r\npython3 contrib/tracing/txgraph/analyze_trace.py trace.bin                       \r\n                                                                                 \r\n# Replay for performance comparison                                              \r\n./build/bin/txgraph-replay trace.bin                                             \r\n```                                                                              \r\n                                                                                 \r\n## Sample output                                                                 \r\n                                                                                 \r\n### analyze_trace.py                                                             \r\n                                                                                 \r\n```                                                                              \r\nParameters: max_cluster_count=64 max_cluster_size=404000 acceptable_cost=75000   \r\nProcessed 78223 operations, 9736 CommitStagings                                  \r\nPeak mempool size: 9688 transactions (at op #74231)                              \r\n                                                                                 \r\n  Peak state (9688 transactions)                                                 \r\n  9688 transactions, 3306 clusters                                               \r\n                                                                                 \r\n    Size    Clusters      Chains   Non-chain    Chain%                           \r\n       1        2723        2723           0    100.0%                           \r\n       2         212         212           0    100.0%                           \r\n      25         207         207           0    100.0%                           \r\n   TOTAL        3306        3266          40     98.8%                           \r\n```                                                                              \r\n                                                                                 \r\n### txgraph-replay                                                               \r\n                                                                                 \r\n```                                                                              \r\n=== TxGraph Replay Summary ===                                                   \r\nTotal ops replayed: 78222                                                        \r\n                                                                                 \r\nTimed entry points:                                                              \r\n  Operation                           Calls     Total (us)       Avg (us)        \r\n  DoWork                               9737         115647          11.88        \r\n  GetMainMemoryUsage                  19482              9           0.00        \r\n  CommitStaging                        9736             14           0.00        \r\n  TOTAL                               58441         115798                       \r\n```                                                                              \r\n~                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               \r\n~                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               \r\n",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2026-04-04T15:46:16Z",
-    "updated_at": "2026-04-04T15:46:42Z",
+    "updated_at": "2026-04-04T16:16:13Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "c13e7080b6832cc0b23065907699c6f2805df420",
+    "merge_commit_sha": "f46fe52c5ff56d2957a74bb068fa8ce38bc00092",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -55,7 +65,7 @@
     "head": {
       "label": "HowHsu:usdt-txgraph-tracing-v2",
       "ref": "usdt-txgraph-tracing-v2",
-      "sha": "fc75025002b305508d46e148b5e0c2627a0ec526",
+      "sha": "48226827345b0fd01e86c833fac2da5723d15c29",
       "user": {
         "login": "HowHsu",
         "id": 38499194,
@@ -155,7 +165,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 288176,
+        "size": 288238,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -168,7 +178,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-04-04T15:44:25Z",
+        "pushed_at": "2026-04-04T16:15:42Z",
         "created_at": "2019-07-15T09:53:32Z",
         "updated_at": "2025-07-04T10:01:37Z",
         "allow_forking": true,
@@ -313,7 +323,7 @@
         "visibility": "public",
         "pushed_at": "2026-04-04T00:46:56Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-04-04T15:29:36Z",
+        "updated_at": "2026-04-04T16:44:55Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -339,7 +349,7 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": true,
-    "additions": 1518,
+    "additions": 1520,
     "deletions": 0,
     "changed_files": 9,
     "commits": 5,
@@ -347,206 +357,6 @@
     "comments": 1
   },
   "events": [
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGJhNWZlMTQzMTI3ZmY0MmVmM2U3ZDdiMGNkZjlmOTAyZjYxYzQ1ODA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580",
-      "tree": {
-        "sha": "f1e8081370766e57156380b147005e9955cf0344",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f1e8081370766e57156380b147005e9955cf0344"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a7c30da1f6fc2eebd7514dd032fbb54940d467de",
-          "sha": "a7c30da1f6fc2eebd7514dd032fbb54940d467de",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a7c30da1f6fc2eebd7514dd032fbb54940d467de"
-        }
-      ],
-      "message": "txgraph: add USDT tracepoints for all TxGraph API operations\n\nAdd 27 USDT tracepoints covering every public TxGraph method:\nmutations (add_transaction, remove_transaction, add_dependency,\nset_transaction_fee, unlink_ref), staging (start/abort/commit),\nqueries (get_ancestors, get_descendants, get_cluster, exists, etc.),\nand maintenance (do_work, trim, get_block_builder).\n\nVariable-length operations (get_ancestors_union, get_descendants_union,\ncount_distinct_clusters) use TRACEPOINT_ACTIVE to conditionally build\na fixed-size stack buffer of per-element indices, passed as a pointer\nfor eBPF to read via bpf_probe_read_user.\n\nThe init tracepoint is placed in CTxMemPool's constructor (txmempool.cpp)\nwhere MakeTxGraph() is called with the configuration parameters. When\nthe TXGRAPH_WAIT_FOR_TRACER environment variable is set, bitcoind waits\nfor a tracer to attach before firing the init tracepoint, with a\n2-second grace period for the BCC perf buffer to become ready.\n\nAll tracepoint arguments are explicitly cast to 64-bit types (uint64_t\nor int64_t) to work around a BCC bug where bpf_usdt_readarg fails to\nread 4-byte USDT stack arguments (descriptors like 4@offset(%rsp)\nalways return zero; only 8-byte descriptors work correctly).",
-      "committer": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T15:44:06Z"
-      },
-      "author": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-03T07:25:34Z"
-      },
-      "sha": "ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGE4NDVmNGVkYzBmZGFjMjljNDJiYTU1NmMyZmUwYWFjNjZmMTZjNzE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a845f4edc0fdac29c42ba556c2fe0aac66f16c71",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a845f4edc0fdac29c42ba556c2fe0aac66f16c71",
-      "tree": {
-        "sha": "573312ae50f2e5f17ae0370472d612615bedf4c3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/573312ae50f2e5f17ae0370472d612615bedf4c3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580",
-          "sha": "ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/ba5fe143127ff42ef3e7d7b0cdf9f902f61c4580"
-        }
-      ],
-      "message": "contrib: add BCC script to record TxGraph traces via USDT\n\nAdd a Python BCC script that attaches to all TxGraph USDT tracepoints\nand records operations into a binary TXGTRACE file for offline replay.\n\nThe eBPF handler functions are generated at runtime from Python data\ndefinitions rather than C preprocessor macros, because BCC does not\nallow its builtins (bpf_usdt_readarg, perf_submit) inside macro\nexpansions.\n\nVariable-length operations (get_ancestors_union, get_descendants_union,\ncount_distinct_clusters) read a fixed-size 64-element uint32_t buffer\nfrom userspace via bpf_probe_read_user.",
-      "committer": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T15:44:06Z"
-      },
-      "author": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-03T07:25:45Z"
-      },
-      "sha": "a845f4edc0fdac29c42ba556c2fe0aac66f16c71"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGEwNzA5MTQwNzA2YTQxMTUwOTBjYzhhMDdkODI4MWU5MTgwN2Y3OTI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a0709140706a4115090cc8a07d8281e91807f792",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a0709140706a4115090cc8a07d8281e91807f792",
-      "tree": {
-        "sha": "607e8de4fb7a2a23e2459b528bb50cb3eea14b5d",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/607e8de4fb7a2a23e2459b528bb50cb3eea14b5d"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a845f4edc0fdac29c42ba556c2fe0aac66f16c71",
-          "sha": "a845f4edc0fdac29c42ba556c2fe0aac66f16c71",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a845f4edc0fdac29c42ba556c2fe0aac66f16c71"
-        }
-      ],
-      "message": "contrib: add trace analysis script for cluster topology\n\nAdd analyze_trace.py that parses TXGTRACE binary files and reports:\n- Peak and final mempool size (transaction count)\n- Cluster size distribution\n- Chain-shaped vs non-chain cluster classification\n- Dependency statistics and edge sanity checks\n\nCorrectly handles staged mutations (only applied on CommitStaging,\ndiscarded on AbortStaging) and tracks oversized cluster warnings.",
-      "committer": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T15:44:06Z"
-      },
-      "author": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-03T07:25:55Z"
-      },
-      "sha": "a0709140706a4115090cc8a07d8281e91807f792"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQxYmNlYmQyZGY2MjQ1NGViMTU0YjE4MGRlMjI3YmZiNGQzZTc5ODg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/41bcebd2df62454eb154b180de227bfb4d3e7988",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/41bcebd2df62454eb154b180de227bfb4d3e7988",
-      "tree": {
-        "sha": "c7067ec92552c8e46861353f817fa8cb1a6c233a",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c7067ec92552c8e46861353f817fa8cb1a6c233a"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a0709140706a4115090cc8a07d8281e91807f792",
-          "sha": "a0709140706a4115090cc8a07d8281e91807f792",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a0709140706a4115090cc8a07d8281e91807f792"
-        }
-      ],
-      "message": "contrib: add txgraph-replay trace replay tool\n\nAdd a standalone tool that replays TXGTRACE binary trace files and\nreports per-entry-point timing statistics. Used to compare TxGraph\nperformance across different implementations.\n\nReads the binary format produced by txgraph_trace_recorder.py,\nreconstructs TxGraph API calls, and measures execution time for\neach query/trigger operation. Mutations are replayed but not timed.\n\nBuilt separately from Bitcoin Core via build_replay.sh, which links\nagainst pre-built Bitcoin Core libraries. A standalone CMakeLists.txt\naccepts BITCOIN_SOURCE_DIR and BITCOIN_BUILD_DIR parameters. No\nmodifications to Bitcoin Core's root or src/ CMake files are required.",
-      "committer": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T15:44:06Z"
-      },
-      "author": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-03T07:26:17Z"
-      },
-      "sha": "41bcebd2df62454eb154b180de227bfb4d3e7988"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGZjNzUwMjUwMDJiMzA1NTA4ZDQ2ZTE0OGI1ZTBjMjYyN2EwZWM1MjY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fc75025002b305508d46e148b5e0c2627a0ec526",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/fc75025002b305508d46e148b5e0c2627a0ec526",
-      "tree": {
-        "sha": "a03a80de0b67a1c4b61ba2fae881ca074403ffbf",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a03a80de0b67a1c4b61ba2fae881ca074403ffbf"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/41bcebd2df62454eb154b180de227bfb4d3e7988",
-          "sha": "41bcebd2df62454eb154b180de227bfb4d3e7988",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/41bcebd2df62454eb154b180de227bfb4d3e7988"
-        }
-      ],
-      "message": "contrib: extract tracing_defs.py as single source of truth for probe definitions\n\nMove all opcode constants, probe argument types, and binary format\nserialization/deserialization into tracing_defs.py. Both the BCC\nrecorder and the analysis script now import from this shared module.\n\nAdding a new TxGraph tracepoint only requires adding one entry to the\nPROBES list in tracing_defs.py (plus the TRACEPOINT call in txgraph.cpp\nand the dispatch case in txgraph_replay.cpp). The recorder and analyzer\nadapt automatically.",
-      "committer": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T15:44:06Z"
-      },
-      "author": {
-        "name": "Hao Xu",
-        "email": "hao.xu@linux.dev",
-        "date": "2026-04-04T04:32:43Z"
-      },
-      "sha": "fc75025002b305508d46e148b5e0c2627a0ec526"
-    },
     {
       "event": "commented",
       "id": 4187301165,
@@ -604,6 +414,272 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/35004#issuecomment-4187301165",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35004"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDA3YjY2MzhhMDYyNGNhZjM1ZWU4NDEzYTNmOGE1NTlkN2NmOWMyMjc",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/07b6638a0624caf35ee8413a3f8a559d7cf9c227",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/07b6638a0624caf35ee8413a3f8a559d7cf9c227",
+      "tree": {
+        "sha": "70335427716ee8ff6b21e320edb3b512081368f0",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/70335427716ee8ff6b21e320edb3b512081368f0"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a7c30da1f6fc2eebd7514dd032fbb54940d467de",
+          "sha": "a7c30da1f6fc2eebd7514dd032fbb54940d467de",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a7c30da1f6fc2eebd7514dd032fbb54940d467de"
+        }
+      ],
+      "message": "txgraph: add USDT tracepoints for all TxGraph API operations\n\nAdd 27 USDT tracepoints covering every public TxGraph method:\nmutations (add_transaction, remove_transaction, add_dependency,\nset_transaction_fee, unlink_ref), staging (start/abort/commit),\nqueries (get_ancestors, get_descendants, get_cluster, exists, etc.),\nand maintenance (do_work, trim, get_block_builder).\n\nVariable-length operations (get_ancestors_union, get_descendants_union,\ncount_distinct_clusters) use TRACEPOINT_ACTIVE to conditionally build\na fixed-size stack buffer of per-element indices, passed as a pointer\nfor eBPF to read via bpf_probe_read_user.\n\nThe init tracepoint is placed in CTxMemPool's constructor (txmempool.cpp)\nwhere MakeTxGraph() is called with the configuration parameters. When\nthe TXGRAPH_WAIT_FOR_TRACER environment variable is set, bitcoind waits\nfor a tracer to attach before firing the init tracepoint, with a\n2-second grace period for the BCC perf buffer to become ready.\n\nAll tracepoint arguments are explicitly cast to 64-bit types (uint64_t\nor int64_t) to work around a BCC bug where bpf_usdt_readarg fails to\nread 4-byte USDT stack arguments (descriptors like 4@offset(%rsp)\nalways return zero; only 8-byte descriptors work correctly).",
+      "committer": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T16:11:20Z"
+      },
+      "author": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-03T07:25:34Z"
+      },
+      "sha": "07b6638a0624caf35ee8413a3f8a559d7cf9c227"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE2YWE2YmQxMzA2MWZjYTM4NmEyNTY3YzMyNDU5YzQwMTcwYzNjMjU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/16aa6bd13061fca386a2567c32459c40170c3c25",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/16aa6bd13061fca386a2567c32459c40170c3c25",
+      "tree": {
+        "sha": "fb230096525dda5b091ed8df671cb2fe798ef788",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fb230096525dda5b091ed8df671cb2fe798ef788"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/07b6638a0624caf35ee8413a3f8a559d7cf9c227",
+          "sha": "07b6638a0624caf35ee8413a3f8a559d7cf9c227",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/07b6638a0624caf35ee8413a3f8a559d7cf9c227"
+        }
+      ],
+      "message": "contrib: add BCC script to record TxGraph traces via USDT\n\nAdd a Python BCC script that attaches to all TxGraph USDT tracepoints\nand records operations into a binary TXGTRACE file for offline replay.\n\nThe eBPF handler functions are generated at runtime from Python data\ndefinitions rather than C preprocessor macros, because BCC does not\nallow its builtins (bpf_usdt_readarg, perf_submit) inside macro\nexpansions.\n\nVariable-length operations (get_ancestors_union, get_descendants_union,\ncount_distinct_clusters) read a fixed-size 64-element uint32_t buffer\nfrom userspace via bpf_probe_read_user.",
+      "committer": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T16:11:40Z"
+      },
+      "author": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-03T07:25:45Z"
+      },
+      "sha": "16aa6bd13061fca386a2567c32459c40170c3c25"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE3NWIxMmFjY2M1NmVmN2JlODkyOTZlNmUwNzUyN2IxODA3Y2RkZGY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/175b12accc56ef7be89296e6e07527b1807cdddf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/175b12accc56ef7be89296e6e07527b1807cdddf",
+      "tree": {
+        "sha": "4bf8da0d4853f28b47bdb11bbb24a8a2bc0bd613",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4bf8da0d4853f28b47bdb11bbb24a8a2bc0bd613"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/16aa6bd13061fca386a2567c32459c40170c3c25",
+          "sha": "16aa6bd13061fca386a2567c32459c40170c3c25",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/16aa6bd13061fca386a2567c32459c40170c3c25"
+        }
+      ],
+      "message": "contrib: add trace analysis script for cluster topology\n\nAdd analyze_trace.py that parses TXGTRACE binary files and reports:\n- Peak and final mempool size (transaction count)\n- Cluster size distribution\n- Chain-shaped vs non-chain cluster classification\n- Dependency statistics and edge sanity checks\n\nCorrectly handles staged mutations (only applied on CommitStaging,\ndiscarded on AbortStaging) and tracks oversized cluster warnings.",
+      "committer": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T16:11:40Z"
+      },
+      "author": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-03T07:25:55Z"
+      },
+      "sha": "175b12accc56ef7be89296e6e07527b1807cdddf"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQxOWM0MjA1YzRlMjBmNmU4ZDlkNDY0ZWE4N2M3NzQyZWY0ZjZlYWE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa",
+      "tree": {
+        "sha": "50fd8badc667f24ab6bc213d753f53fd0281a7a4",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/50fd8badc667f24ab6bc213d753f53fd0281a7a4"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/175b12accc56ef7be89296e6e07527b1807cdddf",
+          "sha": "175b12accc56ef7be89296e6e07527b1807cdddf",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/175b12accc56ef7be89296e6e07527b1807cdddf"
+        }
+      ],
+      "message": "contrib: add txgraph-replay trace replay tool\n\nAdd a standalone tool that replays TXGTRACE binary trace files and\nreports per-entry-point timing statistics. Used to compare TxGraph\nperformance across different implementations.\n\nReads the binary format produced by txgraph_trace_recorder.py,\nreconstructs TxGraph API calls, and measures execution time for\neach query/trigger operation. Mutations are replayed but not timed.\n\nBuilt separately from Bitcoin Core via build_replay.sh, which links\nagainst pre-built Bitcoin Core libraries. A standalone CMakeLists.txt\naccepts BITCOIN_SOURCE_DIR and BITCOIN_BUILD_DIR parameters. No\nmodifications to Bitcoin Core's root or src/ CMake files are required.",
+      "committer": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T16:11:40Z"
+      },
+      "author": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-03T07:26:17Z"
+      },
+      "sha": "d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQ4MjI2ODI3MzQ1YjBmZDAxZTg2YzgzM2ZhYzJkYTU3MjNkMTVjMjk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/48226827345b0fd01e86c833fac2da5723d15c29",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/48226827345b0fd01e86c833fac2da5723d15c29",
+      "tree": {
+        "sha": "15708eb676fba98a0e3cabf48328b92825a08f41",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/15708eb676fba98a0e3cabf48328b92825a08f41"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa",
+          "sha": "d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d19c4205c4e20f6e8d9d464ea87c7742ef4f6eaa"
+        }
+      ],
+      "message": "contrib: extract tracing_defs.py as single source of truth for probe definitions\n\nMove all opcode constants, probe argument types, and binary format\nserialization/deserialization into tracing_defs.py. Both the BCC\nrecorder and the analysis script now import from this shared module.\n\nAdding a new TxGraph tracepoint only requires adding one entry to the\nPROBES list in tracing_defs.py (plus the TRACEPOINT call in txgraph.cpp\nand the dispatch case in txgraph_replay.cpp). The recorder and analyzer\nadapt automatically.",
+      "committer": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T16:11:52Z"
+      },
+      "author": {
+        "name": "Hao Xu",
+        "email": "hao.xu@linux.dev",
+        "date": "2026-04-04T04:32:43Z"
+      },
+      "sha": "48226827345b0fd01e86c833fac2da5723d15c29"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 24198124165,
+      "node_id": "HRFPE_lADOABII5876pnB-zwAAAAWiUhKF",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24198124165",
+      "actor": {
+        "login": "HowHsu",
+        "id": 38499194,
+        "node_id": "MDQ6VXNlcjM4NDk5MTk0",
+        "avatar_url": "https://avatars.githubusercontent.com/u/38499194?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/HowHsu",
+        "html_url": "https://github.com/HowHsu",
+        "followers_url": "https://api.github.com/users/HowHsu/followers",
+        "following_url": "https://api.github.com/users/HowHsu/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/HowHsu/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/HowHsu/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/HowHsu/subscriptions",
+        "organizations_url": "https://api.github.com/users/HowHsu/orgs",
+        "repos_url": "https://api.github.com/users/HowHsu/repos",
+        "events_url": "https://api.github.com/users/HowHsu/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/HowHsu/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "48226827345b0fd01e86c833fac2da5723d15c29",
+      "commit_url": "https://api.github.com/repos/HowHsu/bitcoin/commits/48226827345b0fd01e86c833fac2da5723d15c29",
+      "created_at": "2026-04-04T16:15:44Z"
+    },
+    {
+      "event": "labeled",
+      "id": 24198128167,
+      "node_id": "LE_lADOABII5876pnB-zwAAAAWiUiIn",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24198128167",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-04T16:16:13Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": []
