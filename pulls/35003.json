@@ -43,7 +43,7 @@
     "body": "Early note: the majority of this PR consists of test coverage. The changes per se are quite small, just the issue shows up in multiple paths in slightly different forms.\r\n\r\nThe goal of the PR is to ensure I/O errors are not silently ignored during validation or P2P message handling. In some cases, such as `GETDATA` or `GETBLOCKTXN` requests, errors can be swallowed, leaving the node unresponsive to the request without any action. In a harder to reach but more severe case, a swallowed error can leave the node alive but stuck, unable to process new blocks and advance the chain. Also, silently ignoring errors obviously makes problems harder to diagnose. So this PR seeks to improve all of that.\r\n\r\nCurrently, the same root cause, inability to access the blocks directory, can produce different behaviors depending on where it occurs: \r\n1. If it happens during block connection, inside `AcceptBlock()`, the error gets caught and triggers a fatal error graceful shutdown. This is the correct behavior.\r\n\r\n2. If it happens during block connection (due to the unguarded `FlatFileSeq::Open` -> `fs::create_directories` call), after `AcceptBlock()`, inside `ActivateBestChain()`, the error gets thrown and swallowed by the P2P general try-catch, leaving the node in a living but stuck state. Where `ActivateBestChain()` will always silently fail on any posterior block processing, retrying to active the failing block.\r\n\r\n3. If it happens during `GETDATA` request, the file system error gets swallowed by the message handling general try-catch, only logging a net-debug-level message. The remote peer is not disconnected, nor the node aborts. It just silently ignores the request. This is different to a missing block data, which currently logs the error + disconnects the peer.\r\n\r\n4. If it happens during `GETBLOCKTXN` request, the file system error either gets swallowed by the message handling general try-catch or crashes the system via an assertion, depending on if the problem is at the blocks directory level or at the block data level, which is inconsistent.\r\n\r\n\r\nSo, this PR makes failure handling consistent and ensures the node never enters a stuck state due to a block I/O error. Changes:\r\n\r\n1. `GETDATA` now treats the issue in the same way as other I/O errors: it logs the error + disconnect the remote peer.\r\n2. `GETBLOCKTXN` now triggers a fatal error and graceful shutdown. The error here is stricter than in `GETDATA` because it can only access the last 10 blocks, which must be available for reorgs.\r\n3. `ActivateBestChain()` now triggers a fatal error and graceful shutdown when it happens. Fixing the silent stuck node state scenario.\r\n\r\n\r\nTesting Note\r\nCan reproduce the different behaviors that cause the stuck node scenario by running the second commit’s unit test 28af683b5dfdce88892e367b308857b94ec630fe or by manually introducing an exception in `ConnectTip()` (which occurs inside `ActivateBestChain()`). Previously, the thrown exception would have being caught by the general P2P try-catch and logged only at net-debug level, which most users do not have enabled, leaving the node alive but stuck, as subsequent block connections repeatedly attempt to process the failing block, throw the exception again, and get silently swallowed. Adding a functional test for this scenario is not possible due to the requirement of failing inside `ActivateBestChain()`, which always occurs after `AcceptBlock()`, which correctly captures the error.\r\n\r\n\r\nSeparate Note\r\nThere is another assertion scenario that we can move to graceful shutdown (fatal error) in the compact block relay that I haven't done here.\r\n\r\nExtra Note\r\nIf want to see a similar error producing a crash, but in the wallet, go to #34176.",
     "labels": [],
     "created_at": "2026-04-04T15:29:58Z",
-    "updated_at": "2026-04-13T17:04:36Z",
+    "updated_at": "2026-04-13T18:45:02Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -312,9 +312,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38904,
-        "stargazers_count": 88804,
-        "watchers_count": 88804,
+        "forks_count": 38903,
+        "stargazers_count": 88805,
+        "watchers_count": 88805,
         "size": 311359,
         "default_branch": "master",
         "open_issues_count": 690,
@@ -336,7 +336,7 @@
         "visibility": "public",
         "pushed_at": "2026-04-13T12:40:43Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-04-13T17:33:55Z",
+        "updated_at": "2026-04-13T18:58:45Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -366,7 +366,7 @@
     "deletions": 3,
     "changed_files": 8,
     "commits": 5,
-    "review_comments": 9,
+    "review_comments": 11,
     "comments": 4
   },
   "events": [
@@ -2038,6 +2038,114 @@
       "start_side": null,
       "line": null,
       "original_line": 44,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3075089920",
+      "pull_request_review_id": 4101122388,
+      "id": 3075089920,
+      "node_id": "PRRC_kwDOABII5863SiYA",
+      "diff_hunk": "@@ -0,0 +1,141 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that inaccessible block files are properly handled through P2P paths.\"\"\"\n+\n+import contextlib\n+import os\n+import platform\n+import re\n+import stat\n+\n+from test_framework.blocktools import (\n+    create_block,\n+)\n+from test_framework.messages import (\n+    BlockTransactionsRequest,\n+    CInv,\n+    MSG_BLOCK,\n+    MSG_WITNESS_FLAG,\n+    msg_block,\n+    msg_getblocktxn,\n+    msg_getdata,\n+)\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+\n+\n+@contextlib.contextmanager\n+def simulate_io_error(blocks_path):\n+    # Make block files inaccessible by renaming the blocks directory\n+    blocks_bak = blocks_path.parent / \"blocks_bak\"\n+    parent_dir = blocks_path.parent\n+    old_mode = stat.S_IMODE(os.stat(parent_dir).st_mode)\n+\n+    os.rename(blocks_path, blocks_bak)\n+    os.chmod(parent_dir, 0o500)  # Prevent re-creation of blocks/\n+\n+    try:\n+        yield\n+    finally:\n+        os.chmod(parent_dir, old_mode)\n+        if blocks_bak.exists() and not blocks_path.exists():\n+            os.rename(blocks_bak, blocks_path)\n+\n+class P2PBlockIOErrorTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+\n+    def test_block_connect_on_broken_fs(self):\n+        self.log.info(\"Test block connect on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block = create_block(tmpl=node.getblocktemplate({\"rules\": [\"segwit\"]}))\n+        block.solve()\n+\n+        with simulate_io_error(node.blocks_path):\n+            with node.assert_debug_log(expected_msgs=[\"AcceptBlock FAILED (AcceptBlock: Failed to find position to write new block to disk)\"]):\n+                peer.send_without_ping(msg_block(block))\n+                peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test\n+        self.start_node(0)\n+\n+    def test_getdata_on_broken_fs(self):\n+        \"\"\"The node should not swallow GETDATA requests during I/O issues\"\"\"\n+        self.log.info(\"Test GETDATA on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        self.generate(node, 6, sync_fun=self.no_op)\n+\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block_hash = node.getblockhash(3)  # Not in recent cache\n+        with simulate_io_error(node.blocks_path):\n+            # Request block and expect disconnection. The node must not swallow the exception and do nothing.\n+            with node.assert_debug_log(expected_msgs=[\"Cannot load block from disk\"],\n+                                       unexpected_msgs=[\"[ProcessMessages] [net] ProcessMessages(getdata, 37 bytes): Exception 'filesystem error\"],\n+                                       timeout=30):\n+                peer.send_without_ping(msg_getdata([CInv(MSG_BLOCK | MSG_WITNESS_FLAG, int(block_hash, 16))]))\n+                peer.wait_for_disconnect()\n+\n+            # Currently, the node keeps running\n+            node.getblockcount()\n+\n+    def test_getblocktxn_fatal_on_block_io_error(self):\n+        \"\"\"GETBLOCKTXN block read failures should trigger a fatal error.\n+\n+        Unlike GETDATA, this path operates on recent blocks that must be\n+        available for normal operation (reorgs). A failure here is\n+        unrecoverable and must not be swallowed by the P2P message handling\n+        general try-catch.\n+        \"\"\"\n+        self.log.info(\"Test GETBLOCKTXN triggers fatal error on inaccessible filesystem\")\n+        node = self.nodes[0]\n+\n+        # Generate two blocks so that the first one is evicted from the\n+        # m_most_recent_block cache.\n+        self.generate(node, 1, sync_fun=self.no_op)",
+      "path": "test/functional/p2p_handle_io_errors.py",
+      "position": 1,
+      "original_position": 103,
+      "commit_id": "825dfc200520d503fec64346ed01a8b12ec8fa54",
+      "original_commit_id": "825dfc200520d503fec64346ed01a8b12ec8fa54",
+      "in_reply_to_id": 3072571895,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Done as suggested.",
+      "created_at": "2026-04-13T18:44:53Z",
+      "updated_at": "2026-04-13T18:44:54Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3075089920",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3075089920"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 103,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3075090653",
+      "pull_request_review_id": 4101123404,
+      "id": 3075090653,
+      "node_id": "PRRC_kwDOABII5863Sijd",
+      "diff_hunk": "@@ -0,0 +1,141 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that inaccessible block files are properly handled through P2P paths.\"\"\"\n+\n+import contextlib\n+import os\n+import platform\n+import re\n+import stat\n+\n+from test_framework.blocktools import (\n+    create_block,\n+)\n+from test_framework.messages import (\n+    BlockTransactionsRequest,\n+    CInv,\n+    MSG_BLOCK,\n+    MSG_WITNESS_FLAG,\n+    msg_block,\n+    msg_getblocktxn,\n+    msg_getdata,\n+)\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+\n+\n+@contextlib.contextmanager\n+def simulate_io_error(blocks_path):\n+    # Make block files inaccessible by renaming the blocks directory\n+    blocks_bak = blocks_path.parent / \"blocks_bak\"\n+    parent_dir = blocks_path.parent\n+    old_mode = stat.S_IMODE(os.stat(parent_dir).st_mode)\n+\n+    os.rename(blocks_path, blocks_bak)\n+    os.chmod(parent_dir, 0o500)  # Prevent re-creation of blocks/\n+\n+    try:\n+        yield\n+    finally:\n+        os.chmod(parent_dir, old_mode)\n+        if blocks_bak.exists() and not blocks_path.exists():\n+            os.rename(blocks_bak, blocks_path)\n+\n+class P2PBlockIOErrorTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+\n+    def test_block_connect_on_broken_fs(self):\n+        self.log.info(\"Test block connect on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block = create_block(tmpl=node.getblocktemplate({\"rules\": [\"segwit\"]}))\n+        block.solve()\n+\n+        with simulate_io_error(node.blocks_path):\n+            with node.assert_debug_log(expected_msgs=[\"AcceptBlock FAILED (AcceptBlock: Failed to find position to write new block to disk)\"]):\n+                peer.send_without_ping(msg_block(block))\n+                peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test\n+        self.start_node(0)\n+\n+    def test_getdata_on_broken_fs(self):\n+        \"\"\"The node should not swallow GETDATA requests during I/O issues\"\"\"\n+        self.log.info(\"Test GETDATA on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        self.generate(node, 6, sync_fun=self.no_op)",
+      "path": "test/functional/p2p_handle_io_errors.py",
+      "position": 1,
+      "original_position": 75,
+      "commit_id": "825dfc200520d503fec64346ed01a8b12ec8fa54",
+      "original_commit_id": "825dfc200520d503fec64346ed01a8b12ec8fa54",
+      "in_reply_to_id": 3072563470,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Done as suggested.",
+      "created_at": "2026-04-13T18:45:01Z",
+      "updated_at": "2026-04-13T18:45:02Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3075090653",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3075090653"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 75,
       "side": "RIGHT"
     }
   ]
