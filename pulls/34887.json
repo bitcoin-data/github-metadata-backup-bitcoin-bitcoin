@@ -53,11 +53,11 @@
       }
     ],
     "created_at": "2026-03-21T01:12:00Z",
-    "updated_at": "2026-04-16T13:53:17Z",
+    "updated_at": "2026-04-16T16:20:45Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "d3935de280a7dfe9937f3b512f7dffe40cbf4aac",
+    "merge_commit_sha": "1cf0598b248d6c63b7f214a8793090776e1e3e2f",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -299,12 +299,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38911,
-        "stargazers_count": 88831,
-        "watchers_count": 88831,
+        "forks_count": 38908,
+        "stargazers_count": 88833,
+        "watchers_count": 88833,
         "size": 311473,
         "default_branch": "master",
-        "open_issues_count": 699,
+        "open_issues_count": 698,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -321,9 +321,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-04-16T12:46:09Z",
+        "pushed_at": "2026-04-16T16:19:41Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-04-16T13:26:00Z",
+        "updated_at": "2026-04-16T16:31:42Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -353,7 +353,7 @@
     "deletions": 2,
     "changed_files": 5,
     "commits": 3,
-    "review_comments": 72,
+    "review_comments": 74,
     "comments": 4
   },
   "events": [
@@ -5190,6 +5190,114 @@
       "start_side": null,
       "line": 122,
       "original_line": 133,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3094680946",
+      "pull_request_review_id": 4122502445,
+      "id": 3094680946,
+      "node_id": "PRRC_kwDOABII5864dRVy",
+      "diff_hunk": "@@ -0,0 +1,274 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <dbwrapper.h>\n+#include <logging.h>\n+#include <sync.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/util/random.h>\n+#include <util/byte_units.h>\n+\n+#include <leveldb/env.h>\n+#include <leveldb/helpers/memenv/memenv.h>\n+\n+#include <algorithm>\n+#include <cassert>\n+#include <cstdint>\n+#include <deque>\n+#include <map>\n+#include <memory>\n+#include <numeric>\n+#include <set>\n+#include <vector>\n+\n+namespace {\n+\n+/**\n+ * A leveldb::Env that wraps a memenv and captures scheduled background\n+ * work (compaction) instead of dispatching to a real thread. The fuzz\n+ * harness calls RunOne() or DrainWork() at fuzzer-chosen points to\n+ * execute it, giving deterministic control over when compaction\n+ * interleaves with foreground operations.\n+ *\n+ * Deadlock prevention: LevelDB's MakeRoomForWrite blocks on a condition\n+ * variable when the previous immutable memtable is still awaiting compaction,\n+ * or when the L0 file count hits kL0_StopWritesTrigger. Since both conditions\n+ * can only be resolved by the (deferred) background work, the harness drains\n+ * all pending work before every write to avoid a single-threaded deadlock.\n+ */\n+class DeterministicEnv final : public leveldb::EnvWrapper\n+{\n+    struct Work {\n+        void (*function)(void*);\n+        void* arg;\n+    };\n+\n+    mutable Mutex m_mutex;\n+    std::deque<Work> m_queue GUARDED_BY(m_mutex);\n+\n+public:\n+    explicit DeterministicEnv(leveldb::Env* base) : EnvWrapper(base) {}\n+\n+    void Schedule(void (*function)(void* arg), void* arg) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        m_queue.push_back({function, arg});\n+    }\n+\n+    bool HasPending() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        return !m_queue.empty();\n+    }\n+\n+    /** Execute one pending background task. The task may schedule a\n+     *  successor which is left pending for a later call. */\n+    void RunOne() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        Work work{nullptr, nullptr};\n+        {\n+            LOCK(m_mutex);\n+            if (m_queue.empty()) return;\n+            work = m_queue.front();\n+            m_queue.pop_front();\n+        }\n+        work.function(work.arg);\n+    }\n+\n+    /** Execute pending background tasks until none remain. */\n+    void DrainWork() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        while (HasPending()) {\n+            RunOne();\n+        }\n+    }\n+};\n+\n+constexpr size_t MAX_VALUE_SIZE{4096};\n+\n+/** Generate a deterministic value from key and length. The fuzz input\n+ *  controls only the key and a 16-bit length; the actual content is\n+ *  derived from a fixed pattern and doubled so that fuzz bytes aren't\n+ *  wasted on bulk data. */\n+std::vector<uint8_t> MakeValue(uint16_t key, uint16_t len)\n+{\n+    std::vector<uint8_t> v(static_cast<size_t>(len) * 2);\n+    std::iota(v.begin(), v.end(), static_cast<uint8_t>(key));\n+    return v;\n+}\n+\n+/** Comparator matching LevelDB's lexicographic order on little-endian\n+ *  serialized uint16_t keys (low byte first, then high byte). */\n+struct SerializedU16Cmp {\n+    bool operator()(uint16_t a, uint16_t b) const\n+    {\n+        const auto swap{[](uint16_t v) -> uint16_t { return static_cast<uint16_t>((v << 8) | (v >> 8)); }};\n+        return swap(a) < swap(b);\n+    }\n+};\n+\n+struct FailDeserialize {\n+    template <typename Stream>\n+    void Unserialize(Stream&) { throw std::runtime_error{\"intentional\"}; }\n+};\n+\n+void initialize_dbwrapper()\n+{\n+    LogInstance().DisableLogging();\n+}\n+\n+} // namespace\n+\n+FUZZ_TARGET(dbwrapper, .init = initialize_dbwrapper)\n+{\n+    SeedRandomStateForTest(SeedRand::ZEROS);\n+    FuzzedDataProvider provider{buffer.data(), buffer.size()};\n+\n+    const auto memenv{std::unique_ptr<leveldb::Env>{leveldb::NewMemEnv(leveldb::Env::Default())}};\n+    DeterministicEnv det_env{memenv.get()};\n+\n+    const bool obfuscate{provider.ConsumeBool()};\n+    const size_t cache_bytes{provider.ConsumeIntegralInRange<size_t>(64 << 10, 1_MiB)};\n+    const size_t max_file_size{provider.ConsumeIntegralInRange<size_t>(1_MiB, 4_MiB)};\n+\n+    CDBWrapper dbw{{\n+        .path = \"\",\n+        .cache_bytes = cache_bytes,\n+        .obfuscate = obfuscate,\n+        .testing_env = &det_env,\n+        .max_file_size = max_file_size,\n+    }};\n+\n+    // Oracle: key → value length. Content is reconstructed via MakeValue().\n+    std::map<uint16_t, uint16_t, SerializedU16Cmp> oracle;\n+\n+    LIMITED_WHILE(provider.ConsumeBool(), 10000)\n+    {\n+        CallOneOf(\n+            provider,\n+            // --- Mutations ---\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                const uint16_t len{provider.ConsumeIntegralInRange<uint16_t>(0, MAX_VALUE_SIZE)};\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.Write(key, MakeValue(key, len), sync);\n+                oracle[key] = len;\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.Erase(key, sync);\n+                oracle.erase(key);\n+            },\n+            [&] {\n+                CDBBatch batch{dbw};\n+                std::map<uint16_t, uint16_t> batch_writes;\n+                std::set<uint16_t> batch_erases;\n+                const auto fill{[&] {\n+                    LIMITED_WHILE(provider.ConsumeBool(), 20)\n+                    {\n+                        if (provider.ConsumeBool()) {\n+                            const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                            const uint16_t len{provider.ConsumeIntegralInRange<uint16_t>(0, MAX_VALUE_SIZE)};\n+                            batch.Write(key, MakeValue(key, len));\n+                            batch_writes[key] = len;\n+                            batch_erases.erase(key);\n+                        } else {\n+                            const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                            batch.Erase(key);\n+                            batch_erases.insert(key);\n+                            batch_writes.erase(key);\n+                        }\n+                    }\n+                }};\n+                fill();\n+                if (provider.ConsumeBool()) {\n+                    (void)batch.ApproximateSize();\n+                    batch.Clear();\n+                    batch_writes.clear();\n+                    batch_erases.clear();\n+                    fill();\n+                }\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.WriteBatch(batch, sync);\n+                for (const auto& [k, v] : batch_writes) oracle[k] = v;\n+                for (const auto& k : batch_erases) oracle.erase(k);\n+            },\n+            // --- Reads ---\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                std::vector<uint8_t> value;\n+                const bool found{dbw.Read(key, value)};\n+                const auto it{oracle.find(key)};\n+                assert(found == (it != oracle.end()));\n+                if (found) assert(value == MakeValue(key, it->second));\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                assert(dbw.Exists(key) == oracle.contains(key));\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                FailDeserialize wrong_type;\n+                assert(!dbw.Read(key, wrong_type));",
+      "path": "src/test/fuzz/dbwrapper.cpp",
+      "position": 1,
+      "original_position": 219,
+      "commit_id": "b967e255e7620b8366ec1aeb8932138455be8701",
+      "original_commit_id": "b967e255e7620b8366ec1aeb8932138455be8701",
+      "in_reply_to_id": 3079150646,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "> You are suggesting that it is \"unlikely\" the value will be present in this codepath\r\n\r\nI instrumented the `FailUnserialize` branch to distinguish `Read()` returning `false` because the key is absent vs because deserialization throws.\r\nRunning the `dbwrapper` fuzzer for 766,281 executions showed 46,127 missing-key hits and 3,041 actual deserialization-failure hits.\r\nSo while libFuzzer does discover the intended path, about 94% of the observed hits to this branch are still the missing-key case rather than the deserialization-failure case.\r\nThis is what I meant by unlikely.",
+      "created_at": "2026-04-16T16:14:26Z",
+      "updated_at": "2026-04-16T16:14:26Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34887#discussion_r3094680946",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3094680946"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34887"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 219,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3094717406",
+      "pull_request_review_id": 4122545478,
+      "id": 3094717406,
+      "node_id": "PRRC_kwDOABII5864daPe",
+      "diff_hunk": "@@ -0,0 +1,274 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <dbwrapper.h>\n+#include <logging.h>\n+#include <sync.h>\n+#include <test/fuzz/FuzzedDataProvider.h>\n+#include <test/fuzz/fuzz.h>\n+#include <test/fuzz/util.h>\n+#include <test/util/random.h>\n+#include <util/byte_units.h>\n+\n+#include <leveldb/env.h>\n+#include <leveldb/helpers/memenv/memenv.h>\n+\n+#include <algorithm>\n+#include <cassert>\n+#include <cstdint>\n+#include <deque>\n+#include <map>\n+#include <memory>\n+#include <numeric>\n+#include <set>\n+#include <vector>\n+\n+namespace {\n+\n+/**\n+ * A leveldb::Env that wraps a memenv and captures scheduled background\n+ * work (compaction) instead of dispatching to a real thread. The fuzz\n+ * harness calls RunOne() or DrainWork() at fuzzer-chosen points to\n+ * execute it, giving deterministic control over when compaction\n+ * interleaves with foreground operations.\n+ *\n+ * Deadlock prevention: LevelDB's MakeRoomForWrite blocks on a condition\n+ * variable when the previous immutable memtable is still awaiting compaction,\n+ * or when the L0 file count hits kL0_StopWritesTrigger. Since both conditions\n+ * can only be resolved by the (deferred) background work, the harness drains\n+ * all pending work before every write to avoid a single-threaded deadlock.\n+ */\n+class DeterministicEnv final : public leveldb::EnvWrapper\n+{\n+    struct Work {\n+        void (*function)(void*);\n+        void* arg;\n+    };\n+\n+    mutable Mutex m_mutex;\n+    std::deque<Work> m_queue GUARDED_BY(m_mutex);\n+\n+public:\n+    explicit DeterministicEnv(leveldb::Env* base) : EnvWrapper(base) {}\n+\n+    void Schedule(void (*function)(void* arg), void* arg) override EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        m_queue.push_back({function, arg});\n+    }\n+\n+    bool HasPending() const EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        LOCK(m_mutex);\n+        return !m_queue.empty();\n+    }\n+\n+    /** Execute one pending background task. The task may schedule a\n+     *  successor which is left pending for a later call. */\n+    void RunOne() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        Work work{nullptr, nullptr};\n+        {\n+            LOCK(m_mutex);\n+            if (m_queue.empty()) return;\n+            work = m_queue.front();\n+            m_queue.pop_front();\n+        }\n+        work.function(work.arg);\n+    }\n+\n+    /** Execute pending background tasks until none remain. */\n+    void DrainWork() EXCLUSIVE_LOCKS_REQUIRED(!m_mutex)\n+    {\n+        while (HasPending()) {\n+            RunOne();\n+        }\n+    }\n+};\n+\n+constexpr size_t MAX_VALUE_SIZE{4096};\n+\n+/** Generate a deterministic value from key and length. The fuzz input\n+ *  controls only the key and a 16-bit length; the actual content is\n+ *  derived from a fixed pattern and doubled so that fuzz bytes aren't\n+ *  wasted on bulk data. */\n+std::vector<uint8_t> MakeValue(uint16_t key, uint16_t len)\n+{\n+    std::vector<uint8_t> v(static_cast<size_t>(len) * 2);\n+    std::iota(v.begin(), v.end(), static_cast<uint8_t>(key));\n+    return v;\n+}\n+\n+/** Comparator matching LevelDB's lexicographic order on little-endian\n+ *  serialized uint16_t keys (low byte first, then high byte). */\n+struct SerializedU16Cmp {\n+    bool operator()(uint16_t a, uint16_t b) const\n+    {\n+        const auto swap{[](uint16_t v) -> uint16_t { return static_cast<uint16_t>((v << 8) | (v >> 8)); }};\n+        return swap(a) < swap(b);\n+    }\n+};\n+\n+struct FailDeserialize {\n+    template <typename Stream>\n+    void Unserialize(Stream&) { throw std::runtime_error{\"intentional\"}; }\n+};\n+\n+void initialize_dbwrapper()\n+{\n+    LogInstance().DisableLogging();\n+}\n+\n+} // namespace\n+\n+FUZZ_TARGET(dbwrapper, .init = initialize_dbwrapper)\n+{\n+    SeedRandomStateForTest(SeedRand::ZEROS);\n+    FuzzedDataProvider provider{buffer.data(), buffer.size()};\n+\n+    const auto memenv{std::unique_ptr<leveldb::Env>{leveldb::NewMemEnv(leveldb::Env::Default())}};\n+    DeterministicEnv det_env{memenv.get()};\n+\n+    const bool obfuscate{provider.ConsumeBool()};\n+    const size_t cache_bytes{provider.ConsumeIntegralInRange<size_t>(64 << 10, 1_MiB)};\n+    const size_t max_file_size{provider.ConsumeIntegralInRange<size_t>(1_MiB, 4_MiB)};\n+\n+    CDBWrapper dbw{{\n+        .path = \"\",\n+        .cache_bytes = cache_bytes,\n+        .obfuscate = obfuscate,\n+        .testing_env = &det_env,\n+        .max_file_size = max_file_size,\n+    }};\n+\n+    // Oracle: key → value length. Content is reconstructed via MakeValue().\n+    std::map<uint16_t, uint16_t, SerializedU16Cmp> oracle;\n+\n+    LIMITED_WHILE(provider.ConsumeBool(), 10000)\n+    {\n+        CallOneOf(\n+            provider,\n+            // --- Mutations ---\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                const uint16_t len{provider.ConsumeIntegralInRange<uint16_t>(0, MAX_VALUE_SIZE)};\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.Write(key, MakeValue(key, len), sync);\n+                oracle[key] = len;\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.Erase(key, sync);\n+                oracle.erase(key);\n+            },\n+            [&] {\n+                CDBBatch batch{dbw};\n+                std::map<uint16_t, uint16_t> batch_writes;\n+                std::set<uint16_t> batch_erases;\n+                const auto fill{[&] {\n+                    LIMITED_WHILE(provider.ConsumeBool(), 20)\n+                    {\n+                        if (provider.ConsumeBool()) {\n+                            const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                            const uint16_t len{provider.ConsumeIntegralInRange<uint16_t>(0, MAX_VALUE_SIZE)};\n+                            batch.Write(key, MakeValue(key, len));\n+                            batch_writes[key] = len;\n+                            batch_erases.erase(key);\n+                        } else {\n+                            const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                            batch.Erase(key);\n+                            batch_erases.insert(key);\n+                            batch_writes.erase(key);\n+                        }\n+                    }\n+                }};\n+                fill();\n+                if (provider.ConsumeBool()) {\n+                    (void)batch.ApproximateSize();\n+                    batch.Clear();\n+                    batch_writes.clear();\n+                    batch_erases.clear();\n+                    fill();\n+                }\n+                const bool sync{provider.ConsumeBool()};\n+                det_env.DrainWork();\n+                dbw.WriteBatch(batch, sync);\n+                for (const auto& [k, v] : batch_writes) oracle[k] = v;\n+                for (const auto& k : batch_erases) oracle.erase(k);\n+            },\n+            // --- Reads ---\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                std::vector<uint8_t> value;\n+                const bool found{dbw.Read(key, value)};\n+                const auto it{oracle.find(key)};\n+                assert(found == (it != oracle.end()));\n+                if (found) assert(value == MakeValue(key, it->second));\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                assert(dbw.Exists(key) == oracle.contains(key));\n+            },\n+            [&] {\n+                const uint16_t key{provider.ConsumeIntegral<uint16_t>()};\n+                FailDeserialize wrong_type;\n+                assert(!dbw.Read(key, wrong_type));\n+            },\n+            [&] {\n+                const std::unique_ptr<CDBIterator> it{dbw.NewIterator()};",
+      "path": "src/test/fuzz/dbwrapper.cpp",
+      "position": 1,
+      "original_position": 222,
+      "commit_id": "b967e255e7620b8366ec1aeb8932138455be8701",
+      "original_commit_id": "b967e255e7620b8366ec1aeb8932138455be8701",
+      "in_reply_to_id": 3078931288,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Ok, seems we're talking past each other here, will unsubscribe and leave it to others to review.",
+      "created_at": "2026-04-16T16:20:45Z",
+      "updated_at": "2026-04-16T16:20:45Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34887#discussion_r3094717406",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3094717406"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34887"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 222,
       "side": "RIGHT"
     }
   ]
