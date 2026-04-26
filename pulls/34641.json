@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34641/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34641/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/acf49161117336567f3f18d7709777bd506a900f",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/c75a1c90ada598572552dc62441ca945bbc60e01",
     "number": 34641,
     "state": "open",
     "locked": false,
@@ -41,23 +41,13 @@
       "patch_url": null
     },
     "body": "### Problem\r\n\r\n`-dbcache` controls how much RAM Bitcoin Core uses for the in-memory view of the UTXO set, while the authoritative chainstate remains on disk.\r\nThe default is still the fixed `450 MiB` value, chosen almost a decade ago, even though chainstate size and typical hardware profiles have changed significantly since then.\r\n\r\nIn practice, a fixed `450 MiB` default is often too conservative on modern systems, where larger cache sizes can reduce flush churn and disk roundtrips during validation, especially in IBD. At the same time, memory pressure remains important on smaller systems.\r\n\r\n### Historical changes\r\n\r\n| Date       | dbcache change | PR                                                                                                                                                                                                    |\r\n|------------|----------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|\r\n| 2016-07-06 | 100 -> 300     | [#8273: Bump -dbcache default to 300MiB](https://github.com/bitcoin/bitcoin/commit/32cab91278651d07a11132b7636dc3d21144e616#diff-d102b6032635ce90158c1e6e614f03b50e4449aa46ce23370da5387a658342fdR25) |\r\n| 2017-04-05 | 300 -> 450     | [#10133: Clean up calculations of pcoinsTip memory usage](https://github.com/bitcoin/bitcoin/pull/10133/changes#diff-d102b6032635ce90158c1e6e614f03b50e4449aa46ce23370da5387a658342fdR31)             |\r\n| 2026-02-27 | 450 -> 1024 | [#34692: Bump dbcache to 1 GiB](https://github.com/bitcoin/bitcoin/pull/34692/changes#diff-27467d7959ed740703b223fd131c1f515cc2193d84b896bd4c70c4943a3c12aeR31)\r\n\r\n### IRC\r\n\r\nThe discussion converged on avoiding a single new fixed `-dbcache` value and moving to RAM-aware defaults instead, balancing performance gains on modern hardware against OOM risk on lower-memory systems.\r\n\r\n<details>\r\n<summary>IRC log links</summary>\r\n\r\n* https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-02-17\r\n* https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-02-18\r\n* https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-02-19\r\n* https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-02-26\r\n\r\n</details>\r\n\r\n### Node provider defaults\r\n\r\n* [RaspiBlitz](https://x.com/RaspiBlitz/status/2026625309563388353) sets a higher dbcache during IBD (when no other apps are running), then lowers it afterward.\r\n* [Start9](https://x.com/start9labs/status/2026651195167944775) can set the default dynamically based on total RAM; currently creates a user task to lower dbcache after IBD if it was increased.\r\n* [MyNode](https://x.com/mynodebtc/status/2026694281541374418) automatically adjusts based on system memory (4 GB RAM → 1 GB cache, 8 GB RAM → 2.5 GB cache, 16 GB RAM → 4 GB cache) and also scales max mempool size.\r\n* [Umbrel](https://x.com/lukechilds/status/2026899284474356081) used to default to 50% RAM during IBD then reduce to 200 MiB post-IBD, but removed that logic because dedicating that much RAM caused issues when users ran other apps; now ships Core defaults.\r\n\r\n### Containerization\r\n\r\nContainer memory constraints may or may not be reflected by RAM detection.\r\nWe have considered adding container-detection but decided against it. Startup logs show detected/assumed system memory so users can set `-dbcache` explicitly when needed.\r\n\r\n### Fix\r\n\r\nMeasuring `-reindex-chainstate` on different machines indicates that 450-1024-2048 jumps are all very relevant after which the effects taper off.\r\n\r\nReplace the fixed default with a RAM-aware policy:\r\n```math\r\n\\text{default\\_dbcache}=\\mathrm{clamp}\\left(100\\,\\mathrm{MiB},\\ 0.25\\cdot\\left(\\text{system RAM}-2\\,\\mathrm{GiB}\\right),\\ 2\\,\\mathrm{GiB}\\right)\r\n```\r\n\r\nIf system RAM cannot be determined, assume 4 GiB on 64-bit builds and 2 GiB on 32-bit builds.\r\nManual `-dbcache` values are unchanged and still override the automatic default.\r\n\r\n### Warning threshold update\r\n\r\nOversized `-dbcache` warnings are kept and aligned with the new policy.\r\nThe previous low-memory/high-memory cliff at `FALLBACK_RAM_BYTES`is replaced by a single monotonic rule that re-uses the same `RESERVED_RAM` budget the auto default already accounts for:\r\n\r\n```math\r\n\\text{warn if } \\mathit{dbcache} > \\max\\!\\left(\\mathit{default\\_dbcache},\\ 0.75 \\cdot \\max\\!\\left(\\text{system RAM} - 2\\,\\mathrm{GiB},\\ 0\\right)\\right)\r\n```\r\n\r\nThe auto default uses 25% of the post-`RESERVED_RAM` headroom; warning at 75% of that headroom keeps a 25% margin above `RESERVED_RAM` for OS / mempool variance, while ensuring the auto default never trips its own warning.\r\n\r\n### Performance measurements\r\n\r\n#### reindex-chainstate\r\n\r\n<img width=\"2384\" height=\"1181\" alt=\"image\" src=\"https://github.com/user-attachments/assets/6ca5036c-47a8-4047-811d-582f7c0f8d4e\" />\r\n\r\nMachine | 450 MiB | 1000 MiB | 1536 MiB | 2000 MiB | 3000 MiB\r\n-- | -- | -- | -- | -- | --\r\nM4 Max 16c, 64Gi, SSD | 5h 37m | 3h 12m | — | **2h 17m** | 1h 57m\r\ni7-7700 HDD 8c, 62Gi, HDD | 13h 09m | 10h 24m | — | **8h 42m** | 8h 30m\r\nrpi5-8 4c, 7.7Gi, SSD | 52h 06m | — | **36h 24m** | — | —\r\nrpi5-16 4c, 15Gi, SSD | 13h 35m | 12h 10m | — | **10h 54m** | 10h 45m\r\ni9-9900K 16c, 62Gi, SSD | 6h 07m | 5h 28m | — | **5h 05m** | 4h 57m\r\nXeon E5 Win 8c, 31Gi, SSD | 10h 28m | 9h 30m | — | **8h 36m** | 8h 24m\r\numbrel N150 4c, 15Gi, SSD | 9h 20m | 8h 19m | — | **7h 52m** | 7h 45m\r\n\r\n---\r\n\r\n<details><summary>N150 (Umbrel) - 1.18x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=936639; CC=gcc; CXX=g++; \\\r\n  BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_IPC=OFF && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 097c18239b Merge bitcoin/bitcoin#34385: subprocess: Fix `-Wunused-private-field` when building with clang-cl on Windows\r\n\r\n> 2026-02-19 | reindex-chainstate | 936639 blocks | dbcache 450 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        33619.332 s               [User: 61450.140 s, System: 5671.449 s]\r\n```\r\n\r\n> 2026-02-25 | reindex-chainstate | 936639 blocks | dbcache 1000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n\r\n  Time (abs ≡):        29948.973 s               [User: 51470.950 s, System: 3405.477 s]\r\n```\r\n\r\n> 2026-02-25 | reindex-chainstate | 936639 blocks | dbcache 2000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        28352.766 s               [User: 46633.422 s, System: 2298.085 s]\r\n```\r\n\r\n> 2026-02-20 | reindex-chainstate | 936639 blocks | dbcache 3000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        27910.440 s               [User: 44917.351 s, System: 2090.958 s]\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>Rpi5 (16) - 1.24x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=936639; CC=gcc; CXX=g++; \\\r\n  BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_IPC=OFF && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 097c18239b Merge bitcoin/bitcoin#34385: subprocess: Fix `-Wunused-private-field` when building with clang-cl on Windows\r\n\r\n> 2026-02-19 | reindex-chainstate | 936639 blocks | dbcache 450 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        48933.904 s               [User: 94560.562 s, System: 7823.574 s]\r\n```\r\n\r\n> 2026-02-24 | reindex-chainstate | 936639 blocks | dbcache 1000 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        43856.539 s               [User: 78451.084 s, System: 5183.434 s]\r\n```\r\n\r\n> 2026-02-25 | reindex-chainstate | 936639 blocks | dbcache 2000 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        39259.025 s               [User: 69044.492 s, System: 3227.006 s]\r\n```\r\n\r\n> 2026-02-26 | reindex-chainstate | 936639 blocks | dbcache 3000 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        38756.884 s               [User: 65947.478 s, System: 2887.489 s]\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>Rpi5 (8) - 1.43x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 1536 2000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=936639; CC=gcc; CXX=g++; \\\r\n  BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_IPC=OFF && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 097c18239b Merge bitcoin/bitcoin#34385: subprocess: Fix `-Wunused-private-field` when building with clang-cl on Windows\r\n\r\n> 2026-02-19 | reindex-chainstate | 936639 blocks | dbcache 450 | rpi5-8 | aarch64 | Cortex-A76 | 4 cores | 7.7Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        187564.724 s               [User: 98927.942 s, System: 19100.209 s]\r\n```\r\n\r\n> 2026-02-25 | reindex-chainstate | 936639 blocks | dbcache 1000 | rpi5-8 | aarch64 | Cortex-A76 | 4 cores | 7.7Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        132856.721 s               [User: 77471.886 s, System: 13535.639 s]\r\n```\r\n\r\n> 2026-02-22 | reindex-chainstate | 936639 blocks | dbcache 1536 | rpi5-8 | aarch64 | Cortex-A76 | 4 cores | 7.7Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1536 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        131061.887 s               [User: 71355.478 s, System: 12038.086 s]\r\n```\r\n\r\n> 2026-02-27 | reindex-chainstate | 936639 blocks | dbcache 2000 | rpi5-8 | aarch64 | Cortex-A76 | 4 cores | 7.7Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        125837.682 s               [User: 69422.152 s, System: 11621.279 s]\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>Apple M4 Max - 2.46x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=900000; \\\r\n  DATA_DIR=\"$HOME/Library/Application Support/Bitcoin\"; LOG_DIR=\"$HOME/bitcoin-reindex-logs\"; mkdir -p \"$LOG_DIR\"; \\\r\n  COMMA_COMMITS=${COMMITS// /,}; \\\r\n  (echo \"\"; for c in $(echo $COMMITS); do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(sysctl -n machdep.cpu.brand_string) | $(nproc) cores | $(printf '%.1fGiB' \"$(( $(sysctl -n hw.memsize)/1024/1024/1024 ))\") RAM | SSD | $(sw_vers -productName) $(sw_vers -productVersion) $(sw_vers -buildVersion) | $(xcrun clang --version | head -1)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$LOG_DIR/rdx-$(echo \"$COMMITS\" | sed -E 's/([a-f0-9]{8})[a-f0-9]+ ?/\\1-/g;s/-$//')-$STOP-$DBCACHE-appleclang.json\" \\\r\n    --parameter-list COMMIT \"$COMMA_COMMITS\" \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null || true; rm -f \\\"$DATA_DIR\\\"/debug.log; git checkout {COMMIT}; git reset --hard && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j2 && \\\r\n      ./build/bin/bitcoind -datadir=\\\"$DATA_DIR\\\" -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20\" \\\r\n    --conclude \"killall bitcoind 2>/dev/null || true; sleep 5; grep -q 'height=0' \\\"$DATA_DIR\\\"/debug.log && grep -q 'Disabling script verification at block #1' \\\"$DATA_DIR\\\"/debug.log && grep -q \\\"height=$STOP\\\" \\\"$DATA_DIR\\\"/debug.log || { echo 'debug.log assertions failed'; exit 1; }; \\\r\n                cp \\\"$DATA_DIR\\\"/debug.log \\\"$LOG_DIR\\\"/debug-{COMMIT}-\\$(date +%s).log 2>/dev/null || true\" \\\r\n    \"./build/bin/bitcoind -datadir=\\\"$DATA_DIR\\\" -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 097c18239b Merge bitcoin/bitcoin#34385: subprocess: Fix `-Wunused-private-field` when building with clang-cl on Windows\r\n\r\n> 2026-02-21 | reindex-chainstate | 900000 blocks | dbcache 450 | M4-Max.local | arm64 | Apple M4 Max | 16 cores | 64.0GiB RAM | SSD | macOS 26.2 25C56 | Apple clang version 17.0.0 (clang-1700.6.3.2)\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind -datadir=\"/Users/lorinc/Library/Application Support/Bitcoin\" -stopatheight=900000 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        20261.315 s               [User: 18768.521 s, System: 4271.673 s]\r\n```\r\n\r\n> 2026-02-27 | reindex-chainstate | 900000 blocks | dbcache 1000 | M4-Max.local | arm64 | Apple M4 Max | 16 cores | 64.0GiB RAM | SSD | macOS 26.3 25D125 | Apple clang version 17.0.0 (clang-1700.6.3.2)\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind -datadir=\"/Users/lorinc/Library/Application Support/Bitcoin\" -stopatheight=900000 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        11574.620 s               [User: 12147.446 s, System: 2417.914 s]\r\n```\r\n\r\n> 2026-02-26 | reindex-chainstate | 900000 blocks | dbcache 2000 | M4-Max.local | arm64 | Apple M4 Max | 16 cores | 64.0GiB RAM | SSD | macOS 26.3 25D125 | Apple clang version 17.0.0 (clang-1700.6.3.2)\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind -datadir=\"/Users/lorinc/Library/Application Support/Bitcoin\" -stopatheight=900000 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        8226.676 s               [User: 9083.949 s, System: 1179.971 s]\r\n```\r\n\r\n> 2026-02-21 | reindex-chainstate | 900000 blocks | dbcache 3000 | M4-Max.local | arm64 | Apple M4 Max | 16 cores | 64.0GiB RAM | SSD | macOS 26.2 25C56 | Apple clang version 17.0.0 (clang-1700.6.3.2)\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind -datadir=\"/Users/lorinc/Library/Application Support/Bitcoin\" -stopatheight=900000 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        7064.184 s               [User: 7701.391 s, System: 668.060 s]\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>i7 HDD - 1.51x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=936639; CC=gcc; CXX=g++; \\\r\n  BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_IPC=OFF && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 097c18239b Merge bitcoin/bitcoin#34385: subprocess: Fix `-Wunused-private-field` when building with clang-cl on Windows\r\n\r\n> 2026-02-21 | reindex-chainstate | 936639 blocks | dbcache 450 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 cores | 62Gi RAM | HDD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        47384.896 s               [User: 54460.024 s, System: 3388.557 s]\r\n```\r\n\r\n> 2026-02-24 | reindex-chainstate | 936639 blocks | dbcache 1000 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 cores | 62Gi RAM | HDD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        37486.190 s               [User: 46563.682 s, System: 2189.609 s]\r\n```\r\n\r\n> 2026-02-25 | reindex-chainstate | 936639 blocks | dbcache 2000 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 cores | 62Gi RAM | HDD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        31379.903 s               [User: 41546.866 s, System: 1383.556 s]\r\n```\r\n\r\n> 2026-02-21 | reindex-chainstate | 936639 blocks | dbcache 3000 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 cores | 62Gi RAM | HDD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        30633.603 s               [User: 39511.869 s, System: 1116.371 s]\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>Windows Xeon - 1.24x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"5401e673d56198f2c0bad366581e70d5d9cd765c\"; \\\r\n  STOP=933339; \\\r\n  HOST=x86_64-w64-mingw32; \\\r\n  XPACK=\"/home/win/xpack-mingw-w64-gcc-15.2.0-2\"; \\\r\n  BASE_DIR=\"/mnt/c/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  WIN_DATA_DIR='C:\\\\my_storage\\\\BitcoinData'; \\\r\n  export PATH=\"$XPACK/bin:$PATH\"; \\\r\n  mkdir -p \"$LOG_DIR\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | win64-gcc15\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-win64.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"taskkill.exe /IM bitcoind.exe /F 2>/dev/null; rm -f ./build/bin/bitcoind.exe; rm -f $DATA_DIR/debug.log; git clean -fxd -e depends/built -e depends/sources -e depends/$HOST; git reset --hard {COMMIT} && \\\r\n      make -C depends HOST=$HOST NO_QT=1 NO_ZMQ=1 CC=\\\"$XPACK/bin/x86_64-w64-mingw32-gcc\\\" CXX=\\\"$XPACK/bin/x86_64-w64-mingw32-g++\\\" -j\\$(nproc) && \\\r\n      cmake -B build -G Ninja --toolchain depends/$HOST/toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_GUI=OFF -DWITH_ZMQ=OFF -DBUILD_TESTS=OFF -DBUILD_BENCH=OFF && \\\r\n      ninja -C build bitcoind -j\\$(nproc) && \\\r\n      ./build/bin/bitcoind.exe -datadir=\\\"$WIN_DATA_DIR\\\" -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"taskkill.exe /IM bitcoind.exe /F 2>/dev/null; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n      cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-\\$(date +%s).log\" \\\r\n    \"./build/bin/bitcoind.exe -datadir=\\\"$WIN_DATA_DIR\\\" -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\"; \\\r\ndone\r\n```\r\n\r\n> 5401e673d5 Merge bitcoin/bitcoin#33604: p2p: Allow block downloads from peers without snapshot block after assumeutxo validation\r\n\r\n> 2026-02-10 | reindex-chainstate | 933339 blocks | dbcache 450 | WIN-A2EHOAU4JET | x86_64 | Intel(R) Xeon(R) CPU E5-2637 v2 @ 3.50GHz | 8 cores | 31Gi RAM | win64-gcc15\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind.exe -datadir=\"C:\\\\my_storage\\\\BitcoinData\" -stopatheight=933339 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 5401e673d56198f2c0bad366581e70d5d9cd765c)\r\n  Time (abs ≡):        37691.648 s               [User: 0.000 s, System: 0.001 s]\r\n```\r\n\r\n> 2026-02-24 | reindex-chainstate | 933339 blocks | dbcache 1000 | WIN-A2EHOAU4JET | x86_64 | Intel(R) Xeon(R) CPU E5-2637 v2 @ 3.50GHz | 8 cores | 31Gi RAM | win64-gcc15\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind.exe -datadir=\"C:\\\\my_storage\\\\BitcoinData\" -stopatheight=933339 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 5401e673d56198f2c0bad366581e70d5d9cd765c)\r\n  Time (abs ≡):        34250.996 s               [User: 0.002 s, System: 0.000 s]\r\n```\r\n\r\n> 2026-02-26 | reindex-chainstate | 933339 blocks | dbcache 2000 | WIN-A2EHOAU4JET | x86_64 | Intel(R) Xeon(R) CPU E5-2637 v2 @ 3.50GHz | 8 cores | 31Gi RAM | win64-gcc15\r\n\r\n```bash\r\nBenchmark 1: ./build/bin/bitcoind.exe -datadir=\"C:\\\\my_storage\\\\BitcoinData\" -stopatheight=933339 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 5401e673d56198f2c0bad366581e70d5d9cd765c)\r\n  Time (abs ≡):        31001.091 s               [User: 0.000 s, System: 0.002 s]\r\n```\r\n\r\n> 2026-02-21 | reindex-chainstate | 933339 blocks | dbcache 3000 | WIN-A2EHOAU4JET | x86_64 | Intel(R) Xeon(R) CPU E5-2637 v2 @ 3.50GHz | 8 cores | 31Gi RAM | win64-gcc15\r\n\r\n```bash\r\nBenchmark 2: ./build/bin/bitcoind.exe -datadir=\"C:\\\\my_storage\\\\BitcoinData\" -stopatheight=933339 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 5401e673d56198f2c0bad366581e70d5d9cd765c)\r\n  Time (abs ≡):        30276.311 s               [User: 0.001 s, System: 0.000 s]\r\n```\r\n</details>\r\n\r\n<details><summary>i9 - 1.20x faster</summary>\r\n\r\n```bash\r\nfor DBCACHE in 450 1000 2000 3000; do \\\r\n  COMMITS=\"097c18239b58a8ee03794b3ebc6e722a0da30d8d\"; \\\r\n  STOP=936639; CC=gcc; CXX=g++; \\\r\n  BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n  (echo \"\"; for c in $COMMITS; do git fetch -q origin $c && git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n  (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n  hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/(\\w{8})\\w+ ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_IPC=OFF && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \"$(printf %.12s {COMMIT})\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n```\r\n\r\n> 5401e673d5 Merge bitcoin/bitcoin#33604: p2p: Allow block downloads from peers without snapshot block after assumeutxo validation\r\n\r\n> 2026-02-26 | reindex-chainstate | 936639 blocks | dbcache 450 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=450 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        22076.658 s               [User: 53940.221 s, System: 3111.267 s]\r\n```\r\n\r\n> 2026-02-26 | reindex-chainstate | 936639 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        19724.533 s               [User: 45709.253 s, System: 2066.725 s]\r\n```\r\n\r\n> 2026-02-26 | reindex-chainstate | 936639 blocks | dbcache 2000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=2000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        18302.184 s               [User: 40157.899 s, System: 1250.246 s]\r\n```\r\n\r\n> 2026-02-27 | reindex-chainstate | 936639 blocks | dbcache 3000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\n```bash\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=936639 -dbcache=3000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 097c18239b58a8ee03794b3ebc6e722a0da30d8d)\r\n  Time (abs ≡):        17858.670 s               [User: 38277.112 s, System: 1008.751 s]\r\n```\r\n\r\n</details>\r\n\r\n### Default/Warning quick reference\r\n\r\n| System RAM | Auto-default (64 / 32) | Warning fires above (64 / 32) |\r\n| ---------- | ---------------------- | ----------------------------- |\r\n| 1 GiB      | 100 MiB                | 100 MiB                       |\r\n| 2 GiB      | 100 MiB                | 100 MiB                       |\r\n| 3 GiB      | 256 MiB                | 768 MiB                       |\r\n| 4 GiB      | 512 MiB                | 1536 / 1024 MiB               |\r\n| 8 GiB      | 1536 / — MiB           | 4608 / — MiB                  |\r\n| 16 GiB     | 2048 / — MiB           | 10752 / — MiB                 |\r\n| 32 GiB     | 2048 / — MiB           | 23040 / — MiB                 |\r\n\r\n<img width=\"2068\" height=\"731\" alt=\"image\" src=\"https://github.com/user-attachments/assets/6e8b755e-b21c-4955-9f59-c19bcc4ccbee\" />\r\n",
-    "labels": [
-      {
-        "id": 955867938,
-        "node_id": "MDU6TGFiZWw5NTU4Njc5Mzg=",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20rebase",
-        "name": "Needs rebase",
-        "description": "",
-        "color": "cccccc",
-        "default": false
-      }
-    ],
+    "labels": [],
     "created_at": "2026-02-20T23:00:45Z",
-    "updated_at": "2026-04-26T15:54:30Z",
+    "updated_at": "2026-04-26T16:52:25Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "0cc16dfd3ecd968188b7343299b4d43185332559",
+    "merge_commit_sha": "2b687460783b4495c96ac4acacd48acc14ae8a0d",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -132,7 +122,7 @@
     "head": {
       "label": "l0rinc:l0rinc/dynamic-dbcache",
       "ref": "l0rinc/dynamic-dbcache",
-      "sha": "acf49161117336567f3f18d7709777bd506a900f",
+      "sha": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -232,7 +222,7 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 299420,
+        "size": 299431,
         "default_branch": "master",
         "open_issues_count": 57,
         "is_template": false,
@@ -245,7 +235,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-04-26T15:54:03Z",
+        "pushed_at": "2026-04-26T16:19:26Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2026-04-24T04:13:54Z",
         "allow_forking": true,
@@ -367,8 +357,8 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 38917,
-        "stargazers_count": 88938,
-        "watchers_count": 88938,
+        "stargazers_count": 88941,
+        "watchers_count": 88941,
         "size": 312012,
         "default_branch": "master",
         "open_issues_count": 706,
@@ -390,7 +380,7 @@
         "visibility": "public",
         "pushed_at": "2026-04-25T08:27:20Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-04-26T15:06:19Z",
+        "updated_at": "2026-04-26T16:42:17Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -421,7 +411,7 @@
     "changed_files": 20,
     "commits": 14,
     "review_comments": 92,
-    "comments": 26
+    "comments": 27
   },
   "events": [
     {
@@ -4925,64 +4915,6 @@
       }
     },
     {
-      "event": "commented",
-      "id": 4317034995,
-      "node_id": "IC_kwDOABII588AAAABAVC58w",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/4317034995",
-      "actor": {
-        "login": "DrahtBot",
-        "id": 39886733,
-        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/DrahtBot",
-        "html_url": "https://github.com/DrahtBot",
-        "followers_url": "https://api.github.com/users/DrahtBot/followers",
-        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
-        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
-        "repos_url": "https://api.github.com/users/DrahtBot/repos",
-        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": "2026-04-24T23:35:29Z",
-      "updated_at": "2026-04-24T23:35:29Z",
-      "author_association": "CONTRIBUTOR",
-      "body": "<!--cf906140f33d8803c4a75a2196329ecb-->\n🐙 This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
-      "user": {
-        "login": "DrahtBot",
-        "id": 39886733,
-        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/DrahtBot",
-        "html_url": "https://github.com/DrahtBot",
-        "followers_url": "https://api.github.com/users/DrahtBot/followers",
-        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
-        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
-        "repos_url": "https://api.github.com/users/DrahtBot/repos",
-        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/34641#issuecomment-4317034995",
-      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34641"
-    },
-    {
       "event": "labeled",
       "id": 24855882228,
       "node_id": "LE_lADOABII587srG3SzwAAAAXJhqn0",
@@ -5378,206 +5310,6 @@
       "sha": "a571904de90cbeb548a90a156f3ffcb4e33ad0fa"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDg0ZjAzZmQwMGExM2ZlNjJhMTc4YjkwYWE2ZTk3OTRhZmRhOTU5MWY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/84f03fd00a13fe62a178b90aa6e9794afda9591f",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/84f03fd00a13fe62a178b90aa6e9794afda9591f",
-      "tree": {
-        "sha": "3b6d53870a2aa19ae87abb63dd3f74338b6ea95d",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3b6d53870a2aa19ae87abb63dd3f74338b6ea95d"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 3b6d53870a2aa19ae87abb63dd3f74338b6ea95d\nparent a571904de90cbeb548a90a156f3ffcb4e33ad0fa\nauthor Lőrinc <pap.lorinc@gmail.com> 1776953338 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777218402 +0200\n\nnode: parametrize `GetDefaultDBCache` on `total_ram` and add `GetTotalRam` helper\n\nAdd an optional `total_ram` parameter to `node::GetDefaultDBCache`: when supplied, the helper computes the default for that RAM value instead of querying the OS.\nThis makes the function unit-testable with synthetic memory sizes and lets `ShouldWarnOversizedDbCache` route its floor through `GetDefaultDBCache(total_ram)` instead of the fixed `DEFAULT_DB_CACHE` constant.\n\nIntroduce `node::GetTotalRam()` as a thin wrapper around `TryGetTotalRam().value_or(0)` that hides the `std::optional` boilerplate at call sites.\nThe helper preserves the existing fallback (zero when detection fails) and is used by `GetDefaultDBCache` on the no-arg path; a follow-up swaps the fallback for a more useful value.\n\nUpdate the warning test to pass the synthetic `total_ram` through `GetDefaultDBCache` to keep the assertion independent of the host's actual RAM.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuM2IACgkQZp//D/pH\nenZAABAAnWn3llMbFabbst0WDMFS4WvXORB4ZbYOBNBTjidpVirIqdnxfbG/j8Qz\nB6eL+063z6qCnr4oIOmHtBzffD6G2qf9KO3gYzyB4z8zzpYNk2yw8eJB5R3NP/3t\nUn5jWKhnbYk544wxCj/0ZMVdtmC6U7iKrAqfIluuUD/PeqfAhS+8C7+gdyhOqI+3\nuNjPkD6ZbMITO0ZVR3tAOceuubCm2c/yPdbpaEqnvkLKhYPvXlVV5Jpbc/R2hzyi\nS2RCDMAbbTBiwA/KP+8CPLbzu4Qz/Nm3AK1S37M2MLDlazjXA5f5euWXeDfgoNZp\nUa5oZJtfwd/l/b8UyAJUDFl7ZCAL3tRm8ft8j98p5i9WZ5op+SpN0sHeO435GXuZ\nYeF2yaHlolpXZStztRqqZ6KijGQwefRUNTeqUmOHTZnTpnWXZhfjkB5pX8bEBkkN\nuoMU+GvnJR64J128MryCbDEoFIdeFou3umj1/KsdTbJxEq0gDRL7I4PDkwEyfYET\nrLE0VUfE+kTCd7QY6rtA5CShpJm+k90HnU+JqnCFrYVN2kwXyJFUR+mtuVmrklzt\nl9vB05cuAtNClKm5lo3DqiFiios/YOfpTgY2pzzUGMgeCpTx7MzmnrJwFYwtsxgg\nszy0iOLjWTjJVjqqw8DdRPcEQa7LatFP3EJmhoKxZMlFMlhz6zI=\n=m+s8\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a571904de90cbeb548a90a156f3ffcb4e33ad0fa",
-          "sha": "a571904de90cbeb548a90a156f3ffcb4e33ad0fa",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a571904de90cbeb548a90a156f3ffcb4e33ad0fa"
-        }
-      ],
-      "message": "node: parametrize `GetDefaultDBCache` on `total_ram` and add `GetTotalRam` helper\n\nAdd an optional `total_ram` parameter to `node::GetDefaultDBCache`: when supplied, the helper computes the default for that RAM value instead of querying the OS.\nThis makes the function unit-testable with synthetic memory sizes and lets `ShouldWarnOversizedDbCache` route its floor through `GetDefaultDBCache(total_ram)` instead of the fixed `DEFAULT_DB_CACHE` constant.\n\nIntroduce `node::GetTotalRam()` as a thin wrapper around `TryGetTotalRam().value_or(0)` that hides the `std::optional` boilerplate at call sites.\nThe helper preserves the existing fallback (zero when detection fails) and is used by `GetDefaultDBCache` on the no-arg path; a follow-up swaps the fallback for a more useful value.\n\nUpdate the warning test to pass the synthetic `total_ram` through `GetDefaultDBCache` to keep the assertion independent of the host's actual RAM.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-26T15:46:42Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-23T14:08:58Z"
-      },
-      "sha": "84f03fd00a13fe62a178b90aa6e9794afda9591f"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGM5NDAxMzkzMGRkMTc5YzY2OGU0MzFjZTExZjkzMDNlMjdmYTU5ZjY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c94013930dd179c668e431ce11f9303e27fa59f6",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/c94013930dd179c668e431ce11f9303e27fa59f6",
-      "tree": {
-        "sha": "d24e388a3d37bb9e7ac4f1fd51a7bff83cd4a4ff",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d24e388a3d37bb9e7ac4f1fd51a7bff83cd4a4ff"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree d24e388a3d37bb9e7ac4f1fd51a7bff83cd4a4ff\nparent 84f03fd00a13fe62a178b90aa6e9794afda9591f\nauthor Lőrinc <pap.lorinc@gmail.com> 1771535484 +0100\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777218402 +0200\n\nnode: make default `dbcache` RAM-aware\n\nThe existing automatic `-dbcache` default is too high for small systems and too conservative for larger ones.\n\nCompute the automatic default as `max(100 MiB, min(max(total_ram - 2 GiB, 0) / 4, min(2 GiB, MAX_DBCACHE_BYTES)))`.\n\nThe 2 GiB upper limit was chosen because it is still a lot faster than 1 GiB, but barely faster than 3 GiB.\n\nWhen RAM detection is unavailable, fall back to 4 GiB on 64-bit and 2 GiB on 32-bit by changing the existing `GetTotalRam()` helper to substitute `FALLBACK_RAM_BYTES` instead of `0`.\n\nThe new fallback only matters on platforms where neither `sysconf` nor `GlobalMemoryStatusEx` work, but it gives the auto default a sensible target on those systems.\n\nDrop the now-redundant `DEFAULT_DB_CACHE` constant. The earlier kernel-default unification already routed Qt settings migration through `node::GetDefaultDBCache()`, so the same RAM-aware policy applies there too.\n\nReplace the body of `GetDefaultDBCache(total_ram)` with the new min/max formula and add the matching `MIN_DEFAULT_DBCACHE`, `MAX_DEFAULT_DBCACHE`, `FALLBACK_RAM_BYTES` constants.\n\nSince excessive `-dbcache` values are covered by the startup warning, remove the generic RAM warning from the `-dbcache` help text (\"Make sure you have enough RAM\").\n\nAlso assert the default `dbcache` never triggers the oversized warning.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: willcl-ark <will8clark@gmail.com>\nCo-authored-by: ismaelsadeeq <abubakarsadiqismail@proton.me>\nCo-authored-by: optout <13562139+optout21@users.noreply.github.com>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuM2IACgkQZp//D/pH\nenbmAA/9EO/MJu+OHzW4QrlbauqqOf+d1rBZe60+hp06imj/SdKY7y0FQPxZ7VRX\nPeo9uooAhMr1fbbcPYGHcsmffk9pyudIozWceek+tl8sKTHL4ufErE8s0OJmMcNm\nPMN/oHEz/P4vgM7C7nUGAcx9Wcirn6O7HUbNXAxVDk6UJbWzwihsQupJQ1zjPPw0\n7OAz/LUVGQQca2BrRDbVpL8KW2QiPBBQkKyjsPeiSyanOmkk9VCX5pntt9vdw26g\n+KFJIqKBCkoCT/s8XKK1aFOP9AOkvDOdHQ/FpZeJhksRLGXaip2uWOmDEFC71uGU\nDRXhyVyidkVE55dUtTWNFG15F9V5ItOwxiEJ+Uh4DJneINzjS44Y1jR2TVqR+Dmz\nY/YZJTODeG/fc2reW9C9FTN6qFZhAftFCeOHOqt1lRcWoOw+eBEZgykyjwzKWe/5\ni5YWzznviPz8F9W72D77RTX7jBfHDNWXStTN/q5xjHb4T6H5ZqDCopbTmDtEbQmU\njEV9kGZ6M2nCkSO8YnypfRK38h3mxpseIYI1M1KLFIR1LTsIN8r7zf8swBnFVt5k\nkXOb7LEyKCSDql+cYZxDCWY3qhd0FEoCtDMiJooji+PDu1VQqVkB8JfROYcyN1c6\nTh2a4JYamI4yO1npOsJS27Fg2M+vDi1GIERuPD7KJtj5iXoGukE=\n=1I1V\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/84f03fd00a13fe62a178b90aa6e9794afda9591f",
-          "sha": "84f03fd00a13fe62a178b90aa6e9794afda9591f",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/84f03fd00a13fe62a178b90aa6e9794afda9591f"
-        }
-      ],
-      "message": "node: make default `dbcache` RAM-aware\n\nThe existing automatic `-dbcache` default is too high for small systems and too conservative for larger ones.\n\nCompute the automatic default as `max(100 MiB, min(max(total_ram - 2 GiB, 0) / 4, min(2 GiB, MAX_DBCACHE_BYTES)))`.\n\nThe 2 GiB upper limit was chosen because it is still a lot faster than 1 GiB, but barely faster than 3 GiB.\n\nWhen RAM detection is unavailable, fall back to 4 GiB on 64-bit and 2 GiB on 32-bit by changing the existing `GetTotalRam()` helper to substitute `FALLBACK_RAM_BYTES` instead of `0`.\n\nThe new fallback only matters on platforms where neither `sysconf` nor `GlobalMemoryStatusEx` work, but it gives the auto default a sensible target on those systems.\n\nDrop the now-redundant `DEFAULT_DB_CACHE` constant. The earlier kernel-default unification already routed Qt settings migration through `node::GetDefaultDBCache()`, so the same RAM-aware policy applies there too.\n\nReplace the body of `GetDefaultDBCache(total_ram)` with the new min/max formula and add the matching `MIN_DEFAULT_DBCACHE`, `MAX_DEFAULT_DBCACHE`, `FALLBACK_RAM_BYTES` constants.\n\nSince excessive `-dbcache` values are covered by the startup warning, remove the generic RAM warning from the `-dbcache` help text (\"Make sure you have enough RAM\").\n\nAlso assert the default `dbcache` never triggers the oversized warning.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: willcl-ark <will8clark@gmail.com>\nCo-authored-by: ismaelsadeeq <abubakarsadiqismail@proton.me>\nCo-authored-by: optout <13562139+optout21@users.noreply.github.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-26T15:46:42Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-02-19T21:11:24Z"
-      },
-      "sha": "c94013930dd179c668e431ce11f9303e27fa59f6"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDhhOTFiYmJmMDU1ZTUwMmI0NWNlZmYzYTI5ZjIwZjJlOTA2ZWJiMDM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8a91bbbf055e502b45ceff3a29f20f2e906ebb03",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/8a91bbbf055e502b45ceff3a29f20f2e906ebb03",
-      "tree": {
-        "sha": "18367b30a8eeb4189fcf6a3b44d9fa43077e83ae",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/18367b30a8eeb4189fcf6a3b44d9fa43077e83ae"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 18367b30a8eeb4189fcf6a3b44d9fa43077e83ae\nparent c94013930dd179c668e431ce11f9303e27fa59f6\nauthor Lőrinc <pap.lorinc@gmail.com> 1776951139 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777218402 +0200\n\nnode: log the automatically selected `-dbcache` default\n\nAdd `node::LogAutoDbCacheSettings()` and call it from startup whenever `-dbcache` is not explicitly set.\nThe line reports the picked value, whether the underlying total RAM was detected or assumed, and the resulting figure - useful for users on containerized setups where detected RAM may not match the cgroup limit.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuM2IACgkQZp//D/pH\nena9rA//Wu1bE3lbgzdscOA5xS54rtzYyqdNWuQ3Du50/N7Fdryx2re4hbGY5Zq6\nfRlo7bN9PuZ+GA2iOwk96q15rvYcxhCq/W1UReaoXdPCe2GO+9mZHPBxV8g8jr+E\nJRjXv4Hg7oWsrBNHDqeSUyXV25UwP7vQwiUMeg2cJ6pqAVD6tfmdd1JEOctM7nsE\naiwlXwpuTFd4UvtqycB13H3+H/Sjd0WcueIJzAeosgUaOeQiYmVsGWnY8SIpDKQ1\nKDt2YqYjpqTFEgGZ8tR5q3CuQA3NzTE6dppS1tc5JvxbzhENieG/XqUPfyZi1ps1\n9tQgvLM1KKbruOOr9ayn5PLgkVVVjkJQvs22xIoD1KwYN5pN3W6s+kJKzunjQkMz\n9VE6QhFAwXBy4TPIYPtEzcdf/3VW+gOGwYE2WWnXLeKRlgHyZcvpxUIsBboyJVre\nwq4g1Wdocx92SnIfa8BGZE+Pu0YjwCG8MQhGUvAbqFiI62GhAtb41PRU18X85R1W\nty4a6OlZedv3KVowOIj3xcrcRBOiijXHOLfhbrFJAEHGZamsrVvKCUjMhV/bZmEc\nCEtV4GH3FxIU3FEclO8K4WcrMGTdoPCVlxmw8np2OgsDWXIoBEhI4Jo/zGlEg3Kc\nq84aQflM+0ZfR06t9+4UKz+yvTqs3Fiq21jxihBmvhp8336/x3w=\n=bsNP\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c94013930dd179c668e431ce11f9303e27fa59f6",
-          "sha": "c94013930dd179c668e431ce11f9303e27fa59f6",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/c94013930dd179c668e431ce11f9303e27fa59f6"
-        }
-      ],
-      "message": "node: log the automatically selected `-dbcache` default\n\nAdd `node::LogAutoDbCacheSettings()` and call it from startup whenever `-dbcache` is not explicitly set.\nThe line reports the picked value, whether the underlying total RAM was detected or assumed, and the resulting figure - useful for users on containerized setups where detected RAM may not match the cgroup limit.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-26T15:46:42Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-23T13:32:19Z"
-      },
-      "sha": "8a91bbbf055e502b45ceff3a29f20f2e906ebb03"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDU4ZmY1NWI4Y2Q0MmM5NjAzOWQzMzg0MWU5YjRhZWY4NTdlZTRjYjc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/58ff55b8cd42c96039d33841e9b4aef857ee4cb7",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/58ff55b8cd42c96039d33841e9b4aef857ee4cb7",
-      "tree": {
-        "sha": "97b8eaf62cc8dcfe2e1e275395c0145e8994a488",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/97b8eaf62cc8dcfe2e1e275395c0145e8994a488"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 97b8eaf62cc8dcfe2e1e275395c0145e8994a488\nparent 8a91bbbf055e502b45ceff3a29f20f2e906ebb03\nauthor Lőrinc <pap.lorinc@gmail.com> 1776946097 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777218402 +0200\n\ntest: tighten `system_ram_tests` to require RAM detection\n\nNow that `TryGetTotalRam()` feeds the auto `-dbcache` default (not just the oversized warning), make `system_ram_tests` fail on environments where detection fails instead of silently skipping.\nAlso bump the lower bound from `1000_MiB` to `1_GiB` and switch the upper bound to `10'000_GiB` for unit consistency.\n\nDrop the `skipping total_ram` SKIP regex from the CMake test setup since the test no longer emits it.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuM2IACgkQZp//D/pH\nenZf6Q/8ClyxHUQwgW94Mke5r4YJeMBTG/r/ibr94lPh+W/fD/HAu8s1+rbQbJxu\noFrOqWBP70imLavDMg2bh52b9tYh1BaTawbalfqRZfxwwuLYNhmlPkMofRt4H+/Q\nelTHZRgDA6qNG2rdZRFkPZsWCyl3w4g3ZEIP/773E7nazFyjayfUq0rYg/qH1zaW\nJhejiEhAhoJFJuEzo5/ZI9iTrK77w0az5VczfJrs+b0Wq68BruwBrmQ9TIKGplb2\nWpufUnKbBKNen43NcChBSa11+S5dYpyPcWjs6hj+LHi5YfCw6fVs7zArbMUS3lbo\n90+NOooxTh4gYK+KJd7zLVzoVob1+tFev8CJJh+TrSssPK1Epbdj2AfC0OjCFdYz\n+JMyWb7JW7aqajZEmGjrUJZFsx4KsAXDu8tSWqS4hHQ1/JcNL2L3WR+OjO9+oU0a\nM4cySkhSX47XLankrAMRKV9OQAj8hVO7G+tjIb2ymQeJCt7xD/2LnFX+dMLVHwuB\ntZHJ/CiosQ9F3cs5aFFEhY62JdktDySdD1/kaThUF5T+4vG1wazLW1PCVkT8HvdJ\nsKBW+D1U3/8Uokb127K8HNHzbZPUoqihNnzCZ8+8jUBYIdtn7G7bGck0S7yWbxG4\n/GzIGe+Q5s+i/SLs74c+yfV0pk89BpW86oIQfbtAJ3PyqjIb/Io=\n=A5Th\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8a91bbbf055e502b45ceff3a29f20f2e906ebb03",
-          "sha": "8a91bbbf055e502b45ceff3a29f20f2e906ebb03",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8a91bbbf055e502b45ceff3a29f20f2e906ebb03"
-        }
-      ],
-      "message": "test: tighten `system_ram_tests` to require RAM detection\n\nNow that `TryGetTotalRam()` feeds the auto `-dbcache` default (not just the oversized warning), make `system_ram_tests` fail on environments where detection fails instead of silently skipping.\nAlso bump the lower bound from `1000_MiB` to `1_GiB` and switch the upper bound to `10'000_GiB` for unit consistency.\n\nDrop the `skipping total_ram` SKIP regex from the CMake test setup since the test no longer emits it.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-26T15:46:42Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-23T12:08:17Z"
-      },
-      "sha": "58ff55b8cd42c96039d33841e9b4aef857ee4cb7"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGFjZjQ5MTYxMTE3MzM2NTY3ZjNmMThkNzcwOTc3N2JkNTA2YTkwMGY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/acf49161117336567f3f18d7709777bd506a900f",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/acf49161117336567f3f18d7709777bd506a900f",
-      "tree": {
-        "sha": "746531a12fbe76e9c12ac0c6ee90ffd29557e888",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/746531a12fbe76e9c12ac0c6ee90ffd29557e888"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 746531a12fbe76e9c12ac0c6ee90ffd29557e888\nparent 58ff55b8cd42c96039d33841e9b4aef857ee4cb7\nauthor Lőrinc <pap.lorinc@gmail.com> 1771537654 +0100\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777218403 +0200\n\ndoc: add release notes for updated `dbcache` defaults\n\nAlso update related docs.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuM2MACgkQZp//D/pH\nena4Hw/9HznVz/dY+7pYgccF/NU1RBOJTTKJgtE7QokEUZFGCHWwo4tIeUGncM19\nc60mMWMJl6FBjO0mvmyCsfqbvda1UJHyicld/7hY+qMGjjeJk1f7ulS3ghC7RtPn\nU2Cm1YxWasTAeQV9gL8QvzGMKPk8Y0suwQcbKpn0IadEXqWFLDk6Gl5TAW09roSM\n60NwyDhdkaqQDPar+LDvn8HD+xa44uizN9FPdboidicE+q5grZImoMy01TtOBnEG\nYE1YM7jSORFg1q1y9p4cfxUNeg/yFt5c9Kz0YKAchukvju8chicDc64tet3mA7Xk\nfNnbdiVS1KL+P+D6PMMhx7Cpbse+pWAQSMuOijPWzXuEr0ZYKyi6iE4ATNGv1HCM\nZ4XAZq61BTBYeGpoQ+sRVGke35iVxYJsyVA9rItPa7tBT9ta69tRzUgz6Djvq++4\nrm4To8CwiJC/UDYKx6MnYJtpOV6xBvMgzUiTpknSq1F7uUHFK7BJ2GmY4kdIUDjR\nkCyP4HBM6ReGGgv5f20Le2BLhfjP2GwtE9VpDLd/VT/X6tjTTf1bmQvj6sJAR6Xf\nMUIwjemrK4vIA3zq89LM7dn4q4bjpMRad25Wd5dZwQBI1/AwI8lfiEq74ypi3mIe\nmWQPMNKiol/epHlUN7k6cqCtb0jmmX6iX44EmCLb+BeBecdNICU=\n=627T\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/58ff55b8cd42c96039d33841e9b4aef857ee4cb7",
-          "sha": "58ff55b8cd42c96039d33841e9b4aef857ee4cb7",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/58ff55b8cd42c96039d33841e9b4aef857ee4cb7"
-        }
-      ],
-      "message": "doc: add release notes for updated `dbcache` defaults\n\nAlso update related docs.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-26T15:46:43Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-02-19T21:47:34Z"
-      },
-      "sha": "acf49161117336567f3f18d7709777bd506a900f"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 24881433338,
       "node_id": "HRFPE_lADOABII587srG3SzwAAAAXLDIr6",
@@ -5607,6 +5339,458 @@
       "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
       "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/acf49161117336567f3f18d7709777bd506a900f",
       "created_at": "2026-04-26T15:54:05Z"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGExMjM5MmNlOTg5YTIyYTRjOTQ0NWUxYjFmNDgyNTliMzlmNGM0MTQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a12392ce989a22a4c9445e1b1f48259b39f4c414",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/a12392ce989a22a4c9445e1b1f48259b39f4c414",
+      "tree": {
+        "sha": "a9f08b3aacfc090726a3c73b5dfe3f677567fe14",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a9f08b3aacfc090726a3c73b5dfe3f677567fe14"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree a9f08b3aacfc090726a3c73b5dfe3f677567fe14\nparent a571904de90cbeb548a90a156f3ffcb4e33ad0fa\nauthor Lőrinc <pap.lorinc@gmail.com> 1776953338 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219421 +0200\n\nnode: parametrize `GetDefaultDBCache` on `total_ram` and add `GetTotalRam` helper\n\nAdd an optional `total_ram` parameter to `node::GetDefaultDBCache`: when supplied, the helper computes the default for that RAM value instead of querying the OS.\nThis makes the function unit-testable with synthetic memory sizes and lets `ShouldWarnOversizedDbCache` route its floor through `GetDefaultDBCache(total_ram)` instead of the fixed `DEFAULT_DB_CACHE` constant.\n\nIntroduce `node::GetTotalRam()` as a thin wrapper around `TryGetTotalRam().value_or(0)` that hides the `std::optional` boilerplate at call sites.\nThe helper preserves the existing fallback (zero when detection fails) and is used by `GetDefaultDBCache` on the no-arg path; a follow-up swaps the fallback for a more useful value.\n\nUpdate the warning test to pass the synthetic `total_ram` through `GetDefaultDBCache` to keep the assertion independent of the host's actual RAM.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuN10ACgkQZp//D/pH\nenYXDQ//eP4wulGo2pz5IWfXQhFSX/n++zomZic8JjzAo+bE0XiA6wfk8Os95YLU\nNiJXlLeRsZJ7FtMTlM0Qr8s2fGxSp0/v2sCsrFoQsE8gulR5IvEOhlPt6TH5eVDE\noBYlsKQp4wQm0VVx63X+NmLroGS8o2oDzo4H5D3H4jqRI5Qeemlt4YU7+CyDn91f\nbXkgHNnIfljfOVwjaGAj4HXz49yvb9YtWUfkfxqsLVs/K2ik0CdoGDrqpzfdg4wM\nzWdcnabJtZINXmHBsFi1CQ72txwuE1im0TrGITufuEnyQe11NzRycJEqr9rWUfKG\niOQg+xBdJ9tOYZ7iP/RjMnZNKfYzYYF2VaEEpfYC7kicmzM7pNuxM9eiDOXNe2Jt\ndS+OxbzCc4+1o4MruH8qif2aYgIDUSMcP6dolNmvqIvD4S2shkvjdGsP+/w/4GO6\nxUIyKmIqFavoOha94yA2JnhX/OBd8unpb+HABlXQ5kFIZQlUCX1toh8HFxlGEPaX\nNhH10R1qy2KNzWnfvplAENSqNAsKFUYBilSz/uCyzex78Hq9H3p1GwCQoAg+yJDU\nEsCWMtGRQGiRcdYEFh9iqBTz3rtOii/YYTuq5JSoRRvYJkkehjumN8QnWcQOE/+O\nTTv4sfYKtDoPpwvt061TobkuLqEvDt8I1b1O7GNvMQez/R424bE=\n=2MM6\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a571904de90cbeb548a90a156f3ffcb4e33ad0fa",
+          "sha": "a571904de90cbeb548a90a156f3ffcb4e33ad0fa",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a571904de90cbeb548a90a156f3ffcb4e33ad0fa"
+        }
+      ],
+      "message": "node: parametrize `GetDefaultDBCache` on `total_ram` and add `GetTotalRam` helper\n\nAdd an optional `total_ram` parameter to `node::GetDefaultDBCache`: when supplied, the helper computes the default for that RAM value instead of querying the OS.\nThis makes the function unit-testable with synthetic memory sizes and lets `ShouldWarnOversizedDbCache` route its floor through `GetDefaultDBCache(total_ram)` instead of the fixed `DEFAULT_DB_CACHE` constant.\n\nIntroduce `node::GetTotalRam()` as a thin wrapper around `TryGetTotalRam().value_or(0)` that hides the `std::optional` boilerplate at call sites.\nThe helper preserves the existing fallback (zero when detection fails) and is used by `GetDefaultDBCache` on the no-arg path; a follow-up swaps the fallback for a more useful value.\n\nUpdate the warning test to pass the synthetic `total_ram` through `GetDefaultDBCache` to keep the assertion independent of the host's actual RAM.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:03:41Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-23T14:08:58Z"
+      },
+      "sha": "a12392ce989a22a4c9445e1b1f48259b39f4c414"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYwMThiYzRkZjcxZGMwZTQ5NGI0NzQzYjU5ZDI0YTM3MjE2Yjg2Mjg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6018bc4df71dc0e494b4743b59d24a37216b8628",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/6018bc4df71dc0e494b4743b59d24a37216b8628",
+      "tree": {
+        "sha": "d2b3e0350f0f66327c926e9e4106c87e2d77465e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d2b3e0350f0f66327c926e9e4106c87e2d77465e"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree d2b3e0350f0f66327c926e9e4106c87e2d77465e\nparent a12392ce989a22a4c9445e1b1f48259b39f4c414\nauthor Lőrinc <pap.lorinc@gmail.com> 1771535484 +0100\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219423 +0200\n\nnode: make default `dbcache` RAM-aware\n\nThe existing automatic `-dbcache` default is too high for small systems and too conservative for larger ones.\n\nCompute the automatic default as `max(100 MiB, min(max(total_ram - 2 GiB, 0) / 4, min(2 GiB, MAX_DBCACHE_BYTES)))`.\n\nThe 2 GiB upper limit was chosen because it is still a lot faster than 1 GiB, but barely faster than 3 GiB.\n\nWhen RAM detection is unavailable, fall back to 4 GiB on 64-bit and 2 GiB on 32-bit by changing the existing `GetTotalRam()` helper to substitute `FALLBACK_RAM_BYTES` instead of `0`.\n\nThe new fallback only matters on platforms where neither `sysconf` nor `GlobalMemoryStatusEx` work, but it gives the auto default a sensible target on those systems.\n\nDrop the now-redundant `DEFAULT_DB_CACHE` constant. The earlier kernel-default unification already routed Qt settings migration through `node::GetDefaultDBCache()`, so the same RAM-aware policy applies there too.\n\nReplace the body of `GetDefaultDBCache(total_ram)` with the new min/max formula and add the matching `MIN_DEFAULT_DBCACHE`, `MAX_DEFAULT_DBCACHE`, `FALLBACK_RAM_BYTES` constants.\n\nSince excessive `-dbcache` values are covered by the startup warning, remove the generic RAM warning from the `-dbcache` help text (\"Make sure you have enough RAM\").\n\nAlso assert the default `dbcache` never triggers the oversized warning.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: willcl-ark <will8clark@gmail.com>\nCo-authored-by: ismaelsadeeq <abubakarsadiqismail@proton.me>\nCo-authored-by: optout <13562139+optout21@users.noreply.github.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuN18ACgkQZp//D/pH\nenY2RBAAna8YNWGuZoMVVIXinqtERI1js4WQUN0ImkDeaaCz+TwEx45Ynk2V8qwG\nqds+3qHQ27FKB1qYgZemMYAb2795Hxu5+iVBKwyLsENvDDBpqvQW6dDYFg3t4rgO\ne6D/rss1LqPk4GxD+w2YlnTNOWTblfvGdtsmpfBHgx7IafndUVtw1Z2bEjQ6AJ8D\niAwEWfFk3RoylknIlR9y4PrMMpg5oY/UfVUQ4QsEx/C3mlgI8FYXBUUDgJQlNvmx\nCArh8LYLr6te4JHH25+qawhqWYYNpTbkisxRLVyj4ZXCy4IqU+QyTGiC0i4BU/YH\nsADDtsTwOMYdieROtdJEo4mkq0dyaFz+UQsFVyBhW/S2A4qKZ3lcWZDvGt6Sq2YA\nTcYb2GbMW9sYDwhgZXH5bkA0+nKtiEzm9cWBVAO8J8VPeQnlqdXhZQYLY84kSMZ1\n3461r1zzM4KCuMA2eY/yJ4zd+BJJcx2DZ3paw9hjJ977PbV2cDGZYj7PSXMC+N2w\nn1S4yvDC7wyUIDh2p/wW1pQEBhtghxNdI9iFngrxJENxAl6bHB7R4a3KRrpr8wZE\nM60sZAwUzeadR1MEjVd5ILc2JtPpbrzRcbFFpYP8vMfI2+pypJAeYtSiYVEpIT3Z\nuM3/k4vw1giDeYQYiUFM7sFSaYnuBUP100HUD7NE2x29H1txcQU=\n=dBnb\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a12392ce989a22a4c9445e1b1f48259b39f4c414",
+          "sha": "a12392ce989a22a4c9445e1b1f48259b39f4c414",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a12392ce989a22a4c9445e1b1f48259b39f4c414"
+        }
+      ],
+      "message": "node: make default `dbcache` RAM-aware\n\nThe existing automatic `-dbcache` default is too high for small systems and too conservative for larger ones.\n\nCompute the automatic default as `max(100 MiB, min(max(total_ram - 2 GiB, 0) / 4, min(2 GiB, MAX_DBCACHE_BYTES)))`.\n\nThe 2 GiB upper limit was chosen because it is still a lot faster than 1 GiB, but barely faster than 3 GiB.\n\nWhen RAM detection is unavailable, fall back to 4 GiB on 64-bit and 2 GiB on 32-bit by changing the existing `GetTotalRam()` helper to substitute `FALLBACK_RAM_BYTES` instead of `0`.\n\nThe new fallback only matters on platforms where neither `sysconf` nor `GlobalMemoryStatusEx` work, but it gives the auto default a sensible target on those systems.\n\nDrop the now-redundant `DEFAULT_DB_CACHE` constant. The earlier kernel-default unification already routed Qt settings migration through `node::GetDefaultDBCache()`, so the same RAM-aware policy applies there too.\n\nReplace the body of `GetDefaultDBCache(total_ram)` with the new min/max formula and add the matching `MIN_DEFAULT_DBCACHE`, `MAX_DEFAULT_DBCACHE`, `FALLBACK_RAM_BYTES` constants.\n\nSince excessive `-dbcache` values are covered by the startup warning, remove the generic RAM warning from the `-dbcache` help text (\"Make sure you have enough RAM\").\n\nAlso assert the default `dbcache` never triggers the oversized warning.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: willcl-ark <will8clark@gmail.com>\nCo-authored-by: ismaelsadeeq <abubakarsadiqismail@proton.me>\nCo-authored-by: optout <13562139+optout21@users.noreply.github.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:03:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-02-19T21:11:24Z"
+      },
+      "sha": "6018bc4df71dc0e494b4743b59d24a37216b8628"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDkzZmEyYjY1OTU4NzQ2ZjlhYzk0NGE3ZTIxODhkNzczMjMwZTdhZTU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/93fa2b65958746f9ac944a7e2188d773230e7ae5",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/93fa2b65958746f9ac944a7e2188d773230e7ae5",
+      "tree": {
+        "sha": "f63b3795f22f4fe30f5626d21df3aacbdd5d6422",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f63b3795f22f4fe30f5626d21df3aacbdd5d6422"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree f63b3795f22f4fe30f5626d21df3aacbdd5d6422\nparent 6018bc4df71dc0e494b4743b59d24a37216b8628\nauthor Lőrinc <pap.lorinc@gmail.com> 1776951139 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219423 +0200\n\nnode: log the automatically selected `-dbcache` default\n\nAdd `node::LogAutoDbCacheSettings()` and call it from startup whenever `-dbcache` is not explicitly set.\nThe line reports the picked value, whether the underlying total RAM was detected or assumed, and the resulting figure - useful for users on containerized setups where detected RAM may not match the cgroup limit.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuN18ACgkQZp//D/pH\nenZiHQ/6A0fUjSeoGCUvU/rMT1Pyg8idFOUfc9QUVdayf0eqoM3q5SFkiegPatGL\n+a7KhKt72kEF9FpB6QGnLhWK1Yw+RXmhI/Ryb9+PCxoaXYtoSVLLq0Z5KUkohKeh\nJypKPIy2P+uR0AfvIsrjYtnGv6w+/A4yzgDC+3WuA8OiF9z4jBi07mi0NQ5SmAVg\n4V6E3DDV1xEqanROM22yUInXczhZKV02zh2L8FSPeXBlSzub0pzB89McAjjG/6hA\nl3hjo13deqlRUY6WlVsAcM7Mq1G2mwAkALxHf+fso1N7cm/DkYR2RqBB3ECTsemP\nDrh6BX204b0RtslKwJVGYTImFeuWAKf9DpCWRNsy1+EdjR1/z798SKYJ8H0WChOG\nkXqxmvUs2aJVclQGxdgfPj0cAFD/+RUswo0SvwUi/dOMap1zgFKKh28ChFWbHXws\n9N0LP/92ZR1QjNMuwEiBULCmX2zS1z8q90Ioxi+MYLvXDUuwL+RJ9homkuI5i3Xp\ndvyaWyjgvDpAByFpOodoSoVG8n5k9FsiNCCmiB+pSPbrn8VwfZiaaqvbLBJ4g48b\nmtZhcOBetPneLxTnnoE/w69j8XObNi4rMeJOJkS7deIF/RQPw+VQMVPMO/3HZPii\nYDWhzr6fLCc/JnNSrrXKGxkPJS0fY4yBLPcfwyxaeYsoskum5iY=\n=lcXC\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6018bc4df71dc0e494b4743b59d24a37216b8628",
+          "sha": "6018bc4df71dc0e494b4743b59d24a37216b8628",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/6018bc4df71dc0e494b4743b59d24a37216b8628"
+        }
+      ],
+      "message": "node: log the automatically selected `-dbcache` default\n\nAdd `node::LogAutoDbCacheSettings()` and call it from startup whenever `-dbcache` is not explicitly set.\nThe line reports the picked value, whether the underlying total RAM was detected or assumed, and the resulting figure - useful for users on containerized setups where detected RAM may not match the cgroup limit.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:03:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-23T13:32:19Z"
+      },
+      "sha": "93fa2b65958746f9ac944a7e2188d773230e7ae5"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDM1NzUxYTE4Y2MzMzE2MDM0ZDc0YTAwNjI4MTNjMDY0YWQ1ODVhMTE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/35751a18cc3316034d74a0062813c064ad585a11",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/35751a18cc3316034d74a0062813c064ad585a11",
+      "tree": {
+        "sha": "320a86c7aefee81d11e09e48db531a520326e35d",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/320a86c7aefee81d11e09e48db531a520326e35d"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 320a86c7aefee81d11e09e48db531a520326e35d\nparent 93fa2b65958746f9ac944a7e2188d773230e7ae5\nauthor Lőrinc <pap.lorinc@gmail.com> 1776946097 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219423 +0200\n\ntest: tighten `system_ram_tests` to require RAM detection\n\nNow that `TryGetTotalRam()` feeds the auto `-dbcache` default (not just the oversized warning), make `system_ram_tests` fail on environments where detection fails instead of silently skipping.\nAlso bump the lower bound from `1000_MiB` to `1_GiB` and switch the upper bound to `10'000_GiB` for unit consistency.\n\nDrop the `skipping total_ram` SKIP regex from the CMake test setup since the test no longer emits it.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuN18ACgkQZp//D/pH\nenZFCBAAi1flEKO7co8JRfke5jTgeEA2I0QMIbWfwmYYj+phswrQxkYFJv+UTHLE\nJ5A6xQvHhepEM2/dRo/klzCVvaZ2L2hiMRMX65s6vC5WgI3Ze9JhReZoMzFwOXjb\nzWNb+qbWOOQJOv9TZlqAH32IlY5iliJbaNDr16oM8GkXSSOZaO1E7hswHfsAabi9\nZWWev0YH8Tsy/TgyvZflblBIQLpIqiFbpLFcooiV5LhHaxfWC22Jhu3CgW4w8kTS\n3qJr8PU/fCz3rJ+QNecSP+y4HU9kUTlVD9gkxvZApA9yb6R3bzJuULJzqt1xwnVi\nanqCMPRAp7GW6CSDK1w4D7xxBDOdmLVpYi/Y2igrWsmjVXgNAmVVzkQr32f9Z9kC\nWH/33AIDoGZS7vQ+GERHVqR5AfqlMCdmRu/RujlUlcwmcBgNj0usj0m+oUpUEhxz\njmyzAn209/uQRIsRAjqFtdZjZw5e2snTiTaFEJz/B+QziNMU9kvyZdwOGbObCKrZ\nT/jIW9gAHAwEc7kGVh1s1PPw6PFslKp9i+GC/qg2kTCqiqN+7VfqA+86tPmoV8C3\ngBLKpmmuOwalQKyP2XwjgOfhk7E3zukXX+3M0aOwGpeJkC/Ua2OkOA+O6Hq1Efdp\ntKwR2Ipi40kblZUcoHSHoI25gaNBby4IMehY1aUFvPkBIri5Hwo=\n=UDoz\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/93fa2b65958746f9ac944a7e2188d773230e7ae5",
+          "sha": "93fa2b65958746f9ac944a7e2188d773230e7ae5",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/93fa2b65958746f9ac944a7e2188d773230e7ae5"
+        }
+      ],
+      "message": "test: tighten `system_ram_tests` to require RAM detection\n\nNow that `TryGetTotalRam()` feeds the auto `-dbcache` default (not just the oversized warning), make `system_ram_tests` fail on environments where detection fails instead of silently skipping.\nAlso bump the lower bound from `1000_MiB` to `1_GiB` and switch the upper bound to `10'000_GiB` for unit consistency.\n\nDrop the `skipping total_ram` SKIP regex from the CMake test setup since the test no longer emits it.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:03:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-23T12:08:17Z"
+      },
+      "sha": "35751a18cc3316034d74a0062813c064ad585a11"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGM3NWExYzkwYWRhNTk4NTcyNTUyZGM2MjQ0MWNhOTQ1YmJjNjBlMDE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c75a1c90ada598572552dc62441ca945bbc60e01",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c75a1c90ada598572552dc62441ca945bbc60e01",
+      "tree": {
+        "sha": "e81c4bd23e8201130b38eee0c830dc32ff6edb1f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/e81c4bd23e8201130b38eee0c830dc32ff6edb1f"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree e81c4bd23e8201130b38eee0c830dc32ff6edb1f\nparent 35751a18cc3316034d74a0062813c064ad585a11\nauthor Lőrinc <pap.lorinc@gmail.com> 1771537654 +0100\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219423 +0200\n\ndoc: add release notes for updated `dbcache` defaults\n\nAlso update related docs.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuN18ACgkQZp//D/pH\nenbK3BAAm94QdsRJjUyv1F4vCE2/EDl2UKuZpilWe+V5eGgxVtqP7M22stcxkOVF\nTuUaeww0/9v88TXKe3vvhX6ZQo7tpnMAtiDDWI5vLIBtGyKLCdz58VHkcqBbGD++\ng5dwCoeSyW9GKg2bIyPr5DtcOjHWpOWvXRhDPJZeXeW1jNSgOxCjylAH8OwiUViL\n9mpA92UwFuGzsbX0oqj3JEiA2qksISvZWJZgzmg5zbHi2CxeO+60Zvo9EfAIct2O\nrN2T3+OyFhBIAjugRdxj2Cum6H3hLNHF2qPlu1ECpmwoF2Kw5ZE06fED2MNXBFRK\nKkfTbLtCNJrI+4s6QkdI1WmXUYx+LQeOoxm3/ummP2gNfgH9zcJmFVR2FmDN513Q\nqy5toOY9kplMXP3QQ7XH702CH+U5jx6lH0AzznDo036xTIxsVxm4ZeTCd2LhcNuc\nDlIw0qCJHsWDIpXJzWwy+rcd7YV8ABB3o82CUvcrTztLz1QBYDadrSPVDKzWw+rI\n+CyC4uEknnHTUBPIFh+qbpPTeotZgU5mhyXlvOXCnKF3aqy6rDhU9egUUkd2k0Yo\nB5akFm//Bvcb+T0ngUL39AeuoAYlPIt3ToRnRNj3MmWrMU96ydxrCXS9hL8KcaJW\nrmeoyd1CaSoaff6ldrAOHMwg4m4jJUVqxT9t9imfmeqJMZ4yZ5Y=\n=8jds\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/35751a18cc3316034d74a0062813c064ad585a11",
+          "sha": "35751a18cc3316034d74a0062813c064ad585a11",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/35751a18cc3316034d74a0062813c064ad585a11"
+        }
+      ],
+      "message": "doc: add release notes for updated `dbcache` defaults\n\nAlso update related docs.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:03:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-02-19T21:47:34Z"
+      },
+      "sha": "c75a1c90ada598572552dc62441ca945bbc60e01"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 24881539619,
+      "node_id": "HRFPE_lADOABII587srG3SzwAAAAXLDioj",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24881539619",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/c75a1c90ada598572552dc62441ca945bbc60e01",
+      "created_at": "2026-04-26T16:04:43Z"
+    },
+    {
+      "event": "labeled",
+      "id": 24881550553,
+      "node_id": "LE_lADOABII587srG3SzwAAAAXLDlTZ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24881550553",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-26T16:05:42Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 4322435861,
+      "node_id": "IC_kwDOABII588AAAABAaMjFQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/4322435861",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-26T16:05:53Z",
+      "updated_at": "2026-04-26T16:05:53Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--85328a0da195eb286784d51f73fa0af9-->\n🚧 At least one of the CI tasks failed.\n<sub>Task `32 bit ARM`: https://github.com/bitcoin/bitcoin/actions/runs/24960757002/job/73086863250</sub>\n<sub>LLM reason (✨ experimental): CI failed because the build stopped on a compiler error in `bitcoinkernel.cpp` due to `-Werror=narrowing` (uint64_t to size_t narrowing conversion).</sub>\n\n<details><summary>Hints</summary>\n\nTry to run the tests locally, according to the documentation. However, a CI failure may still\nhappen due to a number of reasons, for example:\n\n* Possibly due to a silent merge conflict (the changes in this pull request being\nincompatible with the current code in the target branch). If so, make sure to rebase on the latest\ncommit of the target branch.\n\n* A sanitizer issue, which can only be found by compiling with the sanitizer and running the\n  affected test.\n\n* An intermittent issue.\n\nLeave a comment here, if you need help tracking down a confusing failure.\n\n</details>\n\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34641#issuecomment-4322435861",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34641"
+    },
+    {
+      "event": "unlabeled",
+      "id": 24881578707,
+      "node_id": "UNLE_lADOABII587srG3SzwAAAAXLDsLT",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24881578707",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-26T16:08:13Z",
+      "label": {
+        "name": "Needs rebase",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 4322477242,
+      "node_id": "IC_kwDOABII588AAAABAaPEug",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/4322477242",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-26T16:27:42Z",
+      "updated_at": "2026-04-26T16:28:06Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Rebased, adjusted a few `size_t` to `uint64_t` changes that were brought in by #35097.\r\nI tried to expand the type change further down the line, but the CI gods decided against it so kept most of the original `size_t`.\r\n\r\nAlso removed a few more `constexpr` 32/64 bit guards that aren't needed anymore.\r\n\r\nChanged a leftover `std::clamp` to `min`/`max` combo for consistency (since clamp is undefined for cases when min > max, so some reviewers prefered it as such). ",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34641#issuecomment-4322477242",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34641"
+    },
+    {
+      "event": "unlabeled",
+      "id": 24882043140,
+      "node_id": "UNLE_lADOABII587srG3SzwAAAAXLFdkE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24882043140",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-04-26T16:52:25Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
@@ -6159,7 +6343,7 @@
       "path": "src/common/system.cpp",
       "position": 4,
       "original_position": 4,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "3e998877dbfb3601d28791cd5d10723e299dddc1",
       "in_reply_to_id": null,
       "user": {
@@ -6645,7 +6829,7 @@
       "path": "src/common/system.cpp",
       "position": 4,
       "original_position": 4,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "3e998877dbfb3601d28791cd5d10723e299dddc1",
       "in_reply_to_id": 2848149679,
       "user": {
@@ -8157,7 +8341,7 @@
       "path": "src/node/dbcache.h",
       "position": 26,
       "original_position": 20,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "847ef0a9f9aefe712d80d5c750e65e1cc7e726a8",
       "in_reply_to_id": null,
       "user": {
@@ -8427,7 +8611,7 @@
       "path": "src/node/dbcache.h",
       "position": 26,
       "original_position": 20,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "847ef0a9f9aefe712d80d5c750e65e1cc7e726a8",
       "in_reply_to_id": 2864395127,
       "user": {
@@ -8805,7 +8989,7 @@
       "path": "src/init.cpp",
       "position": 12,
       "original_position": 12,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "363c043dd4465d52f07cec44df66353291645eaf",
       "in_reply_to_id": null,
       "user": {
@@ -8859,7 +9043,7 @@
       "path": "src/init.cpp",
       "position": 12,
       "original_position": 12,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "363c043dd4465d52f07cec44df66353291645eaf",
       "in_reply_to_id": 2900391459,
       "user": {
@@ -8967,7 +9151,7 @@
       "path": "src/common/system.cpp",
       "position": 6,
       "original_position": 6,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "363c043dd4465d52f07cec44df66353291645eaf",
       "in_reply_to_id": null,
       "user": {
@@ -9021,7 +9205,7 @@
       "path": "src/common/system.cpp",
       "position": 16,
       "original_position": 16,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "363c043dd4465d52f07cec44df66353291645eaf",
       "in_reply_to_id": null,
       "user": {
@@ -9075,7 +9259,7 @@
       "path": "src/common/system.cpp",
       "position": 6,
       "original_position": 6,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "363c043dd4465d52f07cec44df66353291645eaf",
       "in_reply_to_id": 2900799899,
       "user": {
@@ -9831,7 +10015,7 @@
       "path": "src/node/caches.cpp",
       "position": 14,
       "original_position": 4,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "424e71683665fe0d45787a74c3ba2743bf9138d0",
       "in_reply_to_id": null,
       "user": {
@@ -9885,7 +10069,7 @@
       "path": "src/node/caches.cpp",
       "position": 14,
       "original_position": 4,
-      "commit_id": "acf49161117336567f3f18d7709777bd506a900f",
+      "commit_id": "c75a1c90ada598572552dc62441ca945bbc60e01",
       "original_commit_id": "424e71683665fe0d45787a74c3ba2743bf9138d0",
       "in_reply_to_id": null,
       "user": {

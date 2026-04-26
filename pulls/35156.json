@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35156/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35156/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/5c3e0202df9ee53d80fea45e1805992d93a61390",
     "number": 35156,
     "state": "open",
     "locked": false,
@@ -43,11 +43,11 @@
     "body": "### Problem\r\n`CDBIterator::GetValue()` cannot use `SpanReader` the same way as `::GetKey()` because values are deobfuscated in place before deserialization, so it still needs an owning mutable buffer.\r\nHowever, the current path allocates a fresh `DataStream` for every value read.\r\n\r\nThe same local-stream pattern also exists in `CDBIterator::Seek()`, while `CDBBatch` already owns reusable key/value buffers but still manually reserves and clears them on every `Write()` and `Erase()` call.\r\n\r\n### Fix\r\nAdd `ScopedDataStreamUsage`, a small RAII helper for caller-owned scratch streams.\r\nIt asserts that the stream is empty on entry (making accidental re-entry or concurrent use of the same scratch stream fail fast), and clears it on scope exit.\r\n\r\nUse it to guard the reusable scratch streams in `CDBBatch::Write()`, `::Erase()` and `CDBIterator::Seek()`, `::GetValue()`.\r\nThe const read-side `CDBWrapper` helpers stay unchanged, since they can be called concurrently on the same wrapper and should keep using local streams.\r\n\r\nThe production changes are preceded by tests covering repeated reuse on the same owning objects, including a failed iterator value decode followed by a successful read from the same iterator entry.\r\n\r\n### Context\r\nFollow-up to #35128, #34483 and #35025.\r\n\r\n### Reproducer\r\n`gettxoutsetinfo` gets an additional ~6% speedup on top of the previous iterator-key optimization:\r\n\r\n<details><summary>2026-04-24 | gettxoutsetinfo | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | xfs | SSD</summary>\r\n\r\n```bash\r\nCOMMITS=\"2d5ab09f0dca4bfec0b365f5f431def2c0c9d70f 9e5fd595ae8ebeec74678c31a547fbc14f87bf89\"; \\\r\nBASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\nmkdir -p \"$LOG_DIR\" && \\\r\n(echo \"\"; for c in $COMMITS; do git cat-file -e \"$c^{commit}\" 2>/dev/null || git fetch -q origin \"$c\" || exit 1; git log -1 --pretty='%h %s' \"$c\" || exit 1; done) && \\\r\n(echo \"\" && echo \"$(date -I) | gettxoutsetinfo | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(df -T $BASE_DIR | awk 'NR==2{print $2}') | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\nhyperfine \\\r\n  --sort command \\\r\n  --runs 3 \\\r\n  --export-json \"$BASE_DIR/gettxoutsetinfo-$(sed -E 's/([a-f0-9]{8})[a-f0-9]* ?/\\1-/g;s/-$//'<<<\"$COMMITS\")-$(date +%s).json\" \\\r\n  --parameter-list COMMIT ${COMMITS// /,} \\\r\n  --prepare \"killall -9 bitcoind 2>/dev/null || true; rm -f $DATA_DIR/debug.log; git clean -fxd && git reset --hard {COMMIT} && \\\r\n    cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind bitcoin-cli -j$(nproc) && \\\r\n    ./build/bin/bitcoind -datadir=$DATA_DIR -connect=0 -listen=0 -dnsseed=0 -coinstatsindex=0 -txindex=0 -blockfilterindex=0 -daemon -printtoconsole=0; \\\r\n    ./build/bin/bitcoin-cli -datadir=$DATA_DIR -rpcwait getblockcount >/dev/null\" \\\r\n  --conclude \"./build/bin/bitcoin-cli -datadir=$DATA_DIR stop 2>/dev/null || true; killall bitcoind 2>/dev/null || true; sleep 10; \\\r\n    grep -q 'Done loading' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n    cp $DATA_DIR/debug.log $LOG_DIR/gettxoutsetinfo-{COMMIT}-$(date +%s).log\" \\\r\n  \"./build/bin/bitcoin-cli -datadir=$DATA_DIR -rpcclienttimeout=0 -named gettxoutsetinfo hash_type='none' use_index='false' >/dev/null\"\r\n\r\n2d5ab09f0d Merge bitcoin/bitcoin#35124: bench: fix benchmark fixtures and setup checks\r\ncb63e158d9 walletdb: reuse batch scratch streams\r\n\r\n2026-04-24 | gettxoutsetinfo | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | xfs | SSD\r\n\r\nBenchmark 1: ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/BitcoinData -rpcclienttimeout=0 -named gettxoutsetinfo hash_type='none' use_index='false' >/dev/null (COMMIT = 2d5ab09f0dca4bfec0b365f5f431def2c0c9d70f)\r\n  Time (mean ± σ):     60.063 s ±  1.623 s    [User: 0.001 s, System: 0.002 s]\r\n  Range (min … max):   59.020 s … 61.933 s    3 runs\r\n\r\nBenchmark 2: ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/BitcoinData -rpcclienttimeout=0 -named gettxoutsetinfo hash_type='none' use_index='false' >/dev/null (COMMIT = cb63e158d9ae8276dbe54bba0b0cf8f35378ec71)\r\n  Time (mean ± σ):     56.853 s ±  0.179 s    [User: 0.002 s, System: 0.001 s]\r\n  Range (min … max):   56.675 s … 57.033 s    3 runs\r\n\r\nRelative speed comparison\r\n        1.06 ±  0.03  ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/BitcoinData -rpcclienttimeout=0 -named gettxoutsetinfo hash_type='none' use_index='false' >/dev/null (COMMIT = 2d5ab09f0dca4bfec0b365f5f431def2c0c9d70f)\r\n        1.00          ./build/bin/bitcoin-cli -datadir=/mnt/my_storage/BitcoinData -rpcclienttimeout=0 -named gettxoutsetinfo hash_type='none' use_index='false' >/dev/null (COMMIT = cb63e158d9ae8276dbe54bba0b0cf8f35378ec71)\r\n```\r\n\r\n</details>\r\n",
     "labels": [],
     "created_at": "2026-04-24T21:29:03Z",
-    "updated_at": "2026-04-26T14:24:15Z",
+    "updated_at": "2026-04-26T16:19:41Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "0a758ea26e1d3f7ea631e07e223450eb38a67ea8",
+    "merge_commit_sha": "18faa5f2ac861dcfececb80f5feff3c727eb6bca",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -55,7 +55,7 @@
     "head": {
       "label": "l0rinc:l0rinc/ScopedDataStreamUsage",
       "ref": "l0rinc/ScopedDataStreamUsage",
-      "sha": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+      "sha": "5c3e0202df9ee53d80fea45e1805992d93a61390",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -155,7 +155,7 @@
         "forks_count": 0,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 299420,
+        "size": 299431,
         "default_branch": "master",
         "open_issues_count": 57,
         "is_template": false,
@@ -168,7 +168,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-04-25T06:20:35Z",
+        "pushed_at": "2026-04-26T16:19:26Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2026-04-24T04:13:54Z",
         "allow_forking": true,
@@ -192,7 +192,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "6322c1697d8edabf885820e1d0c9157b82c67c35",
+      "sha": "0abbe35bb20cd7dae70b9a4d69e70472a9f6f680",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -289,9 +289,9 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38915,
-        "stargazers_count": 88939,
-        "watchers_count": 88939,
+        "forks_count": 38917,
+        "stargazers_count": 88941,
+        "watchers_count": 88941,
         "size": 312012,
         "default_branch": "master",
         "open_issues_count": 706,
@@ -313,7 +313,7 @@
         "visibility": "public",
         "pushed_at": "2026-04-25T08:27:20Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-04-26T14:57:57Z",
+        "updated_at": "2026-04-26T16:42:17Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -339,11 +339,11 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": false,
-    "additions": 81,
+    "additions": 87,
     "deletions": 25,
     "changed_files": 5,
     "commits": 4,
-    "review_comments": 7,
+    "review_comments": 8,
     "comments": 2
   },
   "events": [
@@ -542,166 +542,6 @@
       "commit_id": "8db6665fda51308c8824296c581abe1492662c75",
       "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/8db6665fda51308c8824296c581abe1492662c75",
       "created_at": "2026-04-25T06:15:24Z"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDllZDU1YTViYzZhMDJmY2VlYjdmZjNlMDBkN2JkZGM2N2IwZDJhYzA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0",
-      "tree": {
-        "sha": "d20ed8b5b028b8368311a2a931c1e3fa5c0bce15",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d20ed8b5b028b8368311a2a931c1e3fa5c0bce15"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree d20ed8b5b028b8368311a2a931c1e3fa5c0bce15\nparent 6322c1697d8edabf885820e1d0c9157b82c67c35\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061598 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777097954 +0200\n\nstreams: add `ScopedDataStreamUsage`\n\nSome DB paths reuse caller-owned `DataStream` scratch buffers across calls.\n\nAdd a small RAII helper that asserts the stream is empty on entry and clears it on exit.\nThis preserves the old temporary-stream contract while making accidental nested reuse fail fast in debug builds.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnsXOIACgkQZp//D/pH\nenZ+Yw/8Cew9rzDI0mSfvUU35OCsKiByK1E7P8UGsUpIbAxNuWjVhtlobElzzMES\nSJ+GzLGWZg9u8BwmCJ4PZeXeE9heb17icsIBpTyo7M7ALLbQXF9Na/hSaWw4YYiC\nwmtAO+83xrsYm2mJDN/+ewvOa8EBo1Kk6dtSrvUjlLwSHtSkoV7FRQvOYPltvxll\nA5lA6lpD1E3B7J8Hcv9ssrrTLt4h4+SJbG2EZWiE0KrPVGSVH/oNClRcyszbCPoJ\nH9xHPafXkivBbF9i8byDSYTHYnzNOZUoRyT95KFI5fyKYsWGO1TwMPA0TcFrtpbs\nDJ6EWFXbjRcHokNU+O+LGwP4WjXvhFhjmlDyLkJy3F/ij/rJIgn+Cs4T2l1r2MHU\n0xlfWCOtyKYwusmEFx0N+E7WURGZTCDXiyC5oUJl5I6q1rZk3pHflsbpj0SYL7aC\nvzHxKJcccfPjv2Z0UmtwqIgSj46XNXVXCOi6COcLfydmIL7jdEtILn29atrX9fPc\nj3ciFEdvTc+TlYBocf9a5nrzWEFdeAOdz6TnOWaXOL/ok3OdqOKncvJxKxsyjjqw\nwmJTpllVWS/a9xsd10SBnaQ34ZuPO9FOOt4vnrxyRVaTLFql++mHr42zTkLi9mbK\np9YkZadde/ZL9+rjPIFY2N1DJ5LS0OS8TUbr0Kthiuo0TgV4Oo0=\n=7qSL\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6322c1697d8edabf885820e1d0c9157b82c67c35",
-          "sha": "6322c1697d8edabf885820e1d0c9157b82c67c35",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/6322c1697d8edabf885820e1d0c9157b82c67c35"
-        }
-      ],
-      "message": "streams: add `ScopedDataStreamUsage`\n\nSome DB paths reuse caller-owned `DataStream` scratch buffers across calls.\n\nAdd a small RAII helper that asserts the stream is empty on entry and clears it on exit.\nThis preserves the old temporary-stream contract while making accidental nested reuse fail fast in debug builds.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-25T06:19:14Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-24T20:13:18Z"
-      },
-      "sha": "9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDE2YzU5OWM2OTk4MzBkOTMyMmRmOTdjN2ExOGZhNTA1YzRjYWI4ZTE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/16c599c699830d9322df97c7a18fa505c4cab8e1",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/16c599c699830d9322df97c7a18fa505c4cab8e1",
-      "tree": {
-        "sha": "5ec4429dc6b39fc8de997bf22f245aca6aaf5441",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5ec4429dc6b39fc8de997bf22f245aca6aaf5441"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 5ec4429dc6b39fc8de997bf22f245aca6aaf5441\nparent 9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061608 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777097954 +0200\n\ntest: cover repeated dbwrapper stream use\n\nThe next commits reuse scratch streams on `CDBBatch` and `CDBIterator`.\n\nExtend dbwrapper tests to reuse a batch after `Clear()`, seek repeatedly on one iterator, and fail a too-large `CDBIterator::GetValue()` decode before reading the same entry successfully.\nThis locks down the reuse and failed-decode contracts before the production changes.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnsXOIACgkQZp//D/pH\nenZo6w/8Dd5Q+P8Xge27pAVpRveK2qcajPOZqwNW1c5/iVQyR/VEUXMk44aFQEoI\n+N/XKhtYanLI7iFMsaXApFSN3pViHUszGggNEKrrn/cS5gSWqvQpZWmXf9FPGG1e\nXdBfQtdNZCiWia9PA0I1g3AHZCEx+vN1bi5NwH8OWf8CrJjVM9gyCipjBZukdFvg\nGcYFNzOsqLuxY6bEQMniLLKlMPz3SzoDz+LZ3xzOOXAOGBH7sYqcabjNtrX3uE75\nJ/f8l6XyLkJMG0y7V27zutHOWyHfrMTyiBDPdTvE6KatTOSukyuCyPSKsGXnPXGw\nV8evxfemxfRm0QvpnOUM6JcGORH+oV8GzmZCcXvcqjr+3XQdV4PNI8Wu02cVfd+/\ne10GSF3AIA9GqXhII8xauBEh2+6+RkCK7chtRc/zy/3WmgHpzMCOLXWDV5MtBEw+\nMy/c/5cuBFLDWVprZ78KsPvje+/rCs3Uq071k+XU2xi3MZUbOJ3jegKxJ6w2xtlK\nj3sdYRaaGeFX4WYx5ZjP/XJGdHQME9fK7yqg4IrFGN5jqU+4jtTjY5+e8REaX/Yx\ndaf2JCA3PITNPOoNiH6xoSi7FZ3nRrNy/GKmoijvoG4p2urDOZJJeXeIlpm/W18w\nRoQvOs9z1NdGDlcajJfjoLzgMPfbSkefecvSO1uVHDnloQ3tpLE=\n=v3tC\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0",
-          "sha": "9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/9ed55a5bc6a02fceeb7ff3e00d7bddc67b0d2ac0"
-        }
-      ],
-      "message": "test: cover repeated dbwrapper stream use\n\nThe next commits reuse scratch streams on `CDBBatch` and `CDBIterator`.\n\nExtend dbwrapper tests to reuse a batch after `Clear()`, seek repeatedly on one iterator, and fail a too-large `CDBIterator::GetValue()` decode before reading the same entry successfully.\nThis locks down the reuse and failed-decode contracts before the production changes.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-25T06:19:14Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-24T20:13:28Z"
-      },
-      "sha": "16c599c699830d9322df97c7a18fa505c4cab8e1"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGVlNzRhMTMwNTE2MTdlZmUxN2EzMWM4M2U4MjU3YTJiMWE0Yjc4NDg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ee74a13051617efe17a31c83e8257a2b1a4b7848",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/ee74a13051617efe17a31c83e8257a2b1a4b7848",
-      "tree": {
-        "sha": "63f283c5fc827a81fdd8c920da52b8a81338ba76",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/63f283c5fc827a81fdd8c920da52b8a81338ba76"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 63f283c5fc827a81fdd8c920da52b8a81338ba76\nparent 16c599c699830d9322df97c7a18fa505c4cab8e1\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061657 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777098001 +0200\n\ndbwrapper: guard `CDBBatch` scratch streams\n\n`CDBBatch` already owns key and value serialization buffers, but manually reserved and cleared them on each call.\n\nGuard `Write()` and `Erase()` scratch-stream use with `ScopedDataStreamUsage`, requiring empty streams on entry and clearing them on every exit path.\n`WriteImpl()` and `EraseImpl()` pass the bytes immediately to LevelDB's write batch, which copies them and does not retain pointers.\n\nDrop the now-unused `DBWRAPPER_PREALLOC_VALUE_SIZE`.\n`Clear()` now asserts the guards left both scratch streams clean.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnsXREACgkQZp//D/pH\nenaXFRAAg/0ajiv9bBSP85hKsEBjm/udWEdVwpHXJ7jxqvy5AbmV9sWbDJbNqLsv\n2u3HTNXKCWOn/dUHRc0CwxVPONVp9yKR1srvzUuzAvtsiMsJuLX43x6UBIfPX5zZ\nfWsp4R9vtCx/o4LmKZnofb4lrpr3hDN28EXepqh79Qi1T8zoBtgHQzuF8fo6Aslx\nEUpFn07vwhBmy+r2rqAfX3H8qsCNmDpZvCAphhcXKJMTLOcLKm8vTZLw5EluOMS9\nDXEFQrf1n1xqIKuXY/nUT86lK/bnS2glBFSc8UKI0YOMSWqWLiYy/v3dSon98Klk\nWjXB1pgtZSlSeX0Rd0VZXNS7rqjw24yajFrDeHQWir28hZMkHvjDjPxl32JpOXlW\nv5uLfYngvDO4GiszTMlUa3uIfa1JKSVlKQ+I09a1Km9GTbIRxSqFOqFmvTI63RLC\n3rN3nbtDi9cD5awzlrQ0K2ZWwsPHPqGXr2aE8n1Gm51rm1fSI6qcWcGByRX6o8bY\nbWgAdx3+zZ5rfU+d0jREGnE33Kpr22QEzZzazhdlQadpg+voqLjWKU5cPpUv/w5x\nMKFCSDoQQ/l/wzzKSZgIKNLuluUo6+mpJQG0Quuox6zEzujE6C2J5dHIpDE1tfHe\nNX0DurnUpFypZHSqZ2rojXeT5Qjel7wWv6BDwSFzHLA0+e87Cog=\n=a3Fg\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/16c599c699830d9322df97c7a18fa505c4cab8e1",
-          "sha": "16c599c699830d9322df97c7a18fa505c4cab8e1",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/16c599c699830d9322df97c7a18fa505c4cab8e1"
-        }
-      ],
-      "message": "dbwrapper: guard `CDBBatch` scratch streams\n\n`CDBBatch` already owns key and value serialization buffers, but manually reserved and cleared them on each call.\n\nGuard `Write()` and `Erase()` scratch-stream use with `ScopedDataStreamUsage`, requiring empty streams on entry and clearing them on every exit path.\n`WriteImpl()` and `EraseImpl()` pass the bytes immediately to LevelDB's write batch, which copies them and does not retain pointers.\n\nDrop the now-unused `DBWRAPPER_PREALLOC_VALUE_SIZE`.\n`Clear()` now asserts the guards left both scratch streams clean.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-25T06:20:01Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-24T20:14:17Z"
-      },
-      "sha": "ee74a13051617efe17a31c83e8257a2b1a4b7848"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDYwZDhjNWM4ODc4MTNjZjY5ZTQ5ZTlhNmY5NWZlN2ZhM2FiNTczNDE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
-      "tree": {
-        "sha": "40eb3501e6fa85deeab8bb4e459d1f908b629d28",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/40eb3501e6fa85deeab8bb4e459d1f908b629d28"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 40eb3501e6fa85deeab8bb4e459d1f908b629d28\nparent ee74a13051617efe17a31c83e8257a2b1a4b7848\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061645 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777098027 +0200\n\ndbwrapper: reuse iterator scratch stream\n\n`CDBIterator::Seek()` and `CDBIterator::GetValue()` only need a temporary owning buffer for immediate use.\n\nKeep one `DataStream` scratch member on the non-copyable iterator and guard each use with `ScopedDataStreamUsage`.\n`SeekImpl()` consumes the serialized key during the immediate LevelDB seek, and `GetValue()` still copies LevelDB value bytes into the owning scratch stream before in-place deobfuscation.\n\nA single stream is enough because these methods cannot overlap on the same iterator without re-entering or concurrently using it, which the guard asserts against.\nThe preceding test covers repeated seeks and failed value deserialization followed by a successful read from the same entry.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnsXSsACgkQZp//D/pH\nenZaKQ/9HWypk4KThuKiqwLDISoLAHpSTGOpTFb+QxthHn6uPAyjbopp6qQ+kpjx\ny96WEd97EGw1EPJt7N/om7mcQcU40Hu1bT/Csz0oPeaU9Gk3sJyzAlPl+0UcXivx\nAdQzhurMJ+Go0gN7U0vj/K3kTCRXu1P5GT/qx6c3WFIxKHDIvGvQE/kGJxwGPHSE\nCjScAiKYAjrnzJiZmzsHke93qelVjwmUbfwOq9GK7KdwWr3DjGz8EeWXLdGAtgdP\nR/JYOVVm5+Q6i4aJHoSl5uoyKQgWMdi9VuMlqhVpjqYIY4yewjixgY4m2+hy0tUM\nLq0cLBFaHBx/1JbQ76Ywko+gpmJhUlbelzywRWiigvDm9T85B1YXiWRxATNq+RjE\ntwQSTc94+UMXuxDDdPVMiDMKrw8959j4sWYaX7guG3K3EpPGuTyD+IncIlT5xETS\nF1d3c7U55G3lsPrBohdF/np5Nzx5EvmxSQSv8dAolSflQRNkdQL4UeRXKuxLvlTX\nomhFNgrJTH88gI/h0UwVeJirPO8jD2qO2frKDUdePUdV6EZAlSjQjuNafx1bCBXX\nyLIIKUuZing5VTix4VTjL//57Y6rktdkfNUo3zuLvHj3SDbHN3vfE2H3ZLrnRAPo\nxjFNsJAcPpLu5OMTRZBXh5WVXsBgK0JHGthowyUV9uC7ihqNyLI=\n=Wjt2\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ee74a13051617efe17a31c83e8257a2b1a4b7848",
-          "sha": "ee74a13051617efe17a31c83e8257a2b1a4b7848",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/ee74a13051617efe17a31c83e8257a2b1a4b7848"
-        }
-      ],
-      "message": "dbwrapper: reuse iterator scratch stream\n\n`CDBIterator::Seek()` and `CDBIterator::GetValue()` only need a temporary owning buffer for immediate use.\n\nKeep one `DataStream` scratch member on the non-copyable iterator and guard each use with `ScopedDataStreamUsage`.\n`SeekImpl()` consumes the serialized key during the immediate LevelDB seek, and `GetValue()` still copies LevelDB value bytes into the owning scratch stream before in-place deobfuscation.\n\nA single stream is enough because these methods cannot overlap on the same iterator without re-entering or concurrently using it, which the guard asserts against.\nThe preceding test covers repeated seeks and failed value deserialization followed by a successful read from the same entry.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-25T06:20:27Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-24T20:14:05Z"
-      },
-      "sha": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341"
     },
     {
       "event": "head_ref_force_pushed",
@@ -935,6 +775,197 @@
       "submitted_at": "2026-04-25T12:52:50Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35156"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDJiZTgwZDQzZjllNmQ0MzE4M2M4ODBmMmIwYzZlNGY2MGVhYjNmYTQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4",
+      "tree": {
+        "sha": "fbf884a703b237ecbe26196923fb3e1902ce52b7",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fbf884a703b237ecbe26196923fb3e1902ce52b7"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree fbf884a703b237ecbe26196923fb3e1902ce52b7\nparent 0abbe35bb20cd7dae70b9a4d69e70472a9f6f680\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061598 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219675 +0200\n\nstreams: add `ScopedDataStreamUsage`\n\nSome DB paths reuse caller-owned `DataStream` scratch buffers across calls.\n\nAdd a small RAII helper that asserts the stream is empty on entry and clears it on exit.\nThis preserves the old temporary-stream contract while making accidental nested reuse fail fast in debug builds.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuOFsACgkQZp//D/pH\nenbSRRAAvNgQG1i+ai3OZpZj9AbaTpp9xaTT/5Dt3voYr9JduS83L7gEf/qt1KKM\nvW6RdPYWcmR1BsUjwTQhhXnfy2AYwVomrQdofzpskUFZmgTwy+/wtOjrT8RuXIv8\nQYvdbyHRqnoyZEJzWjOisRndQM6tWhU+zlbmgsj68ro5qLIKLMc2FGa5DH5h4gqm\nz/EDhFOnsTItJZQdccv0OjI6k4EfCySzeExgIbu2i3Ac0I2l23ZmtPFFqIfRrYyB\nvVAjYg2ScMvEuLlDOoE36vvlkfPKOFPyGYcfQL9a9lNYQbxOQLu5mnirrmruSl4S\nKkq6p/Fm5APz41pSUse39QRhpNQ5TVjVo/XXis2k/gdlStsz2jit1zyWwadsM3GH\np9AIUkLkCI8UeHQjNc0JFwgor6O0uDO0hLuG8etNAUVm0Lf6fIOe5o8zJ2G9nNfb\nc71MDsB77HjxMHxNpT6koDqFp368ZtqPUFdgk38epE0ro3FcSgLQsKTpB/fLREAb\ntEr6MQfUeJwgHjQeZ8j0PB4lHAo/9rm0oY6XUW5+ajuEn0K6o/0XWsvuEiNztJUI\n/gJ8YEKCGoGbOC7W5oiGnhF+enkgeWdOm5pq0cW0ri2MtCZO2fTFxhZcoWDsWj1+\nRR5KMqtuwDL7XdcjrhpgteHgorM8KdwLWofMisPYo7NbSXfNdE4=\n=hR7W\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0abbe35bb20cd7dae70b9a4d69e70472a9f6f680",
+          "sha": "0abbe35bb20cd7dae70b9a4d69e70472a9f6f680",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/0abbe35bb20cd7dae70b9a4d69e70472a9f6f680"
+        }
+      ],
+      "message": "streams: add `ScopedDataStreamUsage`\n\nSome DB paths reuse caller-owned `DataStream` scratch buffers across calls.\n\nAdd a small RAII helper that asserts the stream is empty on entry and clears it on exit.\nThis preserves the old temporary-stream contract while making accidental nested reuse fail fast in debug builds.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:07:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-24T20:13:18Z"
+      },
+      "sha": "2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGU3MjA2ZjIyNTI1ZWQ4YWI1Y2RmYWZmOTRjZGFhMzMzZDhhZWU0MWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e7206f22525ed8ab5cdfaff94cdaa333d8aee41e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e7206f22525ed8ab5cdfaff94cdaa333d8aee41e",
+      "tree": {
+        "sha": "3fbce960ac1d5992868226979a0056ebdd637e5e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3fbce960ac1d5992868226979a0056ebdd637e5e"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 3fbce960ac1d5992868226979a0056ebdd637e5e\nparent 2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061608 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777219675 +0200\n\ntest: cover repeated dbwrapper stream use\n\nThe next commits reuse scratch streams on `CDBBatch` and `CDBIterator`.\n\nExtend dbwrapper tests to reuse a batch after `Clear()`, seek repeatedly on one iterator, and fail a too-large `CDBIterator::GetValue()` decode before reading the same entry successfully.\nThis locks down the reuse and failed-decode contracts before the production changes.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuOFwACgkQZp//D/pH\nenYOAw//coRAYULVysVy1G/v8Xht3IcUPe6fxtKZIJeTJZ5L/UpBtD5qD5QYokKx\nF3/TfEqK+Anhx9bZda3tjxlxsD87QDZFndpUWgl5ivM+o7ESBVM2vulFSOB9slAG\nkoz+9lUktIWte/REizuVBhUrmK9Etv07AfvxLc9E5VxFAetG7vRvxWTghrcSBVyL\nak2bFbPOiGJbQAfymVc9NLta+LWxqXwkTv0ejeS9Z2kfibpEP8RDLy6F6/9/YkMm\nQq/HrhP7wXpKQzauhZ8D2SzpVgAJyYVTyn9d05vV0K515oMskVQQueGRUzWN1kOH\nBmvcODEHaW0yaivry/TsbvrswvfVCmED0pgaQ/w6hgtmAMKIWU/SyzCbsEoYASSl\n3EUYr2NEi9SjBn8IpRE62AnLgzVwXh3G7hYGaBhd3aXseo7IlJbRXPmlUKuNENFj\nc2iXavkw20o4b6AYtyPQivRqOOHpxKs2H9wyz4WMJ3BxyBLAtNb3OsshNuMeFbO0\nKMnkoOhRO1z9OAnYDMOt3DOHrGV1rQMCzyVjEBZ5EMstjHmLisXR1+7o25NMPF5N\ns2sMhzTeI7aMjp/kGCSMQEaf+x22/DOya37+Op/MLg/LgAZxp2yGcsK/0lWXUO+l\nPvd4iY3HmYxUSYXo6C3pqDEaNuV9mu2eeWkPZ97Je3V58VU381E=\n=JVSN\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4",
+          "sha": "2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/2be80d43f9e6d43183c880f2b0c6e4f60eab3fa4"
+        }
+      ],
+      "message": "test: cover repeated dbwrapper stream use\n\nThe next commits reuse scratch streams on `CDBBatch` and `CDBIterator`.\n\nExtend dbwrapper tests to reuse a batch after `Clear()`, seek repeatedly on one iterator, and fail a too-large `CDBIterator::GetValue()` decode before reading the same entry successfully.\nThis locks down the reuse and failed-decode contracts before the production changes.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:07:55Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-24T20:13:28Z"
+      },
+      "sha": "e7206f22525ed8ab5cdfaff94cdaa333d8aee41e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDRiMzcxZDhkOWU1NWQ2ZTc2NWUxNzVjMDE5ZjgzZWNiOWU1MGQyNTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b371d8d9e55d6e765e175c019f83ecb9e50d259",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4b371d8d9e55d6e765e175c019f83ecb9e50d259",
+      "tree": {
+        "sha": "1e27c4a91cb0c83102bc01005e40feb1f5057749",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1e27c4a91cb0c83102bc01005e40feb1f5057749"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 1e27c4a91cb0c83102bc01005e40feb1f5057749\nparent e7206f22525ed8ab5cdfaff94cdaa333d8aee41e\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061657 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777220203 +0200\n\ndbwrapper: guard `CDBBatch` scratch streams\n\n`CDBBatch` already owns key and value serialization buffers, but manually reserved and cleared them on each call.\n\nReserve those scratch buffers once in the constructor, then guard `Write()` and `Erase()` use with `ScopedDataStreamUsage`, requiring empty streams on entry and clearing them on every exit path.\n`WriteImpl()` and `EraseImpl()` pass the bytes immediately to LevelDB's write batch, which copies them and does not retain pointers.\n\n`Clear()` now asserts the guards left both scratch streams clean.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuOmsACgkQZp//D/pH\nenYLrQ//XE9A/nthtou/KdSdZDS2fw8Tz5nBbSeiXJI61oSDKxC1JPTi45F5oq3X\nlP02oMSM/peF9Jr8ZhPdrCpbIkf6mMyzZY1Z7R/iTE5qU3/Y0foU21OaZJ6EqJxB\nOO1LfmCj/f1ezwSSSUapvh6crjQXeLJbuDFSqs+jtprE/FpqrgKtxV6HHYAIyDvL\nhNnrY2RE/HYwnlInZY44rRpOaNu6unYg9W8U9akbaDa+iVeWMGNTwd2K4I+HvzfV\n7KnLfza6jmzgDvT5YluXPf7j0/Ho9tug+8z1u7JMAz8E6RBrTA/4vaIU7s4QEDt0\n8mD3a0O/NRRxlEiaBUKckHKaisSzrbAr9lEA9NcyzUj02LjrMZ6933DfS7a4rbAl\nyH/pn4S2KPuJ9ZT8rgT0SpTuSBKt3itH7ilJWaTS2SUbbzdhhrXwjJpRD2u4YTv4\n7EY7K/qm9OqS0VtNFkay3NuKkFMJvLd4XZy5LnsuQOpyX2539wboOXwuCsXMJLXT\nBLoqyWyBA8f6yZ6jtLvUzKRfBxi51nAV5+gv+hu8O+XYi+DKoWNd9svXQu54JN6F\nbnFNiYUAx46IXsRTvsBRIGuveeBuir0E1bxRpgoaOdxiilcaMiyLtRSzDxNaU/+8\nGBfgW1oTNmcgHJ7zD///kjiJEaKsc9vcKSMmYeNF7dmeQz6KLQI=\n=ef4C\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e7206f22525ed8ab5cdfaff94cdaa333d8aee41e",
+          "sha": "e7206f22525ed8ab5cdfaff94cdaa333d8aee41e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e7206f22525ed8ab5cdfaff94cdaa333d8aee41e"
+        }
+      ],
+      "message": "dbwrapper: guard `CDBBatch` scratch streams\n\n`CDBBatch` already owns key and value serialization buffers, but manually reserved and cleared them on each call.\n\nReserve those scratch buffers once in the constructor, then guard `Write()` and `Erase()` use with `ScopedDataStreamUsage`, requiring empty streams on entry and clearing them on every exit path.\n`WriteImpl()` and `EraseImpl()` pass the bytes immediately to LevelDB's write batch, which copies them and does not retain pointers.\n\n`Clear()` now asserts the guards left both scratch streams clean.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:16:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-24T20:14:17Z"
+      },
+      "sha": "4b371d8d9e55d6e765e175c019f83ecb9e50d259"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDVjM2UwMjAyZGY5ZWU1M2Q4MGZlYTQ1ZTE4MDU5OTJkOTNhNjEzOTA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5c3e0202df9ee53d80fea45e1805992d93a61390",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5c3e0202df9ee53d80fea45e1805992d93a61390",
+      "tree": {
+        "sha": "c27972d1209f5c46c8b52ef3770c0da961b52c2c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c27972d1209f5c46c8b52ef3770c0da961b52c2c"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree c27972d1209f5c46c8b52ef3770c0da961b52c2c\nparent 4b371d8d9e55d6e765e175c019f83ecb9e50d259\nauthor Lőrinc <pap.lorinc@gmail.com> 1777061645 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777220203 +0200\n\ndbwrapper: reuse iterator scratch stream\n\n`CDBIterator::Seek()` and `CDBIterator::GetValue()` only need a temporary owning buffer for immediate use.\n\nKeep one preallocated `DataStream` scratch member on the non-copyable iterator and guard each use with `ScopedDataStreamUsage`.\n`SeekImpl()` consumes the serialized key during the immediate LevelDB seek, and `GetValue()` still copies LevelDB value bytes into the owning scratch stream before in-place deobfuscation.\n\nA single stream is enough because these methods cannot overlap on the same iterator without re-entering or concurrently using it, which the guard asserts against.\nThe preceding test covers repeated seeks and failed value deserialization followed by a successful read from the same entry.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmnuOmsACgkQZp//D/pH\nenbOvA/+KVoajm0W+TDmvoF+h9V9czAJG+9hgNIxTjODYhYYkceFZmk5O7uoxK77\nM64XxN0gS1DiX5k79aoj41PIq7F6PDKLclhuP31zk5O1cCSthvqw3SfDa+6h5wII\nYrUedtTLtCTp1RKv4Yiy7uj9SmCS6lq2MbwP/BOT8DeD4Z7LVGGWfWZ8qhu+Vvjt\nUrWA+bbE89DSdndFBCwUKHycrP6tEMQQKQrntdJNJHoV6x61zrkpShLnzpxSIzRq\nFWmyVZU4nuZlUAgVJ411b2MXLPe9kk6CoXdW/FmAz+7gTCV51d1h4GiqgAHA2Hva\ngzRiPGQg9KA49NyZmEJjYWy9/9V1iHKfnoikJPj75lvD4WQtxxwSwFAQgUcwrn6o\nOtsfwxHyhYTzY33vmsbnhicBzzov2gP5SOwpx1wmeTcB+nPv0myxfruYyGdwjSqr\nromZyy/4injDX4CcM/mbrjLAHDNSCJIlTb3qY4Yi4AZop1k7PzE1gaUJkG5MGdYW\nwTTgtKa20PgH80RuOp+85yWG/d6FxQTyiUNU5bUyAcsGXxkf7UjMOwwmdhqiFFNa\nrO6Owl2wovXkKFRse4LErzF4jq9EZout96xmWYTrDPJRuY0Dxi9vwi2duV6HYcSM\nvA+zKA4FibVosI6gcPYGwt1h+dcHqicl2dJrIJn4GoVs3puScIY=\n=rfE5\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4b371d8d9e55d6e765e175c019f83ecb9e50d259",
+          "sha": "4b371d8d9e55d6e765e175c019f83ecb9e50d259",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/4b371d8d9e55d6e765e175c019f83ecb9e50d259"
+        }
+      ],
+      "message": "dbwrapper: reuse iterator scratch stream\n\n`CDBIterator::Seek()` and `CDBIterator::GetValue()` only need a temporary owning buffer for immediate use.\n\nKeep one preallocated `DataStream` scratch member on the non-copyable iterator and guard each use with `ScopedDataStreamUsage`.\n`SeekImpl()` consumes the serialized key during the immediate LevelDB seek, and `GetValue()` still copies LevelDB value bytes into the owning scratch stream before in-place deobfuscation.\n\nA single stream is enough because these methods cannot overlap on the same iterator without re-entering or concurrently using it, which the guard asserts against.\nThe preceding test covers repeated seeks and failed value deserialization followed by a successful read from the same entry.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-26T16:16:43Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-24T20:14:05Z"
+      },
+      "sha": "5c3e0202df9ee53d80fea45e1805992d93a61390"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 24881694013,
+      "node_id": "HRFPE_lADOABII588AAAABAdTD0c8AAAAFyxCFPQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/24881694013",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "5c3e0202df9ee53d80fea45e1805992d93a61390",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/5c3e0202df9ee53d80fea45e1805992d93a61390",
+      "created_at": "2026-04-26T16:19:27Z"
     }
   ],
   "comments": [
@@ -1161,9 +1192,9 @@
       "node_id": "PRRC_kwDOABII5867Rnee",
       "diff_hunk": "@@ -96,22 +95,18 @@ class CDBBatch\n     template <typename K, typename V>\n     void Write(const K& key, const V& value)\n     {\n-        ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);\n-        ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);",
       "path": "src/dbwrapper.h",
-      "position": 27,
+      "position": 19,
       "original_position": 27,
-      "commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+      "commit_id": "5c3e0202df9ee53d80fea45e1805992d93a61390",
       "original_commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
       "in_reply_to_id": null,
       "user": {
@@ -1215,9 +1246,9 @@
       "node_id": "PRRC_kwDOABII5867SFWa",
       "diff_hunk": "@@ -96,22 +95,18 @@ class CDBBatch\n     template <typename K, typename V>\n     void Write(const K& key, const V& value)\n     {\n-        ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);\n-        ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);",
       "path": "src/dbwrapper.h",
-      "position": 27,
+      "position": 19,
       "original_position": 27,
-      "commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+      "commit_id": "5c3e0202df9ee53d80fea45e1805992d93a61390",
       "original_commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
       "in_reply_to_id": 3141957534,
       "user": {
@@ -1269,9 +1300,9 @@
       "node_id": "PRRC_kwDOABII5867X9Iu",
       "diff_hunk": "@@ -96,22 +95,18 @@ class CDBBatch\n     template <typename K, typename V>\n     void Write(const K& key, const V& value)\n     {\n-        ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);\n-        ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);",
       "path": "src/dbwrapper.h",
-      "position": 27,
+      "position": 19,
       "original_position": 27,
-      "commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+      "commit_id": "5c3e0202df9ee53d80fea45e1805992d93a61390",
       "original_commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
       "in_reply_to_id": 3141957534,
       "user": {
@@ -1304,6 +1335,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3143619118"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35156"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 100,
+      "original_line": 100,
+      "side": "LEFT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3143773828",
+      "pull_request_review_id": 4177147112,
+      "id": 3143773828,
+      "node_id": "PRRC_kwDOABII5867Yi6E",
+      "diff_hunk": "@@ -96,22 +95,18 @@ class CDBBatch\n     template <typename K, typename V>\n     void Write(const K& key, const V& value)\n     {\n-        ssKey.reserve(DBWRAPPER_PREALLOC_KEY_SIZE);\n-        ssValue.reserve(DBWRAPPER_PREALLOC_VALUE_SIZE);",
+      "path": "src/dbwrapper.h",
+      "position": 19,
+      "original_position": 27,
+      "commit_id": "5c3e0202df9ee53d80fea45e1805992d93a61390",
+      "original_commit_id": "60d8c5c887813cf69e49e9a6f95fe7fa3ab57341",
+      "in_reply_to_id": 3141957534,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Yeah, that's fair, I'll pre-reserve in the constructor - and we can investigate if that's still needed in a possible follow-up.",
+      "created_at": "2026-04-26T16:19:41Z",
+      "updated_at": "2026-04-26T16:19:41Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35156#discussion_r3143773828",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3143773828"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35156"
