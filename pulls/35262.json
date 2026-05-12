@@ -12,12 +12,12 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35262/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35262/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/3c8397afbeb1c2f6bebb8e9e03a7e41afb8a45e6",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/75e525590f24f6aeb039b2b8900b29e5c2100d39",
     "number": 35262,
     "state": "open",
     "locked": false,
     "maintainer_can_modify": true,
-    "title": "net: calculate compact filters on-the-fly for an already advertised block",
+    "title": "net: calculate compact filters on the fly for an already advertised block",
     "user": {
       "login": "randomlogin",
       "id": 1616179,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "Compact block filter request might occur when the block has been already processed (and advertised), but the filter is not yet ready, this might lead to a disconnect by a peer who requested a filter.\r\n\r\nFixes: https://github.com/bitcoin/bitcoin/issues/29655, https://github.com/bitcoin/bitcoin/issues/27085 \r\nRelated discussion: [1](https://bnoc.xyz/t/request-block-filter-peers-being-disconnected-due-to-invalid-block-requests/101/2), [2](https://github.com/lightninglabs/neutrino/issues/338)\r\n\r\n**The problem:** \r\nBitcoin core receives a new block and processes it, then it advertises the new block, however by that moment the compact filter might have not yet been constructed, which implies that if a peer asks for a filter, bitcoin core would just not respond. From the peer perspective this is a misbehaviour (we advertised a block and don't provide filers for it), which results in a disconnect/ban.\r\n\r\nMore precisely, [BIP157](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki#getcfilters) specifies:\r\n\r\n```\r\nStopHash MUST be known to belong to a block accepted by the receiving peer. This is the case if the peer had previously sent a headers or inv message with that block or any descendents. A node that receives getcfilters with an unknown StopHash SHOULD NOT respond.\r\n```\r\nCurrent behaviour clearly contradicts the above specification.\r\n\r\nI (re-)discovered it during a test a \"light\" compact block filter node [kyoto](https://github.com/2140-dev/kyoto) and [ldk-node](https://github.com/lightningdevkit/ldk-node).\r\n\r\n**Proposed solution:** compute filters on-the-fly if they are requested for blocks we already know. Filters do not commit to their predecessors on the contrary to the filter headers, thus we can independently compute them for a set of blocks, moreover we can compute them only once and store, thus sequential request would just go as usual by reading already computed filters. This does fix not hinder block processing and propagation.\r\n\r\nWith this change when a filter request is received it checks whether we have block data (if not abort), then checks if we have filter on disk, if not we calculate filter on-the-fly. Then we attempt to write the calculated filter, so the next request would be read instead of calculated (it is less computationally demanding, right?).\r\n\r\nTo write to the DB we need to have both filter and filter header, and the filter header commits to the previous header, which means we can only write if there is only a single block without filters (which is the case for normal operation when blocks are mined one by one).\r\n\r\nSome words about vulnerabilities: we expose the possibility that external peer can force our node to calculate filters on the fly and thus to load CPU. Given that the race condition can only occur when we already have processed blocks, but not yet constructed filters, this is a window on a scale of milliseconds, so it is fine.\r\n\r\nAlso it doesn't affect the initial block download, as during that time a node does not respond to compact filters messages.\r\n",
+    "body": "A compact block filter request might arrive when a block has already been processed (and advertised) but its filter has not yet been constructed. In that window the node fails to respond, which the requesting peer treats as misbehaviour and may disconnect/ban.\r\n\r\nFixes: https://github.com/bitcoin/bitcoin/issues/29655, https://github.com/bitcoin/bitcoin/issues/27085\r\nRelated discussion: [1](https://bnoc.xyz/t/request-block-filter-peers-being-disconnected-due-to-invalid-block-requests/101/2), [2](https://github.com/lightninglabs/neutrino/issues/338)\r\n\r\n**The problem:**\r\nBitcoin Core receives a new block and processes it, then advertises it; however, by that moment the compact filter might not yet have been constructed. If a peer asks for a filter in that window, Bitcoin Core simply does not respond. From the peer's perspective this is a misbehaviour (we advertised a block and don't provide filters for it), which results in disconnects or bans. While it does not critically affect core nodes, it breaks the network topology for BIP 157 clients.\r\n\r\nMore precisely, [BIP157](https://github.com/bitcoin/bips/blob/master/bip-0157.mediawiki#getcfilters) specifies:\r\n\r\n```\r\nStopHash MUST be known to belong to a block accepted by the receiving peer. This is the case if the peer had previously sent a headers or inv message with that block or any descendents. A node that receives getcfilters with an unknown StopHash SHOULD NOT respond.\r\n```\r\n\r\nCurrent behaviour clearly contradicts the above specification.\r\n\r\nI (re-)discovered it while testing \"light\" compact block filter nodes [kyoto](https://github.com/2140-dev/kyoto) and its addition to [ldk-node](https://github.com/lightningdevkit/ldk-node), it was also discussed in context of [neutrino](https://github.com/lightninglabs/neutrino).\r\n\r\n**Proposed solution:** compute filters on the fly when they are requested for blocks we already have. Unlike filter headers, individual filters do not commit to their predecessors, so we can compute them independently for a set of blocks (but this doesn't work for filter headers!). Moreover we compute each filter at most once and persist it, so subsequent requests proceed as usual by reading the already-computed filter from disk.\r\n\r\nChanges:\r\n- `LookupFilter`\r\n- `LookupFilterHeader`\r\n- `LookupFilterRange`\r\n- `LookupFilterHashRange`\r\n\r\n`LookupFilterHeader` is used by `ProcessGetCFHeaders` to fetch `prev_filter_header` at `start - 1` of a requested range. For a `getcfheaders [tip, tip]` request, that predecessor is at `tip - 1`, which can itself be inside the race window. Without on-the-fly fallback on this path, the response would fail even though the filter hashes are recoverable. All four lookup paths now share the same chain-aware fallback.\r\n\r\nSchematically `LookupFilter` now works as follows:\r\n1. On filter request, check if we know the requested block. If not, abort.\r\n2. Check if the filter is already computed and stored. If so, respond with it.\r\n3. Otherwise compute the filter, persist it, respond with it.\r\n\r\n`LookupFilterRange` (and `LookupFilterHashRange`) now work as follows:\r\n1. We are asked for a filter range, say `[tip-N, tip]` (BIP 157 caps `N` at 1000).\r\n2. Check if filters for the full range `[tip-N, tip]` are already on disk. If so, respond with them.\r\n3. Otherwise check if filters for the stable subrange `[tip-N, tip-10]` are all on disk. If any are missing, fail — those are too far behind the tip to be a race-window miss and we refuse to recompute them on demand.\r\n4. For each block in `[tip-9, tip]` that is missing from the index, compute its filter on the fly. Then respond with the complete range.\r\n\r\nThis exposes the possibility that an external peer can force our node to compute filters on the fly and thus burn CPU. However this is not a concern, because:\r\n\r\n1. It can only happen once per filter — subsequent requests read from disk.\r\n2. There is a hard limit on the depth of on-the-fly computation: only the 10 blocks below the active chain tip (`ONTHEFLY_TIP_WINDOW`).\r\n3. The whole window is tiny (single-digit milliseconds on testnet4, tens of milliseconds on mainnet — see numbers below).\r\n\r\n**Benchmarks**\r\n\r\nI benchmarked the four scenarios below on testnet4 (heights 134703–134802). The benchmark files are not included in this PR because they require a synced node and real block data, but I can include them in an additional commit on request.\r\n\r\n- 1a. Request 100 filters, all already computed and stored.\r\n- 1b. Request 100 filters, 90 already stored, 10 computed on the fly (the worst case for a 100-block request).\r\n- 2a. Request 10 filters, all already stored.\r\n- 2b. Request 10 filters, none stored — all computed on the fly (the worst case for a 10-block request).\r\n\r\nResults on testnet4:\r\n\r\n| Scenario | Per-request total | Per-block on-the-fly cost | Overhead vs all-indexed |\r\n|---|---|---|---|\r\n| 1a (100 indexed)            | 0.97 ms | — | baseline |\r\n| 1b (100, 10 on the fly)     | 1.25 ms | ~28 µs | +0.28 ms |\r\n| 2a (10 indexed)             | 0.099 ms | — | baseline |\r\n| 2b (10 all on the fly)      | 0.50 ms | ~40 µs | +0.40 ms |\r\n\r\nMainnet figures extrapolation (compute scales roughly with block size and script count; estimated from the per-block compute cost of ~3.4 ms measured against a real mainnet datadir):\r\n\r\n| Scenario | Per-request total | Overhead vs all-indexed |\r\n|---|---|---|\r\n| 1a (100 indexed) | ~2.5 ms | baseline |\r\n| 1b (100, 10 on the fly) | ~36 ms | +~34 ms |\r\n| 2a (10 indexed) | ~0.25 ms | baseline |\r\n| 2b (10 all on the fly) | ~34 ms | +~34 ms |\r\n\r\nIn other words, the worst-case extra cost a hostile peer can extract is ~34 ms per request, bounded to the 10 tip blocks, paid at most once per block per node lifetime due to the write-back.\r\n\r\nThis PR does not affect block propagation, as the very root of this bug is the independence of block processing and filter construction in `CustomAppend`. Nor does it affect the initial block download, since during IBD a node does not respond to compact filter messages.\r\n\r\nI've used Claude Code for this PR.\r\n\r\n",
     "labels": [
       {
         "id": 98298007,
@@ -52,11 +52,11 @@
       }
     ],
     "created_at": "2026-05-11T17:55:49Z",
-    "updated_at": "2026-05-12T13:35:32Z",
+    "updated_at": "2026-05-12T17:36:25Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "811e5b551c43bba2f5c43f98036eb2f38c75a8a6",
+    "merge_commit_sha": "d0664ca0eef5c1df92f18a8bc65feb9cfbaaa606",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -64,7 +64,7 @@
     "head": {
       "label": "randomlogin:p2p-cbf-advertised-block-not-found",
       "ref": "p2p-cbf-advertised-block-not-found",
-      "sha": "3c8397afbeb1c2f6bebb8e9e03a7e41afb8a45e6",
+      "sha": "75e525590f24f6aeb039b2b8900b29e5c2100d39",
       "user": {
         "login": "randomlogin",
         "id": 1616179,
@@ -163,7 +163,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 271375,
+        "size": 271403,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -176,7 +176,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-05-12T13:35:31Z",
+        "pushed_at": "2026-05-12T17:30:17Z",
         "created_at": "2026-05-08T02:28:04Z",
         "updated_at": "2026-05-08T02:28:04Z",
         "allow_forking": true,
@@ -200,7 +200,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "1af8e0c4e895ebd159304ed86ac059bebeced1f8",
+      "sha": "10ca73c02cbff59f2134c0c7da3b8d0a7e727475",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -298,11 +298,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 38964,
-        "stargazers_count": 89062,
-        "watchers_count": 89062,
+        "stargazers_count": 89066,
+        "watchers_count": 89066,
         "size": 315516,
         "default_branch": "master",
-        "open_issues_count": 694,
+        "open_issues_count": 692,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -321,7 +321,7 @@
         "visibility": "public",
         "pushed_at": "2026-05-11T22:29:58Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-05-12T13:36:49Z",
+        "updated_at": "2026-05-12T17:39:05Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -346,95 +346,15 @@
       }
     },
     "author_association": "NONE",
-    "draft": true,
-    "additions": 746,
-    "deletions": 23,
-    "changed_files": 9,
-    "commits": 3,
+    "draft": false,
+    "additions": 437,
+    "deletions": 29,
+    "changed_files": 6,
+    "commits": 2,
     "review_comments": 0,
     "comments": 1
   },
   "events": [
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDU0MTUyOTIxMmU3ZDUxYjc2ZDcxZDc4YTNiNzA3NmYyYjZiZDlkYTM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/541529212e7d51b76d71d78a3b7076f2b6bd9da3",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/541529212e7d51b76d71d78a3b7076f2b6bd9da3",
-      "tree": {
-        "sha": "8422ee34c2ab2070bfec7237b8850ac70e067fd8",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8422ee34c2ab2070bfec7237b8850ac70e067fd8"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 8422ee34c2ab2070bfec7237b8850ac70e067fd8\nparent 8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e\nauthor Alexander Shevtsov <randomlogin76@gmail.com> 1778519878 +0200\ncommitter Alexander Shevtsov <randomlogin76@gmail.com> 1778519878 +0200\n\nAdd compact filter race condition test\n\nCompact block filter request might occur when the bloclk has been\nalready processed (and advertised), but the filter is not yet ready,\nthis might lead to connection drop by a peer who requested a filter.\n\ncfilter_race_tests are added to capture this behaviour.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEEafD4VpUZuehjWNOmqdpJAsVp7+4FAmoCELEACgkQqdpJAsVp\n7+6WzQ//RDVdY71wxbC8ShvGCdsy+gXI/fImS2vPibr8F/LEVMh9M7dvA44NaBjF\nARX+TN4nJa/NTVtJyB/Dh9Iio7hryBRi/I3vAvJ5PPIT0jMxuw2nMuC9fctWYNdX\nr/x4RWfEWaZLiCrM/cUy1QcmgYG1Mr6BjLd+IujEiCz8Sk/a1a6bwn8OtKIjkWcc\nTJfhosPUwQzih9gItAH6dKDxoZY6qQH1dA/Vnl0DUGg92+LnVlWg/OqbsC0UdZe1\n1s4OWr/pylj/gz25KlqZYGgP2H3NJ+a1RwXPVTvo1MILhRudwnZydBilhfy9Ydbr\nHt/pyaOPDV+Y39kT/gxNTilXYMYKYGNyJUclNX7cA+QLnEWDbzygjfxFdf4YXX8J\nyN+BiozzEObm1KVrhfotdxoi+tO+9ODsFz1hZDo1J0navar3O9Q19SfY3O2MmPqF\nN6lT2PuI5TtFBRevnAwikGJdX9CcuyUOLqSsbpU8OwTVJZneBf0cxRsxnP6fbxFA\nYoOzX8lOS0tVHyBO/p+infQIDXI9PIpu2+3HHf77JE+zQ7UUshUtw6rj8zYBCufW\n7jQER1UMDsC7tukHudiYJrP5GWiWgGQQkLwArwGows2nHCcLLl3p+I2qPtAkV2Xc\ntELJKFGGsKMGT690ecA4u4WqIju3jxWGY9w0zoGBgmNdCW5yxDE=\n=9ZDU\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e",
-          "sha": "8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e"
-        }
-      ],
-      "message": "Add compact filter race condition test\n\nCompact block filter request might occur when the bloclk has been\nalready processed (and advertised), but the filter is not yet ready,\nthis might lead to connection drop by a peer who requested a filter.\n\ncfilter_race_tests are added to capture this behaviour.",
-      "committer": {
-        "name": "Alexander Shevtsov",
-        "email": "randomlogin76@gmail.com",
-        "date": "2026-05-11T17:17:58Z"
-      },
-      "author": {
-        "name": "Alexander Shevtsov",
-        "email": "randomlogin76@gmail.com",
-        "date": "2026-05-11T17:17:58Z"
-      },
-      "sha": "541529212e7d51b76d71d78a3b7076f2b6bd9da3"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDdjZmE2YmFjNGJmY2VlMmJmNzNhMmI3YTZkNDI5MjFhYTU0MzMzMjI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322",
-      "tree": {
-        "sha": "634c8d84c68e7bcb39ee78869cae7c33cf825196",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/634c8d84c68e7bcb39ee78869cae7c33cf825196"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 634c8d84c68e7bcb39ee78869cae7c33cf825196\nparent 541529212e7d51b76d71d78a3b7076f2b6bd9da3\nauthor Alexander Shevtsov <randomlogin76@gmail.com> 1778522085 +0200\ncommitter Alexander Shevtsov <randomlogin76@gmail.com> 1778522085 +0200\n\nCompute compact filters on-the-fly\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEEafD4VpUZuehjWNOmqdpJAsVp7+4FAmoCGBYACgkQqdpJAsVp\n7+5kMxAAjIuEkNoCeVCGpSScP2buWVAt9J0XvDN0f5jhK8jK3ihATWX4lufpcqO6\nSsL+NPiLZWzAwx84huDR0pW1iglCje1l0IvKJ/Yxy15DAwS6krihCEfy62vi8mzg\n1gzUT5HIbqbSIOz+jD92zyll587ZPFsLXH3XqXcw3B+k+OoAXHr+zGily+r58CfV\n8mENl4Qnjs1S/pQotb21gD4ct+g1wBPPMB/SJ4og8i3TwqT0k40mT3Oe/ica/Yiy\n5ikw/iLeRi5oVrjQBD/N6Tt76VMnZO4vX8ho6lhTdWinWFn8oByUd6FJOHUr2qs8\niwaoZuPbmhFPqHb/GdpcJ5E10fqa3SIJmwjV+9hU5X3kuYqXQUMQy1wIADMrQSxh\ngnN4Eyli2fUOLExvZIC3cuRLP2oY5m6MRKq/sBhLCiMXG6xfqH5ce5/a2wtxp2at\nYyKbQcXPFMQihPs3n3JvNEdGciufTA5Zw3Ibk+2hw91F18TZ6xjjeOIEDX60jv8J\nY9iDGEGCmUmwZ5a3VaAKPdhVh7RHg6IDC3tDi7V0cH/W8fNOxb1PC/YWamDNiGee\ng92Q+nZ84MIbgZVh/IiKdgGxHF+HcdyULEreaqRKtcLq0iXs0dpZJjQRYrbs4woE\n3Y7F8dTasdAsne25NC8J9BCyzRsLch61Ff7DHSSOpTKOaNtEXDY=\n=NL9I\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/541529212e7d51b76d71d78a3b7076f2b6bd9da3",
-          "sha": "541529212e7d51b76d71d78a3b7076f2b6bd9da3",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/541529212e7d51b76d71d78a3b7076f2b6bd9da3"
-        }
-      ],
-      "message": "Compute compact filters on-the-fly",
-      "committer": {
-        "name": "Alexander Shevtsov",
-        "email": "randomlogin76@gmail.com",
-        "date": "2026-05-11T17:54:45Z"
-      },
-      "author": {
-        "name": "Alexander Shevtsov",
-        "email": "randomlogin76@gmail.com",
-        "date": "2026-05-11T17:54:45Z"
-      },
-      "sha": "7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322"
-    },
     {
       "event": "labeled",
       "id": 25394690229,
@@ -529,44 +449,181 @@
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35262"
     },
     {
+      "event": "renamed",
+      "id": 25441532197,
+      "node_id": "RTE_lADOABII588AAAABB6K06c8AAAAF7G75JQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/25441532197",
+      "actor": {
+        "login": "randomlogin",
+        "id": 1616179,
+        "node_id": "MDQ6VXNlcjE2MTYxNzk=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1616179?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/randomlogin",
+        "html_url": "https://github.com/randomlogin",
+        "followers_url": "https://api.github.com/users/randomlogin/followers",
+        "following_url": "https://api.github.com/users/randomlogin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/randomlogin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/randomlogin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/randomlogin/subscriptions",
+        "organizations_url": "https://api.github.com/users/randomlogin/orgs",
+        "repos_url": "https://api.github.com/users/randomlogin/repos",
+        "events_url": "https://api.github.com/users/randomlogin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/randomlogin/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-05-12T17:01:37Z",
+      "rename": {
+        "from": "net: calculate compact filters on-the-fly for an already advertised block",
+        "to": "net: calculate compact filters on the fly for an already advertised block"
+      }
+    },
+    {
       "event": "committed",
       "id": null,
-      "node_id": "C_kwDOABII59oAKDNjODM5N2FmYmViMWMyZjZiZWJiOGU5ZTAzYTdlNDFhZmI4YTQ1ZTY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3c8397afbeb1c2f6bebb8e9e03a7e41afb8a45e6",
+      "node_id": "C_kwDOABII59oAKGRhZmFjZmQ1NjRhZTc1ZjU3OTk5MDJkZTVmZjJjM2FhMmNmMDc2ZjQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/dafacfd564ae75f5799902de5ff2c3aa2cf076f4",
       "actor": null,
       "commit_id": null,
       "commit_url": null,
       "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/3c8397afbeb1c2f6bebb8e9e03a7e41afb8a45e6",
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/dafacfd564ae75f5799902de5ff2c3aa2cf076f4",
       "tree": {
-        "sha": "48dfa24b3eb781fd87f5b99b3affd720a1c7b727",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/48dfa24b3eb781fd87f5b99b3affd720a1c7b727"
+        "sha": "e61fd20a39a8719504547e553af0d9d4487b5c7f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/e61fd20a39a8719504547e553af0d9d4487b5c7f"
       },
       "verification": {
         "verified": true,
         "reason": "valid",
-        "payload": "tree 48dfa24b3eb781fd87f5b99b3affd720a1c7b727\nparent 7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322\nauthor Alexander Shevtsov <randomlogin76@gmail.com> 1778592899 +0200\ncommitter Alexander Shevtsov <randomlogin76@gmail.com> 1778592899 +0200\n\nAdd benchmarking for on-the-fly compact filter\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEEafD4VpUZuehjWNOmqdpJAsVp7+4FAmoDLJ8ACgkQqdpJAsVp\n7+4hexAAzC70Z+AgS30NNtHmp+xvdhspUBfXktS/3z99PbXm1dkH1WCYwgbR0SWP\nYUNyoet23uq03iIbk3Jl4DEo/749dwfxDUuexqXG0MmParV6odi4N6IABDpqNfrl\nMn7HCZDSZeeDb4R4BfynRil48S8+gElWCAaAcRzJoftKcuuzfyw+pgAiUTIAxB4R\nl7Vj2KQMTkcURTwjpyXkqCrQkRRqw1GqfsEqUyoWcwbtHz74a7rr2Kl+G1NHFo67\n9tn23r7a6ZAb+eYSAsZuI95UlLJzaDSOt4uNxplGuO6xprvB9dBUFFcp1X+KaPOo\nPwFfvw+Tb0ZEDv1b/LM3WBNv0+J5nNh7JKAmCYc1UsCWByVB6/qac0xu+ZpSvL2k\ncM6wfp2DP5qIUNcnA1NeAt2XiuybUqUJ3xjzaWdVlY8VDU86Hlr1AfofshEZSFyk\nkCBMZmMHUvBRy87+iSg08o256qQTBffuj3GRo/OY296oIOnmPWEWijjUHRThW/MH\nH535/kgR6gf7aqPOoyoexXgwxxpt4/2/sjsu7b+j6FC51Z/ll94vjbW3MAs17zoz\nb5O5QZ8UTfyfjXxznWYqTvOusBQ7UEIW9AaUIN4rKEU7Sz8xM3JvCQtl2ThZmlNV\nQ59PIZrxthMYFqlRJ/2IqjapOUMcF3nhm1qCyJniI47+bd8OXxg=\n=RMdJ\n-----END PGP SIGNATURE-----"
+        "payload": "tree e61fd20a39a8719504547e553af0d9d4487b5c7f\nparent 8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e\nauthor Alexander Shevtsov <randomlogin76@gmail.com> 1778606759 +0200\ncommitter Alexander Shevtsov <randomlogin76@gmail.com> 1778606759 +0200\n\ntest: add cfilter race condition tests\n\nCompact block filter requests can arrive after a block has been\nconnected and advertised (NODE_COMPACT_FILTERS) but before the\nfilter index's CustomAppend has written the filter on the\nvalidation-signals scheduler thread. In that window LookupFilter,\nLookupFilterRange, LookupFilterHashRange and LookupFilterHeader\nall fail, and peers requesting filters for a block we already have\nreceive no reply.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEEafD4VpUZuehjWNOmqdpJAsVp7+4FAmoDYrcACgkQqdpJAsVp\n7+5K1A/+Pw2uceeOV/uhxTR/aIfCPew8/BlOhEwgZAHdxZcD+re0nMF9cOumilGO\nOUGi+rOdIptSXR0h4kTwtc1QhyFrewHYf+NDHNEMTS5XyuSdSZBAdzmYf+mrmRXI\nhe17uOgBpJsts8//9Wgjy62zzT7MN1gXX21sosiOFYjow/A3Ylz09VTU9BG6e0Zl\nO5X9ePds4H/Xz79YtP9eJmj1kHWE66SB4+03Tupe6i5Ch/gDMrc0hwenFwmlyFER\nif8H7hCWHr0KTf2hYVH1wv3M5fcNuKpqypABX66XygDGYpSs52ewBnUcV8hpn826\nI7bOCUnICXnDEcFEgDcGNlVozgtjIHIkp/NnCHH4X5RG4MWXj4y2ODWSHBuTL54R\neNivmMI3Zb4t9DDkDcvJvmkkS+eWRPwpwQ1CfmOHQk81w5fdZB8MyWbh8Q8L2xzR\nAbC9Sb8v9ZOcWTQOlrna4A7XZzsrmG3xo2gIa5f1RBgRhT8xsufmTplDYIX2l+cB\nwi608wGN/45J3h11ESQwOBZ3zORr7VlAoOMWKTKGZ26Y8W41k1H66+CRiwtPGP1F\npbpkcBtjZV6oemzeDApd81Ko5ODRRbJfNHBGHMocYTFSZbyz/sjlknmJbGZ0w9UN\nm+jlBFcmGFlORJIQcnjiIRGYWkWpPIKnWrd0VRd8uoBQNgopEHA=\n=Tplb\n-----END PGP SIGNATURE-----"
       },
       "parents": [
         {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322",
-          "sha": "7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7cfa6bac4bfcee2bf73a2b7a6d42921aa5433322"
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e",
+          "sha": "8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/8396b7f2a3be4be7bb2ffc152f87b4cab95dd84e"
         }
       ],
-      "message": "Add benchmarking for on-the-fly compact filter",
+      "message": "test: add cfilter race condition tests\n\nCompact block filter requests can arrive after a block has been\nconnected and advertised (NODE_COMPACT_FILTERS) but before the\nfilter index's CustomAppend has written the filter on the\nvalidation-signals scheduler thread. In that window LookupFilter,\nLookupFilterRange, LookupFilterHashRange and LookupFilterHeader\nall fail, and peers requesting filters for a block we already have\nreceive no reply.",
       "committer": {
         "name": "Alexander Shevtsov",
         "email": "randomlogin76@gmail.com",
-        "date": "2026-05-12T13:34:59Z"
+        "date": "2026-05-12T17:25:59Z"
       },
       "author": {
         "name": "Alexander Shevtsov",
         "email": "randomlogin76@gmail.com",
-        "date": "2026-05-12T13:34:59Z"
+        "date": "2026-05-12T17:25:59Z"
       },
-      "sha": "3c8397afbeb1c2f6bebb8e9e03a7e41afb8a45e6"
+      "sha": "dafacfd564ae75f5799902de5ff2c3aa2cf076f4"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDc1ZTUyNTU5MGYyNGY2YWViMDM5YjJiODkwMGIyOWU1YzIxMDBkMzk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/75e525590f24f6aeb039b2b8900b29e5c2100d39",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/75e525590f24f6aeb039b2b8900b29e5c2100d39",
+      "tree": {
+        "sha": "534e5f438eca70fa5948b1320379a73026944ee5",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/534e5f438eca70fa5948b1320379a73026944ee5"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 534e5f438eca70fa5948b1320379a73026944ee5\nparent dafacfd564ae75f5799902de5ff2c3aa2cf076f4\nauthor Alexander Shevtsov <randomlogin76@gmail.com> 1778606914 +0200\ncommitter Alexander Shevtsov <randomlogin76@gmail.com> 1778606982 +0200\n\nnet: compute missing compact filters on the fly\n\nWhen a filter request arrives for a block that is connected and\nhas block/undo data but has not yet been written by the filter\nindex's CustomAppend (the gap between block-connect and the\nscheduler-thread callback), compute the filter from raw block\ndata and persist it.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCgAdFiEEafD4VpUZuehjWNOmqdpJAsVp7+4FAmoDY5MACgkQqdpJAsVp\n7+7d1RAAxTJ3szvdMap0Po4gtpkxcuItgvoxRbsLDYEj7y27/aUOIUWgFVRFbR1u\nv/+yxQgqTdbI4O/K6s3ZQ2/8vKXpoVj95tsD28gfIhNvdR77VZyN6mYDUxhTKoLZ\ngMEuFokZCFfSmcQHPQajMQUZ1P+QJ6j5qKPDcFjmHFT7ngqan7r9wK9BAH63Dlwi\nHIc5enfyZ60YGy7yKT1Uae+4h811hncDoLu0CQsIam2aHo3HWWLXXZOTLfXSn3gD\ngfL7LgHv3G0QmyOV+zvwR3wCCtlNIvoWdv6lBF2g+EVGgtZb/nC9FRE20UCPby8E\nLktgIG8TDPqC5ipn5Y7x7pPNn9QerUjT2vaq5AXRFQKhD5ed1zGNh3RIz04Chu8u\n5llI+XC3XzJR2xDDpmHR+jztSqfHkVAqqAuPZudxi7DAJFpVgSHtaaC2D566O4zE\nexEl6Pvh+nAJ3RJVQWLDQVfiHSXcjgZ+NXfuZEn8ZffZybRn3CPz5cyI/lFQUWYZ\nEGWMX0Sv5QJxE/Vyqxk4fyD272iG8BHene11/yaKtD+4DKAZepkn1koqaZkD48it\ngpbEj3o810PE2PvXgqRKI7nY+N5ukmcz08es5qBvRk9maRD3NhWJAC5/RISoH77i\ntuq9sXuTpeAIcZPVovmEoJEFf5q/2PkRQDvfhCkjAfCmTJniYMQ=\n=WG1O\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/dafacfd564ae75f5799902de5ff2c3aa2cf076f4",
+          "sha": "dafacfd564ae75f5799902de5ff2c3aa2cf076f4",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/dafacfd564ae75f5799902de5ff2c3aa2cf076f4"
+        }
+      ],
+      "message": "net: compute missing compact filters on the fly\n\nWhen a filter request arrives for a block that is connected and\nhas block/undo data but has not yet been written by the filter\nindex's CustomAppend (the gap between block-connect and the\nscheduler-thread callback), compute the filter from raw block\ndata and persist it.",
+      "committer": {
+        "name": "Alexander Shevtsov",
+        "email": "randomlogin76@gmail.com",
+        "date": "2026-05-12T17:29:42Z"
+      },
+      "author": {
+        "name": "Alexander Shevtsov",
+        "email": "randomlogin76@gmail.com",
+        "date": "2026-05-12T17:28:34Z"
+      },
+      "sha": "75e525590f24f6aeb039b2b8900b29e5c2100d39"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 25442606681,
+      "node_id": "HRFPE_lADOABII588AAAABB6K06c8AAAAF7H9eWQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/25442606681",
+      "actor": {
+        "login": "randomlogin",
+        "id": 1616179,
+        "node_id": "MDQ6VXNlcjE2MTYxNzk=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1616179?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/randomlogin",
+        "html_url": "https://github.com/randomlogin",
+        "followers_url": "https://api.github.com/users/randomlogin/followers",
+        "following_url": "https://api.github.com/users/randomlogin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/randomlogin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/randomlogin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/randomlogin/subscriptions",
+        "organizations_url": "https://api.github.com/users/randomlogin/orgs",
+        "repos_url": "https://api.github.com/users/randomlogin/repos",
+        "events_url": "https://api.github.com/users/randomlogin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/randomlogin/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "75e525590f24f6aeb039b2b8900b29e5c2100d39",
+      "commit_url": "https://api.github.com/repos/randomlogin/bitcoin/commits/75e525590f24f6aeb039b2b8900b29e5c2100d39",
+      "created_at": "2026-05-12T17:30:18Z"
+    },
+    {
+      "event": "ready_for_review",
+      "id": 25442819359,
+      "node_id": "RFRE_lADOABII588AAAABB6K06c8AAAAF7IKdHw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/25442819359",
+      "actor": {
+        "login": "randomlogin",
+        "id": 1616179,
+        "node_id": "MDQ6VXNlcjE2MTYxNzk=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1616179?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/randomlogin",
+        "html_url": "https://github.com/randomlogin",
+        "followers_url": "https://api.github.com/users/randomlogin/followers",
+        "following_url": "https://api.github.com/users/randomlogin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/randomlogin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/randomlogin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/randomlogin/subscriptions",
+        "organizations_url": "https://api.github.com/users/randomlogin/orgs",
+        "repos_url": "https://api.github.com/users/randomlogin/repos",
+        "events_url": "https://api.github.com/users/randomlogin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/randomlogin/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-05-12T17:36:25Z"
     }
   ],
   "comments": []
