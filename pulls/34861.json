@@ -52,9 +52,8 @@
       }
     ],
     "created_at": "2026-03-19T09:24:04Z",
-    "updated_at": "2026-05-28T12:53:40Z",
-    "mergeable": true,
-    "mergeable_state": "blocked",
+    "updated_at": "2026-05-28T18:29:55Z",
+    "mergeable_state": "unknown",
     "merged": false,
     "merge_commit_sha": "8c51e1ee407716ab9cc4a449a8c169816a402ab5",
     "assignees": [],
@@ -171,7 +170,6 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": true,
     "head": {
       "label": "polespinasa:2026-03-19-importdescriptors",
       "ref": "2026-03-19-importdescriptors",
@@ -409,12 +407,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38979,
-        "stargazers_count": 89204,
-        "watchers_count": 89204,
-        "size": 316296,
+        "forks_count": 38978,
+        "stargazers_count": 89206,
+        "watchers_count": 89206,
+        "size": 316359,
         "default_branch": "master",
-        "open_issues_count": 672,
+        "open_issues_count": 667,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -431,9 +429,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-05-28T12:02:30Z",
+        "pushed_at": "2026-05-28T18:58:04Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-05-28T12:02:39Z",
+        "updated_at": "2026-05-28T18:58:14Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -463,7 +461,7 @@
     "deletions": 264,
     "changed_files": 6,
     "commits": 4,
-    "review_comments": 75,
+    "review_comments": 76,
     "comments": 29
   },
   "events": [
@@ -9896,6 +9894,60 @@
       "start_side": "RIGHT",
       "line": null,
       "original_line": 383,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3319905125",
+      "pull_request_review_id": 4383646335,
+      "id": 3319905125,
+      "node_id": "PRRC_kwDOABII587F4btl",
+      "diff_hunk": "@@ -281,42 +303,159 @@ static UniValue ProcessDescriptorImport(CWallet& wallet, const UniValue& data, c\n                 std::transform(extpubs.begin(), extpubs.end(), std::inserter(pubkeys, pubkeys.begin()), [](const CExtPubKey& xpub) { return xpub.pubkey; });\n                 CHECK_NONFATAL(pubkeys.size() == 1);\n                 if (wallet.GetKey(pubkeys.begin()->GetID())) {\n-                    throw JSONRPCError(RPC_WALLET_ERROR, \"Cannot import an unused() descriptor when its private key is already in the wallet\");\n+                    return result.Error(ImportDescriptorResult::FailureReason::WALLET_ERROR, \"Cannot import an unused() descriptor when its private key is already in the wallet\");\n                 }\n             }\n \n-            WalletDescriptor w_desc(std::move(parsed_desc), timestamp, range_start, range_end, next_index);\n+        WalletDescriptor w_desc(std::move(parsed_desc), timestamp, range_start, range_end, next_index);\n+\n+        // Add descriptor to wallet\n+        auto spk_manager_res = wallet.AddWalletDescriptor(w_desc, keys, label_str, desc_internal);\n+\n+        if (!spk_manager_res) {\n+            return result.Error(ImportDescriptorResult::FailureReason::WALLET_ERROR,\n+                strprintf(\"Could not add descriptor '%s': %s\", descriptor, util::ErrorString(spk_manager_res).original));\n+        }\n \n-            // Add descriptor to the wallet\n-            auto spk_manager_res = wallet.AddWalletDescriptor(w_desc, keys, label, desc_internal);\n+        auto& spk_manager = spk_manager_res.value().get();\n \n-            if (!spk_manager_res) {\n-                throw JSONRPCError(RPC_WALLET_ERROR, strprintf(\"Could not add descriptor '%s': %s\", descriptor, util::ErrorString(spk_manager_res).original));\n+        // Set descriptor as active if necessary\n+        if (active) {\n+            if (!w_desc.descriptor->GetOutputType()) {\n+                result.warnings.emplace_back(\"Unknown output type, cannot set descriptor to active.\");\n+            } else {\n+                wallet.AddActiveScriptPubKeyMan(spk_manager.GetID(), *w_desc.descriptor->GetOutputType(), desc_internal);\n+            }\n+        } else {\n+            if (w_desc.descriptor->GetOutputType()) {\n+                wallet.DeactivateScriptPubKeyMan(spk_manager.GetID(), *w_desc.descriptor->GetOutputType(), desc_internal);\n             }\n+        }\n+    }\n \n-            auto& spk_manager = spk_manager_res.value().get();\n+    result.success = true;\n+    return result;\n+}\n \n-            // Set descriptor as active if necessary\n-            if (active) {\n-                if (!w_desc.descriptor->GetOutputType()) {\n-                    warnings.push_back(\"Unknown output type, cannot set descriptor to active.\");\n-                } else {\n-                    wallet.AddActiveScriptPubKeyMan(spk_manager.GetID(), *w_desc.descriptor->GetOutputType(), desc_internal);\n+std::vector<ImportDescriptorResult> ProcessDescriptorsImport(CWallet& wallet,\n+    std::vector<ImportDescriptorRequest> requests)\n+{\n+    std::vector<ImportDescriptorResult> response;\n+    std::vector<int64_t> resolved_timestamps;\n+    resolved_timestamps.reserve(requests.size());\n+\n+    // Make sure the results are valid at least up to the most recent block\n+    // the user could have gotten from another RPC command prior to now\n+    wallet.BlockUntilSyncedToCurrentChain();\n+\n+    WalletRescanReserver reserver(wallet);\n+    if (!reserver.reserve(/*with_passphrase=*/true)) {\n+        ImportDescriptorResult result;\n+        result.Error(ImportDescriptorResult::FailureReason::WALLET_ERROR,\n+            \"Wallet is currently rescanning. Abort existing rescan or wait.\",\n+            /*g_e=*/true);\n+        response.push_back(result);\n+        return response;\n+    }\n+    // Ensure that the wallet is not locked for the remainder of this call,\n+    // as the passphrase is used to top up the keypool.\n+    LOCK(wallet.m_relock_mutex);\n+    const int64_t minimum_timestamp = 1;\n+    int64_t now = 0;\n+    int64_t lowest_timestamp = 0;\n+    bool rescan = false;\n+    {\n+        LOCK(wallet.cs_wallet);\n+        if (wallet.IsLocked()) {\n+            ImportDescriptorResult result;\n+            result.Error(\n+                ImportDescriptorResult::FailureReason::WALLET_UNLOCK_NEEDED,\n+                \"Error: Please enter the wallet passphrase with walletpassphrase first.\",\n+                /*g_e=*/true);\n+            response.push_back(result);\n+            return response;\n+        }\n+\n+        CHECK_NONFATAL(wallet.chain().findBlock(wallet.GetLastBlockHash(), interfaces::FoundBlock().time(lowest_timestamp).mtpTime(now)));\n+\n+        for (ImportDescriptorRequest& request : requests) {\n+            const int64_t timestamp = std::max(request.timestamp.value_or(now), minimum_timestamp);\n+            resolved_timestamps.push_back(timestamp);\n+            ImportDescriptorResult result = ImportDescriptor(\n+                wallet,\n+                request.descriptor,\n+                request.active,\n+                request.internal,\n+                request.label,\n+                timestamp,\n+                request.range,\n+                request.next_index);\n+            response.push_back(result);\n+\n+            if (result.success) {\n+                // At least one request succeeded, so we need to rescan\n+                rescan = true;\n+                if (lowest_timestamp > timestamp) {\n+                    lowest_timestamp = timestamp;\n                 }\n-            } else {\n-                if (w_desc.descriptor->GetOutputType()) {\n-                    wallet.DeactivateScriptPubKeyMan(spk_manager.GetID(), *w_desc.descriptor->GetOutputType(), desc_internal);\n+            }\n+        }\n+        wallet.ConnectScriptPubKeyManNotifiers();\n+        wallet.RefreshAllTXOs();\n+    }\n+\n+    if (rescan) {\n+        const int64_t scanned_time = wallet.RescanFromTime(lowest_timestamp, reserver);\n+        wallet.ResubmitWalletTransactions(node::TxBroadcast::MEMPOOL_NO_BROADCAST, /*force=*/true);\n+\n+        if (wallet.IsAbortingRescan()) {\n+            // Mark all previously successful imports as aborted\n+            for (ImportDescriptorResult& r : response) {\n+                if (r.success) {\n+                    r.success = false;\n+                    r.Error(ImportDescriptorResult::FailureReason::MISC_ERROR,\n+                        \"Rescan aborted by user.\");\n                 }\n             }\n+            return response;\n         }\n \n-        result.pushKV(\"success\", UniValue(true));\n-    } catch (const UniValue& e) {\n-        result.pushKV(\"success\", UniValue(false));\n-        result.pushKV(\"error\", e);\n+        if (scanned_time > lowest_timestamp) {\n+            for (size_t i = 0; i < requests.size(); ++i) {\n+                ImportDescriptorResult& result = response.at(i);\n+\n+                // If the descriptor timestamp is within the successfully scanned\n+                // range, or if the import result already has an error set, let\n+                // the result stand unmodified. Otherwise replace the result\n+                // with an error message.\n+                const int64_t timestamp{resolved_timestamps.at(i)};\n+                if (scanned_time <= timestamp || !result.success) continue;\n+                const int64_t error_timestamp{requests.at(i).timestamp.value_or(timestamp)};",
+      "path": "src/wallet/rpc/backup.cpp",
+      "position": 1,
+      "original_position": 443,
+      "commit_id": "da866a3eaeb6bb8c3bb4c2d23e1ae13c45a7b200",
+      "original_commit_id": "da866a3eaeb6bb8c3bb4c2d23e1ae13c45a7b200",
+      "in_reply_to_id": 3299710844,
+      "user": {
+        "login": "achow101",
+        "id": 3782274,
+        "node_id": "MDQ6VXNlcjM3ODIyNzQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/3782274?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/achow101",
+        "html_url": "https://github.com/achow101",
+        "followers_url": "https://api.github.com/users/achow101/followers",
+        "following_url": "https://api.github.com/users/achow101/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/achow101/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/achow101/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/achow101/subscriptions",
+        "organizations_url": "https://api.github.com/users/achow101/orgs",
+        "repos_url": "https://api.github.com/users/achow101/repos",
+        "events_url": "https://api.github.com/users/achow101/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/achow101/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I'm pretty sure allowing a timestamp of 0 doesn't have a negative effect. The default value for the field that the timestamp ends up in is 0 already. We should disallow invalid timestamps (e.g. negatives), not rewriting them into a valid value.",
+      "created_at": "2026-05-28T18:29:54Z",
+      "updated_at": "2026-05-28T18:29:55Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34861#discussion_r3319905125",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3319905125"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34861"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 433,
       "side": "RIGHT"
     }
   ]
