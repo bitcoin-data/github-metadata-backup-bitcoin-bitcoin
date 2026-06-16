@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35215/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35215/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/7ca4e5d6948ff944d09ea1d3c78415216d5f895f",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/4d00740e2921c09a717bcf1964b94780a64757bb",
     "number": 35215,
     "state": "open",
     "locked": false,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "**Problem:** Several internal unordered maps/sets use `COutPoint` keys (most notably `CCoinsMap` storing the in-memory dbcache), repeatedly hashing a 32-byte txid plus a 32-bit output index using SipHash-2-4. That path is conservative but expensive for this fixed 36-byte shape: it processes the four txid limbs and the final index/length word in 14 SipRounds.\r\n\r\n**SipHash-1-3 & Jumbo blocks:** This implementation follows Pieter Wuille's jumboblock suggestion based on the SipHash analysis [paper](https://eprint.iacr.org/2012/351.pdf). The main input is already a 256-bit hash, so the hasher processes the four txid limbs together as one block instead of feeding them as four independent 64-bit SipHash message blocks.\r\n<details>\r\n<summary>Pieter Wuille's jumboblock and SipRound sketch</summary>\r\n\r\n> we can actually process a full 256-bit hash at once, as one block, rather than having a block per 64-bit.\r\n>\r\n> SH24=SipHash-2-4, SH13=SipHash-1-3, JB=jumboblock(this idea), UP=unpadded(dropping the last block, which IMO doesn't help given that our inputs are constant length).\r\n>\r\n> In the UTXO set cache setting, we have:\r\n> * SH24: 16 SipRounds\r\n> * SH24+UP: 14 SipRounds\r\n> * SH24+JB: 10 SipRounds\r\n> * SH24+JB+UP: 8 SipRounds\r\n> * SH13: 9 SipRounds\r\n> * SH13+UP: 8 SipRounds\r\n> * SH13+JB: 6 SipRounds\r\n> * SH13+JB+UP: 5 SipRounds\r\n>\r\n> Specifically, this is pseudocode that I asked him about:\r\n\r\n```python\r\n(m0-m3 are the 64-bit limbs of the hash input, m4-m5 are other inputs including padding)\r\n\r\n# initialization\r\nv0 = c0 ^ k0\r\nv1 = c1 ^ k1\r\nv2 = c2 ^ k0\r\nv3 = c3 ^ k1\r\n\r\n# process m0-m3\r\nv0 ^= m0\r\nv1 ^= m1\r\nv2 ^= m2\r\nv3 ^= m3\r\nSIPROUND * c\r\nv0 ^= m3\r\nv1 ^= m0\r\nv2 ^= m1\r\nv3 ^= m2\r\n\r\n# process m4\r\nv3 ^= m4\r\nSIPROUND * c\r\nv0 ^= m4\r\n\r\n# process m5\r\nv3 ^= m5\r\nSIPROUND * c\r\nv0 ^= m5\r\n\r\n# finalize\r\nv2 ^= 0xff\r\nSIPROUND * d\r\nreturn v0 ^ v1 ^ v2 ^ v3\r\n```\r\n\r\n</details>\r\n\r\n**Design:** For the `COutPoint` shape, this processes the txid limbs as a jumboblock, keeps Bitcoin Core's existing combined index/length word (`m4`), and omits `m5` from Pieter's generic sketch. The length byte is also included for symmetry (even though this path does not need to be compatible with a variable-length SipHash implementation), and the round count drops from 14 SipRounds (`SH24+UP`) to 5 (`SH13+JB+UP`).\r\n\r\nPieter also ran the jumboblock idea by [Jean-Philippe Aumasson](https://github.com/bitcoin/bitcoin/pull/35215#issuecomment-4385336928), one of the SipHash authors; based on a preliminary analysis, Aumasson did not think this made collisions easier to construct. Aumasson also said SipHash-1-3 is fine for this hashmap use case and offered to comment on or review the PR.\r\n\r\n<img width=\"2100\" height=\"860\" alt=\"siphash_compare_github_aligned_v7_compact min\" src=\"https://github.com/user-attachments/assets/c3bf9297-c4b1-4c96-a47b-dc6b4377758b\" />\r\nOld: 4 separate 64-bit txid compressions + 1 index/length compression + 4 finalization rounds = 14 SipRounds.\r\nNew: 1 combined 256-bit txid compression + 1 index/length compression + 3 finalization rounds = 5 SipRounds.\r\n\r\n**Fix:** Add `PresaltedSipHasher13Jumbo`, a narrow SipHash-1-3 jumboblock specialization for hashing an existing `uint256` hash plus a `uint32_t` index. Then switch the existing `SaltedOutpointHasher` wrapper to use it, so existing `COutPoint` unordered maps and sets keep their public hasher type while getting the faster implementation.\r\n\r\nThis covers the coins cache and other in-memory outpoint tables through the existing abstraction, without spreading a variant-specific type name through call sites. The regular `PresaltedSipHasher` path remains for txid/wtxid/uint256 hashers, compact-block short IDs, and persisted/index key derivation.\r\n\r\nThe salted hash codes are only local in-memory table indexes for the current process; they already vary across normal restarts and are not serialized, persisted, sent over the network, or used for consensus.\r\n\r\n**Reproducer:** A test vector documents the non-standard jumboblock output, and the benchmarks now include both the existing 36-byte SipHash-2-4 path and the new jumboblock path.\r\n\r\n[Counting the dbcache buckets](https://gist.github.com/l0rinc/d68f56c3ed89f76f56da6632ef6f2d92) indicates the new hasher satisfies the uniformness criteria relied on before:\r\n<img width=\"1200\" height=\"750\" alt=\"ccoinsmap-collisions\" src=\"https://github.com/user-attachments/assets/eeedec81-acdc-4adf-a9c8-bfce089700da\" />\r\n\r\nFresh isolated aarch64 microbenchmarks on a Raspberry Pi 5 show the new 36-byte path about 2x faster with GCC and Clang.\r\n\r\n<details>\r\n<summary>Linux reproducer command</summary>\r\n\r\nThe command below rebuilds with GCC and Clang and prints only the benchmark output after the build.\r\n\r\n```bash\r\nfor COMPILER in gcc clang; do \\\r\n  if [ \"$COMPILER\" = gcc ]; then CC=gcc; CXX=g++; else CC=clang; CXX=clang++; fi; \\\r\n  cmake -B \"build-bench-$COMPILER\" -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON -DBUILD_TESTS=OFF -DBUILD_GUI=OFF -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=\"$CC\" -DCMAKE_CXX_COMPILER=\"$CXX\" >/dev/null 2>&1 && \\\r\n  cmake --build \"build-bench-$COMPILER\" --target bench_bitcoin -j\"$(nproc)\" >/dev/null 2>&1 && \\\r\n  echo \"\" && echo \"$(date -I) | SipHash 36-byte microbench | $(\"$CC\" --version | head -1) | $(\"$CXX\" --version | head -1) | $(hostname) | $(uname -m) | $(lscpu | awk -F: '/Model name/{print $2; exit}' | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM\" && \\\r\n  \"build-bench-$COMPILER/bin/bench_bitcoin\" -filter='SipHash.*36b' -min-time=10000; \\\r\ndone\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>aarch64 SipHash 36-byte microbenchmarks: ~2x faster with GCC and Clang</summary>\r\n\r\n```markdown\r\n2026-05-03 | SipHash 36-byte microbench | gcc (Ubuntu 14.2.0-19ubuntu2) 14.2.0 | g++ (Ubuntu 14.2.0-19ubuntu2) 14.2.0 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|               16.61 |       60,192,540.58 |    0.0% |           80.00 |           39.78 |  2.011 |           0.00 |   50.0% |     11.00 | `SipHash13Jumbo_36b`\r\n|               33.92 |       29,483,465.40 |    0.0% |          171.00 |           81.23 |  2.105 |           0.00 |   50.0% |     11.00 | `SipHash24_36b`\r\n\r\n2026-05-03 | SipHash 36-byte microbench | Ubuntu clang version 22.0.0 (++20250923084147+c890a9050e88-1~exp1~20250923084331.324) | Ubuntu clang version 22.0.0 (++20250923084147+c890a9050e88-1~exp1~20250923084331.324) | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|               17.02 |       58,748,229.11 |    0.0% |           81.00 |           40.75 |  1.988 |           0.00 |   50.0% |     11.00 | `SipHash13Jumbo_36b`\r\n|               33.21 |       30,115,556.16 |    0.0% |          172.00 |           79.51 |  2.163 |           0.00 |   50.0% |     11.00 | `SipHash24_36b`\r\n```\r\n\r\n</details>\r\n\r\n**Benchmarks**\r\n\r\nThe `-reindex-chainstate` runs below were collected before this final shared-wrapper shape, while the branch still applied the same jumboblock hasher only to `CCoinsMap`.\r\n\r\n<details><summary>5% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\\r\n    COMMITS=\"976985eccd546a95e38973b854ccc6589e8afc74 b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n976985eccd Merge bitcoin/bitcoin#34124: validation: make `CCoinsView` a pure virtual interface\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-04 | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 976985eccd546a95e38973b854ccc6589e8afc74)\r\n  Time (abs ≡):        19247.091 s               [User: 33228.894 s, System: 1908.564 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        18357.707 s               [User: 32399.997 s, System: 1935.467 s]\r\n\r\nRelative speed comparison\r\n        1.05          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 976985eccd546a95e38973b854ccc6589e8afc74)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n```\r\n</details>\r\n\r\n<details><summary>5% faster | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 30000; do \\\r\n    COMMITS=\"976985eccd546a95e38973b854ccc6589e8afc74 b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\nffa1b71e87 bench: add SipHash-2-4 36-byte benchmark\r\n42410eda26 coins: use jumboblock SipHash for `CCoinsMap`\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ffa1b71e870755d2a355fe3c8ed8c084544fabb2)\r\n  Time (abs ≡):        17664.762 s               [User: 24440.658 s, System: 773.072 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 42410eda260ed\r\n  Time (abs ≡):        16835.349 s               [User: 23591.362 s, System: 759.491 s]\r\n\r\nRelative speed comparison\r\n        1.05          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ffa1b71e870755d2a355fe3c8ed8c084544fabb2)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 42410eda260ed60bc2af1e8857e96f348bafdcde)\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>2% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | rpi5-16-3 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\                                                                                                                                     \r\n    COMMITS=\"71728b0c83d6f372406f34549ce8b988fa7e3a1e b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n71728b0c83 bench: add SipHash-2-4 36-byte benchmark\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 1000 | rpi5-16-3 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n  Time (abs ≡):        37976.474 s               [User: 55537.835 s, System: 4759.529 s]\r\n \r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        37076.745 s               [User: 54518.158 s, System: 4766.083 s]\r\n \r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>2% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\                                                                                                                                    \r\n    COMMITS=\"71728b0c83d6f372406f34549ce8b988fa7e3a1e b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n71728b0c83 bench: add SipHash-2-4 36-byte benchmark\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 1000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n  Time (abs ≡):        27194.936 s               [User: 36353.676 s, System: 3494.054 s]\r\n \r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        26559.372 s               [User: 35396.175 s, System: 3521.104 s]\r\n \r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n\r\n```\r\n\r\n</details>\r\n\r\n**Future Work**\r\n\r\n* [ ] Add a general SipHash-1-3 implementation, shorter-input specializations, or other variants from Pieter's sketch if benchmarks justify them.\r\n* [ ] Evaluate related ideas for compact-block short IDs ([BIP152](https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki)); this is a protocol surface and would require separate design, BIP discussion, and negotiation.\r\n",
+    "body": "**Problem:** Several internal hash-table and index-prefix paths key by values that already contain a 32-byte txid/hash. The most important current user is `CCoinsMap`, which stores the in-memory dbcache and hashes `COutPoint` keys as a 32-byte txid plus a 32-bit output index.\r\n\r\nThe existing `PresaltedSipHasher` path uses SipHash-2-4 for these fixed-width shapes. That is conservative, but expensive: the txid is processed as four independent 64-bit message blocks, followed by the fixed-size tail and finalization. The 32-byte txid-only path and 36-byte outpoint-shaped path both take 14 SipRounds today.\r\n\r\nThis also matters for hash-prefix index work such as [#35531](https://github.com/bitcoin/bitcoin/pull/35531): once a new persisted key format chooses a hash function, changing it later would require reindexing. If we want a faster non-standard keyed hash for txids there, it is better to expose and benchmark the fixed txid-only construction before that format ships.\r\n\r\n**SipHash-1-3 & Jumbo blocks:** This implementation follows Pieter Wuille's jumboblock suggestion based on the SipHash analysis [paper](https://eprint.iacr.org/2012/351.pdf). The main input is already a 256-bit hash, so the hasher processes the four txid limbs together as one block instead of feeding them as four independent 64-bit SipHash message blocks.\r\n<details>\r\n<summary>Pieter Wuille's jumboblock and SipRound sketch</summary>\r\n\r\n> we can actually process a full 256-bit hash at once, as one block, rather than having a block per 64-bit.\r\n>\r\n> SH24=SipHash-2-4, SH13=SipHash-1-3, JB=jumboblock(this idea), UP=unpadded(dropping the last block, which IMO doesn't help given that our inputs are constant length).\r\n>\r\n> In the UTXO set cache setting, we have:\r\n> * SH24: 16 SipRounds\r\n> * SH24+UP: 14 SipRounds\r\n> * SH24+JB: 10 SipRounds\r\n> * SH24+JB+UP: 8 SipRounds\r\n> * SH13: 9 SipRounds\r\n> * SH13+UP: 8 SipRounds\r\n> * SH13+JB: 6 SipRounds\r\n> * SH13+JB+UP: 5 SipRounds\r\n>\r\n> Specifically, this is pseudocode that I asked him about:\r\n\r\n```python\r\n(m0-m3 are the 64-bit limbs of the hash input, m4-m5 are other inputs including padding)\r\n\r\n# initialization\r\nv0 = c0 ^ k0\r\nv1 = c1 ^ k1\r\nv2 = c2 ^ k0\r\nv3 = c3 ^ k1\r\n\r\n# process m0-m3\r\nv0 ^= m0\r\nv1 ^= m1\r\nv2 ^= m2\r\nv3 ^= m3\r\nSIPROUND * c\r\nv0 ^= m3\r\nv1 ^= m0\r\nv2 ^= m1\r\nv3 ^= m2\r\n\r\n# process m4\r\nv3 ^= m4\r\nSIPROUND * c\r\nv0 ^= m4\r\n\r\n# process m5\r\nv3 ^= m5\r\nSIPROUND * c\r\nv0 ^= m5\r\n\r\n# finalize\r\nv2 ^= 0xff\r\nSIPROUND * d\r\nreturn v0 ^ v1 ^ v2 ^ v3\r\n```\r\n\r\n</details>\r\n\r\n**Design:** Add a narrow `PresaltedSipHasher13Jumbo` specialization for two fixed input shapes whose main input is already a uniformly distributed `uint256` hash:\r\n\r\n* `uint256`: process the four txid/hash limbs as one jumboblock, omit the final length/padding word, and run 3 finalization SipRounds. This is the 4-round txid-only `SH13+JB+UP` case.\r\n* `uint256 + uint32_t`: process the four txid/hash limbs as one jumboblock, run one compression round for the 32-bit index, omit the final length/padding word, and run 3 finalization SipRounds. This is the 5-round outpoint-shaped `SH13+JB+UP` case.\r\n\r\nThese paths intentionally do not try to match a variable-length SipHash API. Their supported input shapes are fixed and unambiguous, so the length/padding word does not add useful separation for these local/index uses.\r\n\r\nPieter also ran the jumboblock idea by [Jean-Philippe Aumasson](https://github.com/bitcoin/bitcoin/pull/35215#issuecomment-4385336928), one of the SipHash authors; based on a preliminary analysis, Aumasson did not think this made collisions easier to construct. Aumasson also said SipHash-1-3 is fine for this hashmap use case and offered to comment on or review the PR.\r\n\r\n<img width=\"2100\" height=\"860\" alt=\"siphash_compare_github_aligned_v7_compact min\" src=\"https://github.com/user-attachments/assets/c3bf9297-c4b1-4c96-a47b-dc6b4377758b\" />\r\n\r\n* Old 36-byte path: 4 separate 64-bit txid compressions + 1 index/length compression + 4 finalization rounds = 14 SipRounds.\r\n* New 36-byte path: 1 combined 256-bit txid compression + 1 index compression + 3 finalization rounds = 5 SipRounds.\r\n* New 32-byte path: 1 combined 256-bit txid compression + 3 finalization rounds = 4 SipRounds.\r\n\r\n**Fix:** Add `PresaltedSipHasher13Jumbo`, a fixed-shape SipHash-1-3 jumboblock specialization for hashing an existing `uint256` hash, optionally plus a `uint32_t` index. Then switch the existing `SaltedOutpointHasher` wrapper to use the 36-byte overload, so existing `COutPoint` unordered maps and sets keep their public hasher type while getting the faster implementation.\r\n\r\nThis covers the coins cache and other in-memory outpoint tables through the existing abstraction, without spreading a variant-specific type name through call sites. The 32-byte overload gives txid-only index-prefix work, such as [#35531](https://github.com/bitcoin/bitcoin/pull/35531), a benchmarked way to use the same construction before a new disk format commits to a hash function.\r\n\r\nThe regular `PresaltedSipHasher` path remains for existing txid/wtxid/uint256 hashers, compact-block short IDs, and current persisted/index key derivation unless a specific follow-up deliberately opts into this non-standard construction.\r\n\r\nFor the `SaltedOutpointHasher` users changed in this PR, the salted hash codes are only local in-memory table indexes for the current process; they already vary across normal restarts and are not serialized, persisted, sent over the network, or used for consensus.\r\n\r\n**Reproducer:** Fixed test vectors document both non-standard jumboblock outputs. The benchmarks now include SipHash-2-4 baselines and jumboblock paths for both supported fixed-width shapes.\r\n\r\n[Counting the dbcache buckets](https://gist.github.com/l0rinc/d68f56c3ed89f76f56da6632ef6f2d92) indicates the new 36-byte outpoint hasher satisfies the uniformness criteria relied on before:\r\n<img width=\"1200\" height=\"750\" alt=\"ccoinsmap-collisions\" src=\"https://github.com/user-attachments/assets/eeedec81-acdc-4adf-a9c8-bfce089700da\" />\r\n\r\nFresh isolated aarch64 microbenchmarks on a Raspberry Pi 5 show the new 36-byte path about 2x faster with GCC and Clang.\r\n\r\n<details>\r\n<summary>Linux reproducer command</summary>\r\n\r\nThe command below rebuilds with GCC and Clang and prints only the benchmark output after the build.\r\n\r\n```bash\r\nfor COMPILER in gcc clang; do \\\r\n  if [ \"$COMPILER\" = gcc ]; then CC=gcc; CXX=g++; else CC=clang; CXX=clang++; fi; \\\r\n  cmake -B \"build-bench-$COMPILER\" -DCMAKE_BUILD_TYPE=Release -DBUILD_BENCH=ON -DBUILD_TESTS=OFF -DBUILD_GUI=OFF -DENABLE_WALLET=OFF -DCMAKE_C_COMPILER=\"$CC\" -DCMAKE_CXX_COMPILER=\"$CXX\" >/dev/null 2>&1 && \\\r\n  cmake --build \"build-bench-$COMPILER\" --target bench_bitcoin -j\"$(nproc)\" >/dev/null 2>&1 && \\\r\n  echo \"\" && echo \"$(date -I) | SipHash fixed-width microbench | $(\"$CC\" --version | head -1) | $(\"$CXX\" --version | head -1) | $(hostname) | $(uname -m) | $(lscpu | awk -F: '/Model name/{print $2; exit}' | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM\" && \\\r\n  \"build-bench-$COMPILER/bin/bench_bitcoin\" -filter='SipHash.*32b|SipHash.*36b' -min-time=10000; \\\r\ndone\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>aarch64 SipHash 36-byte microbenchmarks: ~2x faster with GCC and Clang</summary>\r\n\r\n```markdown\r\n2026-05-03 | SipHash 36-byte microbench | gcc (Ubuntu 14.2.0-19ubuntu2) 14.2.0 | g++ (Ubuntu 14.2.0-19ubuntu2) 14.2.0 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|               16.61 |       60,192,540.58 |    0.0% |           80.00 |           39.78 |  2.011 |           0.00 |   50.0% |     11.00 | `SipHash13Jumbo_36b`\r\n|               33.92 |       29,483,465.40 |    0.0% |          171.00 |           81.23 |  2.105 |           0.00 |   50.0% |     11.00 | `SipHash24_36b`\r\n\r\n2026-05-03 | SipHash 36-byte microbench | Ubuntu clang version 22.0.0 (++20250923084147+c890a9050e88-1~exp1~20250923084331.324) | Ubuntu clang version 22.0.0 (++20250923084147+c890a9050e88-1~exp1~20250923084331.324) | rpi5-16-2 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM\r\n\r\n|               ns/op |                op/s |    err% |          ins/op |          cyc/op |    IPC |         bra/op |   miss% |     total | benchmark\r\n|--------------------:|--------------------:|--------:|----------------:|----------------:|-------:|---------------:|--------:|----------:|:----------\r\n|               17.02 |       58,748,229.11 |    0.0% |           81.00 |           40.75 |  1.988 |           0.00 |   50.0% |     11.00 | `SipHash13Jumbo_36b`\r\n|               33.21 |       30,115,556.16 |    0.0% |          172.00 |           79.51 |  2.163 |           0.00 |   50.0% |     11.00 | `SipHash24_36b`\r\n```\r\n\r\n</details>\r\n\r\n**Benchmarks**\r\n\r\nThe `-reindex-chainstate` runs below were collected before this final shared-wrapper shape, while the branch still applied the same jumboblock hasher only to `CCoinsMap`.\r\n\r\n<details><summary>5% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\\r\n    COMMITS=\"976985eccd546a95e38973b854ccc6589e8afc74 b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n976985eccd Merge bitcoin/bitcoin#34124: validation: make `CCoinsView` a pure virtual interface\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-04 | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 976985eccd546a95e38973b854ccc6589e8afc74)\r\n  Time (abs ≡):        19247.091 s               [User: 33228.894 s, System: 1908.564 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        18357.707 s               [User: 32399.997 s, System: 1935.467 s]\r\n\r\nRelative speed comparison\r\n        1.05          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 976985eccd546a95e38973b854ccc6589e8afc74)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n```\r\n</details>\r\n\r\n<details><summary>5% faster | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 30000; do \\\r\n    COMMITS=\"976985eccd546a95e38973b854ccc6589e8afc74 b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\nffa1b71e87 bench: add SipHash-2-4 36-byte benchmark\r\n42410eda26 coins: use jumboblock SipHash for `CCoinsMap`\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ffa1b71e870755d2a355fe3c8ed8c084544fabb2)\r\n  Time (abs ≡):        17664.762 s               [User: 24440.658 s, System: 773.072 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 42410eda260ed\r\n  Time (abs ≡):        16835.349 s               [User: 23591.362 s, System: 759.491 s]\r\n\r\nRelative speed comparison\r\n        1.05          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ffa1b71e870755d2a355fe3c8ed8c084544fabb2)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 42410eda260ed60bc2af1e8857e96f348bafdcde)\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>2% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | rpi5-16-3 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\\r\n    COMMITS=\"71728b0c83d6f372406f34549ce8b988fa7e3a1e b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n71728b0c83 bench: add SipHash-2-4 36-byte benchmark\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 1000 | rpi5-16-3 | aarch64 | Cortex-A76 | 4 cores | 15Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n  Time (abs ≡):        37976.474 s               [User: 55537.835 s, System: 4759.529 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        37076.745 s               [User: 54518.158 s, System: 4766.083 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n```\r\n\r\n</details>\r\n\r\n<details><summary>2% faster | reindex-chainstate | 946649 blocks | dbcache 1000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000; do \\\r\n    COMMITS=\"71728b0c83d6f372406f34549ce8b988fa7e3a1e b16188a906302b7d9e06adf2bc57e2b4f88b942f\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\n71728b0c83 bench: add SipHash-2-4 36-byte benchmark\r\nb16188a906 crypto: inline jumboblock SipHash\r\n\r\n2026-05-03 | reindex-chainstate | 946649 blocks | dbcache 1000 | umbrel | x86_64 | Intel(R) N150 | 4 cores | 15Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n  Time (abs ≡):        27194.936 s               [User: 36353.676 s, System: 3494.054 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n  Time (abs ≡):        26559.372 s               [User: 35396.175 s, System: 3521.104 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 71728b0c83d6f372406f34549ce8b988fa7e3a1e)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = b16188a906302b7d9e06adf2bc57e2b4f88b942f)\r\n\r\n```\r\n\r\n</details>\r\n\r\n**Future Work**\r\n\r\n* [ ] Evaluate using the 32-byte jumboblock path in txindex hash-prefix work such as [#35531](https://github.com/bitcoin/bitcoin/pull/35531) before a new persisted key format ships, because changing the hash function afterward would require reindexing.\r\n* [ ] Add a general SipHash-1-3 implementation, shorter-input specializations, or other variants from Pieter's sketch if benchmarks justify them.\r\n* [ ] Evaluate related ideas for compact-block short IDs ([BIP152](https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki)); this is a protocol surface and would require separate design, BIP discussion, and negotiation.\r\n",
     "labels": [
       {
         "id": 97470796,
@@ -52,11 +52,11 @@
       }
     ],
     "created_at": "2026-05-05T14:02:39Z",
-    "updated_at": "2026-05-29T12:04:03Z",
+    "updated_at": "2026-06-16T22:12:13Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "4571900b870174a3977cf4886f1a1a2006ed1ad5",
+    "merge_commit_sha": "e7320faf1adb09ecaafb27f845b68d9aec77a679",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -64,7 +64,7 @@
     "head": {
       "label": "l0rinc:l0rinc/siphash-jumbo",
       "ref": "l0rinc/siphash-jumbo",
-      "sha": "7ca4e5d6948ff944d09ea1d3c78415216d5f895f",
+      "sha": "4d00740e2921c09a717bcf1964b94780a64757bb",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -164,9 +164,9 @@
         "forks_count": 1,
         "stargazers_count": 4,
         "watchers_count": 4,
-        "size": 305118,
+        "size": 314624,
         "default_branch": "master",
-        "open_issues_count": 73,
+        "open_issues_count": 82,
         "is_template": false,
         "topics": [],
         "has_issues": false,
@@ -177,9 +177,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-05-28T21:29:03Z",
+        "pushed_at": "2026-06-16T22:10:38Z",
         "created_at": "2023-08-03T09:49:12Z",
-        "updated_at": "2026-05-28T21:16:00Z",
+        "updated_at": "2026-06-13T08:26:19Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -201,7 +201,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "d7ed2840acc0f065620fdd3d45480169f06a266c",
+      "sha": "a30ef6b91f73a6669e5aeedf460e0c9be2745a49",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -298,12 +298,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 38979,
-        "stargazers_count": 89211,
-        "watchers_count": 89211,
-        "size": 316571,
+        "forks_count": 39010,
+        "stargazers_count": 89448,
+        "watchers_count": 89448,
+        "size": 317560,
         "default_branch": "master",
-        "open_issues_count": 664,
+        "open_issues_count": 671,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -320,9 +320,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-05-29T09:30:34Z",
+        "pushed_at": "2026-06-16T16:19:33Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-05-29T11:46:51Z",
+        "updated_at": "2026-06-16T17:12:03Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -348,54 +348,14 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": false,
-    "additions": 120,
+    "additions": 151,
     "deletions": 15,
     "changed_files": 5,
     "commits": 4,
     "review_comments": 0,
-    "comments": 7
+    "comments": 8
   },
   "events": [
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQyZTA4OGZhZGE0NTQzZTk5MTJiOWYwZDFhOWY1Y2I2OGI1ODlmOGM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/42e088fada4543e9912b9f0d1a9f5cb68b589f8c",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/42e088fada4543e9912b9f0d1a9f5cb68b589f8c",
-      "tree": {
-        "sha": "888799849ccbd11a9f9cf0ecfed94ff389a7259e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/888799849ccbd11a9f9cf0ecfed94ff389a7259e"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 888799849ccbd11a9f9cf0ecfed94ff389a7259e\nparent d7ed2840acc0f065620fdd3d45480169f06a266c\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842714 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777989609 +0200\n\nbench: add SipHash-2-4 36-byte benchmark\n\nRename the existing 32-byte benchmark to `SipHash24_32b`.\nAdd a 36-byte variant for `uint256` plus a 32-bit outpoint index.\nThis records the current baseline shape before adding outpoint-specific hashers.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn59+kACgkQZp//D/pH\nenaAoRAAwP9ESnNWM8r7L2dX7zFAhvu7L5dhS6Sl4z402t83H7EVecOtmTjU3Qdw\nIaxf5k3SjeV1Q3Rwzog8fprXPdNGMrkRb6U7OKhxm0LDZg66MtQ+bwM7ecbm2VdB\nxFZS//sC2Ru7aO9D2I33lCkixp9/0T9gtprxyABIanQ3aSnkhjlC6vGafefqw9UJ\nyjI7BOToP7L/zhlcZ+8pUgiyrHiuM0J+HSdFngU8ejiKTPtW0/2qprh1mDndBFsm\nO4s3iTVicnFFEwiFo09D8d0lIV4iYkxSlDTSTDKmbH4rDuo2r+8kW2qSu+EbqMCt\ncFMHzu3l2nDzYJM4YkJ8clD4TBfvDDbjK0pAtx5i8/co95keS/i+bkZiDOCGTPMI\nl8oOKwYnzf+2zVpQt8mvjZk2GEGcjhomlO38MFOocGFB6V/Ipsokz074Kd48cI1d\nUAIlnaLAQtgcSaKXm4KMbZ39uu8+I+3+bGs9h3oZ9vkbA/5jyZRgfmEA5nzoFQML\nOEcC/HWKrHEM1ehR9pF46LmdOdzfhcn77FpwhCsMu/MKAAX6iS9Vg7ROwQD6OHzl\nhoSiZEL5tbhJdRrsNKEPKOWnFj4ollAkFzNVAN3oliToxz9fHkLhV18FCChW3orf\nuwzg3rVQgODpYWNwHBoIcV8LNlDqzWvLoUj1duCsd/r80p69aZk=\n=lPWF\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d7ed2840acc0f065620fdd3d45480169f06a266c",
-          "sha": "d7ed2840acc0f065620fdd3d45480169f06a266c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d7ed2840acc0f065620fdd3d45480169f06a266c"
-        }
-      ],
-      "message": "bench: add SipHash-2-4 36-byte benchmark\n\nRename the existing 32-byte benchmark to `SipHash24_32b`.\nAdd a 36-byte variant for `uint256` plus a 32-bit outpoint index.\nThis records the current baseline shape before adding outpoint-specific hashers.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-05T14:00:09Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-03T21:11:54Z"
-      },
-      "sha": "42e088fada4543e9912b9f0d1a9f5cb68b589f8c"
-    },
     {
       "event": "labeled",
       "id": 25179327747,
@@ -612,126 +572,6 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/35215#issuecomment-4382336519",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35215"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDhlMmZjYTNjNTViZTIyYTY1NjEyNTk0N2VmMWEzZDVkMzg1NDA5NjA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8e2fca3c55be22a656125947ef1a3d5d38540960",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/8e2fca3c55be22a656125947ef1a3d5d38540960",
-      "tree": {
-        "sha": "74b507911435bd5b2d4634aedc452f637568aa1e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/74b507911435bd5b2d4634aedc452f637568aa1e"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 74b507911435bd5b2d4634aedc452f637568aa1e\nparent 42e088fada4543e9912b9f0d1a9f5cb68b589f8c\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842766 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1778016405 +0200\n\ncrypto: use jumboblock SipHash for outpoints\n\nAdd `PresaltedSipHasher13Jumbo` for hashing a `uint256` plus a `uint32_t` outpoint index.\nFor this fixed 36-byte input, the implementation processes the four hash limbs as one jumboblock, keeps the existing index/length word, omits `m5`, and runs 3 finalization SipRounds.\nThis is the `SH13+JB+UP` case from Pieter Wuille's sketch.\n\nSwitch the existing `SaltedOutpointHasher` wrapper to the new presalted hasher, so all existing `COutPoint` unordered containers keep their public hasher type while using the faster implementation.\nThis is a non-standard table-hashing specialization, meant for internal hash tables whose keys already contain a uniformly distributed hash.\n\nAdd a fixed test vector for the non-standard path.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn6YJUACgkQZp//D/pH\nenbuGA//f+30KyRExZoDg+8BySirbSznaiv9Lod+b7XGMH1dJWjHcyGjSo/c6kkw\naGPMUgpNp13Aw/qEoSOzdLF3CXn7YWsw8Iu457y1onIIdurCMkeLQCHW0ClWyYSz\nOlgDrqdvVvspveNhj0RJPNbuFvJ8p7kJ6i1BNjIzUoO5pIwt3ubVJTux2R5drESD\nPKKOLi/otiAfjGUrrxPVZ6vXbbuerMy5oFEJpzqfPKZXIgSji50udcoT234TK0UM\nMZWj6VYSBm8/9YxevKcGnpDcZOFtvoH3Mx3UqYHArHhvsZ530J2GLN3r1X/wCGus\nEMAR9FutXsbXpBjfUA4W0O9yRk/MLQlOSP/spnsAW4LW8fr/4/rlK9WiXLiziC7I\nyMeywzzSKv8yFirTdhZNRnwhu98sGh/Z2tW2pCT5n2hHbS9Vz9/mWYvMzf3vtOrd\nNj+cesFlAzELULkrCoDyZvaIa/lWkrxfyOLZhx0Y2Xenpa6II5AItXPTRLihTkUL\n/zIstTYZNa5yVqyl3X8/HiwttnblzVcNvGAL2kH7AoOJPUwthMOxcvwY+UMdHpYy\nFko/0z9lid57OzF2Unha4r6jdQbne2W15rzUmPDKbKa8tEyGJbr3KC7Oj22MJ/Qb\n72CzFv95Qtz9CIQC7hby0bybIdnWxH3nDWHg40t39F1QYXqjCAg=\n=ns0u\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/42e088fada4543e9912b9f0d1a9f5cb68b589f8c",
-          "sha": "42e088fada4543e9912b9f0d1a9f5cb68b589f8c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/42e088fada4543e9912b9f0d1a9f5cb68b589f8c"
-        }
-      ],
-      "message": "crypto: use jumboblock SipHash for outpoints\n\nAdd `PresaltedSipHasher13Jumbo` for hashing a `uint256` plus a `uint32_t` outpoint index.\nFor this fixed 36-byte input, the implementation processes the four hash limbs as one jumboblock, keeps the existing index/length word, omits `m5`, and runs 3 finalization SipRounds.\nThis is the `SH13+JB+UP` case from Pieter Wuille's sketch.\n\nSwitch the existing `SaltedOutpointHasher` wrapper to the new presalted hasher, so all existing `COutPoint` unordered containers keep their public hasher type while using the faster implementation.\nThis is a non-standard table-hashing specialization, meant for internal hash tables whose keys already contain a uniformly distributed hash.\n\nAdd a fixed test vector for the non-standard path.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-05T21:26:45Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-03T21:12:46Z"
-      },
-      "sha": "8e2fca3c55be22a656125947ef1a3d5d38540960"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQyNWRmN2M3Y2RiNTlhMWJjZjU0YmQ0MjEwOWM5ZTllNGI1YjAwYzI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2",
-      "tree": {
-        "sha": "42f16f840e3e9257375cca2aad5409069737b3dd",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/42f16f840e3e9257375cca2aad5409069737b3dd"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 42f16f840e3e9257375cca2aad5409069737b3dd\nparent 8e2fca3c55be22a656125947ef1a3d5d38540960\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842779 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1778016484 +0200\n\nbench: add SipHash13Jumbo_36b benchmark\n\nAdd a focused benchmark for `PresaltedSipHasher13Jumbo` on the same 36-byte shape as `SipHash24_36b`.\nThis lets reviewers compare the existing SipHash-2-4 36-byte benchmark with the new SipHash-1-3 jumboblock specialization.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn6YOQACgkQZp//D/pH\nenZ00w//XdnNkEpyL3cIEROvpc5BkBApLpoo07jvLupubHOA/KIQ6EFdVW9cycP3\nbC5VLCPd9g32KI7NPo2vbPLkv1w88mYkLPvYVw0pmtCzA5PDKGQLxQy01LAqe0ME\nUDG/o4XAjCl+n5HragKHQqZRwQgls3jE9ZnB2wjSq8cUbsGfBwAkvBLMCd+E5qmO\nBOFaOgMluPzzMJhuQ9QceOo+vCwTFSy6aEWqlw01p3D8tam+Ph5+yWUoiGxhpVLH\nS/28GN1p01ySfq7ggivWb2OHqMsCi8Gs+dKnP1+j3Iny02UGANRXFSj8JhItaeg5\nzx23uoxx704yzIXEZnf//r1f4hDRyNMhsFtSw5aVq2d46t6RW0o3d5K6Sgm9ES2I\nH1JUsivzVqH5CbgDPqMLrAl/JpGhfr6P+D16d2vmAQnYuzV0wmvBAc8jfcTwROma\n7MC0PFZJpLnW+Q1IOfMJIS5jNj+LS+RikgGPQT1KkpbiG1I4WlG9NXUNtC5Kyw4x\nJkwXXuiv+sMKq8WXkyUDb/pMVA7mgpcffrAJ8GizCALiDNx402aEETin00C0sPdQ\nqHI4CnxkN1Ykz58fnELg7/ygOZa7M1DGPb09ep7fmYficeJG/rCpfzZC4nPA2stJ\nxDJRlNP6w1ewtbLaZCIzFk072tWnPID+Yiqs6/y9kBdwuCXcX/w=\n=mNt9\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8e2fca3c55be22a656125947ef1a3d5d38540960",
-          "sha": "8e2fca3c55be22a656125947ef1a3d5d38540960",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8e2fca3c55be22a656125947ef1a3d5d38540960"
-        }
-      ],
-      "message": "bench: add SipHash13Jumbo_36b benchmark\n\nAdd a focused benchmark for `PresaltedSipHasher13Jumbo` on the same 36-byte shape as `SipHash24_36b`.\nThis lets reviewers compare the existing SipHash-2-4 36-byte benchmark with the new SipHash-1-3 jumboblock specialization.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-05T21:28:04Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-03T21:12:59Z"
-      },
-      "sha": "425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDdjYTRlNWQ2OTQ4ZmY5NDRkMDllYTFkM2M3ODQxNTIxNmQ1Zjg5NWY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7ca4e5d6948ff944d09ea1d3c78415216d5f895f",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7ca4e5d6948ff944d09ea1d3c78415216d5f895f",
-      "tree": {
-        "sha": "c4fc21f876dd26a171a06b1b857c7e918ded9759",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c4fc21f876dd26a171a06b1b857c7e918ded9759"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree c4fc21f876dd26a171a06b1b857c7e918ded9759\nparent 425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842795 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1778016485 +0200\n\ncrypto: inline jumboblock SipHash\n\nMove `siphash_detail::SipRound` and `PresaltedSipHasher13Jumbo::operator()` into `siphash.h`.\nThis lets the benchmark and `COutPoint` hash-table call sites inline the short specialized hash body through `SaltedOutpointHasher`.\nInlining made this benchmark up to about 16% faster locally, while the existing SipHash implementations did not show improvement from the same treatment.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn6YOUACgkQZp//D/pH\nenYrUBAAvWfWX5H6PGC948KzzlCM6c16sPU4SE4f+LKJvJF1afE0XqWh21Fi/C3p\ndL1yYLlCfRv6yBPrfcXKcHLv8eOFl7LVkJJtn7CMSyvx39m4m24E58rTxrANDEWM\nP8IA3TsKRDUSXaFkUh/Z++W/954AJltxpaIYtMjCZayFTx6bAxtCcpKDEAV/zIWY\nOnUnGIP6cM9Hziwl/2mHsIH6WZR6ATXg2j+KHri0wDDml9Ox8b3H1ojpG2S5R4w0\nL9cEXlK2t4r5PHnDR/wCSzf+ErT/+40fvY653uAIqqvruBwpcBtWa7hHF5UByHqB\nm5Cpj2+8vZFGlHRJ2thO9k23KHnSpQuhM99CLtNZR+NB3GJSF+UbntW5vDkMLnXm\n/KeGyBJXM+O9HrHJO5gQU3D03sXT4E+zLOCN6wh1ql4aqHYIFKRl/fpBMzO7Lk/x\nHMrw4KZTcHqpX2nI1Yj8u6LkDhPjO8q6y8TLKW/hejkf8Xc+2Uv3zG2ndgXMoZWk\ndXi0lVdY7rn+x3JSBLMnDKqF+wEBoDZkPpszpewdf0Z1HWUVGYCg+2R2RcgHl+ko\nc7jk/GHQ2UQbM1cmGvL2WHiOS4jd1mpy+hyoRoT+5Zwe81J4II1STNao7vDIsQN/\ncpq36Dgf6cDgatBkpWn8kLEzLT05bWhGWks0SRCt4MM3r3r4HXc=\n=0rhq\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2",
-          "sha": "425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/425df7c7cdb59a1bcf54bd42109c9e9e4b5b00c2"
-        }
-      ],
-      "message": "crypto: inline jumboblock SipHash\n\nMove `siphash_detail::SipRound` and `PresaltedSipHasher13Jumbo::operator()` into `siphash.h`.\nThis lets the benchmark and `COutPoint` hash-table call sites inline the short specialized hash body through `SaltedOutpointHasher`.\nInlining made this benchmark up to about 16% faster locally, while the existing SipHash implementations did not show improvement from the same treatment.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-05T21:28:05Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-03T21:13:15Z"
-      },
-      "sha": "7ca4e5d6948ff944d09ea1d3c78415216d5f895f"
     },
     {
       "event": "head_ref_force_pushed",
@@ -1087,6 +927,255 @@
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/35215#issuecomment-4574739995",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35215"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGVmMWY4M2E5MWUxMjFkMjcwMDAzODI3ZjA2YzY0MWExOGUyNmE0NDY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ef1f83a91e121d270003827f06c641a18e26a446",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ef1f83a91e121d270003827f06c641a18e26a446",
+      "tree": {
+        "sha": "714b382cd52c559142ffd2578e153ca56ff042f6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/714b382cd52c559142ffd2578e153ca56ff042f6"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 714b382cd52c559142ffd2578e153ca56ff042f6\nparent a30ef6b91f73a6669e5aeedf460e0c9be2745a49\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842714 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1781646383 +0200\n\nbench: add SipHash-2-4 36-byte benchmark\n\nRename the existing 32-byte benchmark to `SipHash24_32b`.\nAdd a 36-byte variant for `uint256` plus a 32-bit outpoint index.\nThis records the current baseline shape before adding outpoint-specific hashers.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmoxxC8ACgkQZp//D/pH\nenZjRBAAkrOPxOe4LzpS+M7qFc4SyXjicy7cAoCEjASrCa9uOMSN3/72T2lcZ/Jx\nWgMbtOuUn73hwGNtJLkYsYbu6psc8Knhnj8IZ+L4pH1Nz72a4Movp6olBJVJXVxh\nxBJzbqybqhncFt0D41UdeGRPjtfP2inrxu/MZhAbtQl1Oq9AePu1cKYGz9Aaw8Ku\nGqd5MxR0Ky1kzwsL2bX7AYsKkyJREHli8juBPhDzBxl1OPPVbuRzDu1CRucWQX/W\nlapUuc8Gf587SfT2sbQAPcS932d8sLymOr/vDehEZM98SLtBX+X0TKNnokZ71GXb\n1lKjBrmfwzfHCPH8Pv5Iqdv+r/GxlnQ/R9t8aT3Kwd4kYRDA+TGl2ppCBU2stkIE\n06EpMq2HVEq6WnJfnl+GEbPl26FeW5fbIbIqIdnxo8jzTrhEjVOwkUiETbylMIJ5\nYa6/oWue10bsH8fDP4n19SFFN0HuKUrp0UvZONlVjRizgK/4S81GfaCcl4ot+Pgt\nWumSSrmPcUh2NcoKSZN0muhj2Y1rLEHEeZ57YcCswhP9cShxEKLysL22tNsBzBaY\nQIX3GryPxbanhLVSmn7OrsT1VF7clT5RiRZ/BMxB1jHp9gSaZN5OFCp13xwcNZ0q\npg0klmUQlWclyXYf1dgq2c4zToSZbhVq1Fq6JGL1f13O4x8u+Xk=\n=iYd2\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a30ef6b91f73a6669e5aeedf460e0c9be2745a49",
+          "sha": "a30ef6b91f73a6669e5aeedf460e0c9be2745a49",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a30ef6b91f73a6669e5aeedf460e0c9be2745a49"
+        }
+      ],
+      "message": "bench: add SipHash-2-4 36-byte benchmark\n\nRename the existing 32-byte benchmark to `SipHash24_32b`.\nAdd a 36-byte variant for `uint256` plus a 32-bit outpoint index.\nThis records the current baseline shape before adding outpoint-specific hashers.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-06-16T21:46:23Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-05-03T21:11:54Z"
+      },
+      "sha": "ef1f83a91e121d270003827f06c641a18e26a446"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDhkOGYwMWQxZjg3ZmU1ZDQ3ZDdhYzc5ODFjODdkZGUyZDExNjUwNDY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8d8f01d1f87fe5d47d7ac7981c87dde2d1165046",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/8d8f01d1f87fe5d47d7ac7981c87dde2d1165046",
+      "tree": {
+        "sha": "4f552beb775abb0b2a18a1cba9c080cbdc362dfe",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4f552beb775abb0b2a18a1cba9c080cbdc362dfe"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 4f552beb775abb0b2a18a1cba9c080cbdc362dfe\nparent ef1f83a91e121d270003827f06c641a18e26a446\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842766 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1781646889 +0200\n\ncrypto: use jumboblock SipHash for local indexes\n\nAdd `PresaltedSipHasher13Jumbo` for hashing a `uint256`, optionally plus a `uint32_t` outpoint index.\nFor the supported fixed 32-byte and 36-byte inputs, the implementation processes the four hash limbs as one jumboblock, omits SipHash's final length/padding word, and runs 3 finalization SipRounds.\nThe 32-byte path is the 4-round `SH13+JB+UP` case from Pieter Wuille's sketch, and the 36-byte path adds one compression round for the extra index.\n\nSwitch the existing `SaltedOutpointHasher` wrapper to the new presalted hasher, so existing `COutPoint` unordered containers keep their public hasher type while using the faster implementation.\nThis is a non-standard local-index specialization, meant for keys that already contain a uniformly distributed hash.\nAdd fixed test vectors for both non-standard input shapes.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmoxxikACgkQZp//D/pH\nenbNVQ/+Lz5Zi9+9SEQ9TsI2QWEglc4iy5WHOsH9unFKA5qJWxdhhVo+osWnHF0Y\n5u8M8ajTnltagWR5PXoNG1zZBtUwDEFSzd8EQ/jzIJvEfNLSWca8dxzpd678xvsZ\nlTITSBkO0kl/oLqR0ma2z+lpN7Y7bDvBzlC230LpBVMK/NG2VM5BFf8aBo8w6tSN\ncJ1L2AtX+a37/xPvwmul3W9TVcHRqLKhcM0LzjszGaMqBmj6+xnvqSH4k4/2Blf/\nNODlWZcq82lvQHmOdaoW4sqYBE4sIPdNOc17un2a9o8FwMcCYpQzItu+qz2XpDOV\n/pKyJEFvrZXu/y4jzBbAry6vkLhoPqx8eVPljRASbXN35S6AzZ6rntPEq/5eVzED\nOh7RcD8sCG3CJrNet93bcilDoYNiFUzv19U6sPni81gcKFc6msrjXG2wQkQSDAW1\nNC1oLWqCCBCjPc1pq6M849J/fOXSHHuXCkQJg1Zjf/Q5XsQZy2ZIqebtEpgFz9Ww\nU29q9lnh9DZCGimbGIFyI8AZ0sjsQ5XkvbWVjZ2P06Ex8wJmGd3/2bI5NCmb779v\noTY+bkUNyLPrS0RRNfrjXVJy3uUhmEZHlCQDZBVJHSmjXvjMqHlerxrVQ9pqW7Re\nSdz/Ry44C2jIdwl/smDTmPUWN9lV979YPHsU4ULr+W84L3guwtA=\n=1oFd\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ef1f83a91e121d270003827f06c641a18e26a446",
+          "sha": "ef1f83a91e121d270003827f06c641a18e26a446",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ef1f83a91e121d270003827f06c641a18e26a446"
+        }
+      ],
+      "message": "crypto: use jumboblock SipHash for local indexes\n\nAdd `PresaltedSipHasher13Jumbo` for hashing a `uint256`, optionally plus a `uint32_t` outpoint index.\nFor the supported fixed 32-byte and 36-byte inputs, the implementation processes the four hash limbs as one jumboblock, omits SipHash's final length/padding word, and runs 3 finalization SipRounds.\nThe 32-byte path is the 4-round `SH13+JB+UP` case from Pieter Wuille's sketch, and the 36-byte path adds one compression round for the extra index.\n\nSwitch the existing `SaltedOutpointHasher` wrapper to the new presalted hasher, so existing `COutPoint` unordered containers keep their public hasher type while using the faster implementation.\nThis is a non-standard local-index specialization, meant for keys that already contain a uniformly distributed hash.\nAdd fixed test vectors for both non-standard input shapes.\n\nCo-authored-by: Pieter Wuille <pieter@wuille.net>\nCo-authored-by: Jean-Philippe Aumasson <jeanphilippe.aumasson@gmail.com>",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-06-16T21:54:49Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-05-03T21:12:46Z"
+      },
+      "sha": "8d8f01d1f87fe5d47d7ac7981c87dde2d1165046"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGRhYTJlY2NkMzkwNmMwMDE1MTUyYmVlZGY4ZTRjNmQ5MDViZmRiNWU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/daa2eccd3906c0015152beedf8e4c6d905bfdb5e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/daa2eccd3906c0015152beedf8e4c6d905bfdb5e",
+      "tree": {
+        "sha": "bee10485fb6b2be36f981c3b665de108034abb25",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/bee10485fb6b2be36f981c3b665de108034abb25"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree bee10485fb6b2be36f981c3b665de108034abb25\nparent 8d8f01d1f87fe5d47d7ac7981c87dde2d1165046\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842779 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1781646894 +0200\n\nbench: add jumboblock SipHash benchmarks\n\nAdd focused `PresaltedSipHasher13Jumbo` benchmarks for the same fixed-width shapes covered by the existing SipHash-2-4 baselines.\n`SipHash13Jumbo_32b` measures the txid-only path that can be used for salted local index prefixes.\n`SipHash13Jumbo_36b` measures the outpoint-shaped `uint256` plus `uint32_t` path used by `SaltedOutpointHasher`.\n\nKeep these benchmarks before the inline commit so reviewers can measure the non-inline jumboblock implementation and then compare it with the inlined version in the next commit.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmoxxi4ACgkQZp//D/pH\nenY9GQ/9HmRcGeEoWoltcDC7sB0fwq5GLkdHdI19LcneUM2CUY7BBDzpgIiZ1J2t\nHEpjtRd793Pv3SptutgT5VoLdq2CIFasoec4Qpv2cMUm5acVeCJ7TiGGz+XXme+W\nuNQf6CVdx+23b+UdAcO/YXYlwfCsGAOk3TFHkQxzCzWU+pI9b4MWSO3lBGb5j5SM\nIslf5Iy/vzA4XA3i4OSEnArTH4onzTo0v7Q43/1+hJ4FBK6ul69PvEoF2mHrBF69\nT10C7zCAxPXqhMAI6REih1GWwuAr4thiEpTekl08EaBd/ibL628o3qNiKW0Jbyvh\nnON3Z9sVpSHC/caJYx3ECYHOM7O5IWbxbz01ldLe6tqOzS3ZprVV22XxMCRQ134u\nUbkDxbEfdP2u3zjrVFd6nIGVowjLzjhUDwYjgKWamM6iFwJLUK2mnnZhknaPQCcK\nYYdZMoWwFt+EmkSDPzADj4JSmMNM/yCnZFMdey0Tnl2XmYDv56QZPcSUt6Siiiyw\nTsdsw/PE2/N40dCOrxeLfOyPmU2rvKrNJEHUe2qWLU/oETPZvxiztSx1xTnj29Ie\nxitrP92dDy+2EC3RD3hD+InYfYrra5AIzVJhjYQf1dq0hKJG12peVQlaFaM394ix\neqBHKPNOeQsKdG3W1lhL+M5L8PxE+h5yd9qldc649CBhEj8i+44=\n=0h4U\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8d8f01d1f87fe5d47d7ac7981c87dde2d1165046",
+          "sha": "8d8f01d1f87fe5d47d7ac7981c87dde2d1165046",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/8d8f01d1f87fe5d47d7ac7981c87dde2d1165046"
+        }
+      ],
+      "message": "bench: add jumboblock SipHash benchmarks\n\nAdd focused `PresaltedSipHasher13Jumbo` benchmarks for the same fixed-width shapes covered by the existing SipHash-2-4 baselines.\n`SipHash13Jumbo_32b` measures the txid-only path that can be used for salted local index prefixes.\n`SipHash13Jumbo_36b` measures the outpoint-shaped `uint256` plus `uint32_t` path used by `SaltedOutpointHasher`.\n\nKeep these benchmarks before the inline commit so reviewers can measure the non-inline jumboblock implementation and then compare it with the inlined version in the next commit.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-06-16T21:54:54Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-05-03T21:12:59Z"
+      },
+      "sha": "daa2eccd3906c0015152beedf8e4c6d905bfdb5e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDRkMDA3NDBlMjkyMWMwOWE3MTdiY2YxOTY0Yjk0NzgwYTY0NzU3YmI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4d00740e2921c09a717bcf1964b94780a64757bb",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4d00740e2921c09a717bcf1964b94780a64757bb",
+      "tree": {
+        "sha": "9f630cab9cdfda27dc96b5d27c971f86db66f8b6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9f630cab9cdfda27dc96b5d27c971f86db66f8b6"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 9f630cab9cdfda27dc96b5d27c971f86db66f8b6\nparent daa2eccd3906c0015152beedf8e4c6d905bfdb5e\nauthor Lőrinc <pap.lorinc@gmail.com> 1777842795 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1781646927 +0200\n\ncrypto: inline jumboblock SipHash\n\nMove `siphash_detail::SipRound` and both `PresaltedSipHasher13Jumbo` overloads into `siphash.h`.\nThis lets the benchmark, the txid-only path, and `COutPoint` hash-table call sites inline the short fixed-width hash body through their presalted hasher wrappers.\n\nKeep this as a separate commit after the benchmark additions so reviewers can measure the non-inline jumboblock implementation and then compare it with the inlined version.\nInlining made the 36-byte benchmark up to about 16% faster locally, while the existing SipHash implementations did not show improvement from the same treatment.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmoxxk8ACgkQZp//D/pH\nenYn0Q//QqPTPD3AgtRqbTBEbvmGRtY6byOOmtW1ipGk7kPchSlo2AbiAAkwKBtF\nv3Bw24GQRn/r/xWf6qjTRmVhdljtdiVFX8st1uAzblxXvYqEK0Lg65XD4wsgjV/I\nrULFihBpqlwR64twryOnGBtcwJoD3yLDENhHrJlagb7B25ngeREMNYSZmaXxa20h\nDWTgBG227+qw0M/4z6LjuelRzfGkIXkj0aerQr5nyL2Nwa9YxuhhSLXhYZHhWzK9\n1phKOBzGAzMcL1auVN7rOPf8lCmqcLpE96r/C3FOOqqnsnnj8SBFHcJN0sGPldvE\nGTsFPir+PwTeHBHHX+CXZyXS6BzE3fbRRhENJBy2uelPZBAMxCifeGMNzgz9nDpN\nn6bmMHolqSx9oIxlrY6KojnD0oPyFm4rdAwM2Erc1/2xunOIu+P8xUd7a1WOWK6q\nAqT3JAY0Bzxfp8hPNPOr9EbBjaUS56PyjM3j0okHgHf4aEvSTWOYzoQLO9dUBoIs\nRwMu3bnOr8aW5vR9FYxyBmC4BjKxAuPKVsQC413lcpSY93hM+Je66O8YUvebmTPc\nb02hOD5SUP9MYsXIXVFLjxkLM1rnEclDvharC42BgP2lqrkSodF7KEgo+YpAFcX6\nV7SIweazS/gb3/kHOj2XEnLl2jxCZobgDGlyPVCWMZMjZtOm+38=\n=qFRd\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/daa2eccd3906c0015152beedf8e4c6d905bfdb5e",
+          "sha": "daa2eccd3906c0015152beedf8e4c6d905bfdb5e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/daa2eccd3906c0015152beedf8e4c6d905bfdb5e"
+        }
+      ],
+      "message": "crypto: inline jumboblock SipHash\n\nMove `siphash_detail::SipRound` and both `PresaltedSipHasher13Jumbo` overloads into `siphash.h`.\nThis lets the benchmark, the txid-only path, and `COutPoint` hash-table call sites inline the short fixed-width hash body through their presalted hasher wrappers.\n\nKeep this as a separate commit after the benchmark additions so reviewers can measure the non-inline jumboblock implementation and then compare it with the inlined version.\nInlining made the 36-byte benchmark up to about 16% faster locally, while the existing SipHash implementations did not show improvement from the same treatment.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-06-16T21:55:27Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-05-03T21:13:15Z"
+      },
+      "sha": "4d00740e2921c09a717bcf1964b94780a64757bb"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 26831552911,
+      "node_id": "HRFPE_lADOABII588AAAABBViU5s8AAAAGP0kBjw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/26831552911",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "4d00740e2921c09a717bcf1964b94780a64757bb",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/4d00740e2921c09a717bcf1964b94780a64757bb",
+      "created_at": "2026-06-16T22:10:39Z"
+    },
+    {
+      "event": "commented",
+      "id": 4724072178,
+      "node_id": "IC_kwDOABII588AAAABGZOe8g",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/4724072178",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-06-16T22:12:13Z",
+      "updated_at": "2026-06-16T22:12:13Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Added a simpler 32 byte `PresaltedSipHasher13Jumbo` hasher for https://github.com/bitcoin/bitcoin/pull/35531 (+ rebase and code simplification + PR description adjustments)",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35215#issuecomment-4724072178",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35215"
     }
   ],
