@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2025-05-06T14:27:59Z",
-    "updated_at": "2026-06-28T23:59:44Z",
+    "updated_at": "2026-06-29T00:01:43Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -485,8 +485,8 @@
     "deletions": 201,
     "changed_files": 30,
     "commits": 8,
-    "review_comments": 157,
-    "comments": 73
+    "review_comments": 156,
+    "comments": 74
   },
   "events": [
     {
@@ -11506,6 +11506,64 @@
       "submitted_at": "2026-06-26T16:34:06Z",
       "state": "COMMENTED",
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/32427"
+    },
+    {
+      "event": "commented",
+      "id": 4827817824,
+      "node_id": "IC_kwDOABII588AAAABH8KnYA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/4827817824",
+      "actor": {
+        "login": "stringintech",
+        "id": 157148846,
+        "node_id": "U_kgDOCV3mrg",
+        "avatar_url": "https://avatars.githubusercontent.com/u/157148846?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/stringintech",
+        "html_url": "https://github.com/stringintech",
+        "followers_url": "https://api.github.com/users/stringintech/followers",
+        "following_url": "https://api.github.com/users/stringintech/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/stringintech/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/stringintech/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/stringintech/subscriptions",
+        "organizations_url": "https://api.github.com/users/stringintech/orgs",
+        "repos_url": "https://api.github.com/users/stringintech/repos",
+        "events_url": "https://api.github.com/users/stringintech/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/stringintech/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-06-29T00:01:43Z",
+      "updated_at": "2026-06-29T00:01:43Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Re https://github.com/bitcoin/bitcoin/pull/32427#discussion_r3475510641: I'm thinking if it would make sense to add a separate directory lock for writers only, one that's taken for the whole lifetime of the store (in WRITE/WIPE mode) and **fails fast on a second writer process instead of busy-waiting** (similar to how bitcoind takes its datadir directory lock), while leaving the existing `StoreLock` solely for the writer-vs-reader clashes it already handles? That would go in the direction of treating a second writer as misuse to be rejected loudly, rather than trying to guarantee correctness for concurrent-writer scenarios.\r\n\r\nI experimented with this and tested it by extending the `tool_bitcoin_chainstate.py` functional test to run a kernel process (the `bitcoin-chainstate` binary) against a running node's datadir:\r\n\r\n<details>\r\n<summary>Diff</summary>\r\n\r\n```diff\r\ndiff --git a/src/kernel/blocktreestorage.cpp b/src/kernel/blocktreestorage.cpp\r\nindex 875c5b2f5e..0cc104c0e9 100644\r\n--- a/src/kernel/blocktreestorage.cpp\r\n+++ b/src/kernel/blocktreestorage.cpp\r\n@@ -37,6 +37,7 @@ using Checksum = uint32_t;\r\n using FilePosition = int64_t;\r\n \r\n static constexpr const char* STORE_LOCK_NAME{\".lock\"};\r\n+static constexpr const char* WRITER_LOCK_NAME{\".writer-lock\"};\r\n \r\n class StoreLock\r\n {\r\n@@ -65,6 +66,24 @@ public:\r\n     StoreLock& operator=(const StoreLock&) = delete;\r\n };\r\n \r\n+WriterLock::WriterLock(const fs::path& dir) : m_dir{dir}\r\n+{\r\n+    switch (util::LockDirectory(m_dir, m_dir / WRITER_LOCK_NAME)) {\r\n+    case util::LockResult::Success:\r\n+        return;\r\n+    case util::LockResult::ErrorWrite:\r\n+        throw BlockTreeStoreError(strprintf(\r\n+            \"Cannot create writer-lock file in %s\", fs::PathToString(m_dir)));\r\n+    case util::LockResult::ErrorLock:\r\n+        LogError(\"Another writer process is already using the block tree store in %s.\\n\",\r\n+                 fs::PathToString(m_dir));\r\n+        throw BlockTreeStoreError(strprintf(\r\n+            \"Another writer process is already using the block tree store in %s\", fs::PathToString(m_dir)));\r\n+    }\r\n+}\r\n+\r\n+WriterLock::~WriterLock() { UnlockDirectory(m_dir, m_dir / WRITER_LOCK_NAME); }\r\n+\r\n /** A wrapper for creating a constant-sized serialization without varint encoding */\r\n struct BlockFileInfoWrapper : CBlockFileInfo {\r\n     static constexpr size_t SERIALIZED_SIZE{36};\r\n@@ -186,6 +205,9 @@ BlockTreeStore::BlockTreeStore(const fs::path& path, const OpenMode open_mode)\r\n     assert(GetSerializeSize(BlockFileInfoWrapper{}) == BlockFileInfoWrapper::SERIALIZED_SIZE);\r\n     LOCK(m_mutex);\r\n     fs::create_directories(path);\r\n+    if (m_mode != OpenMode::READ) {\r\n+        m_writer_lock.emplace(path);\r\n+    }\r\n     if (m_mode == OpenMode::WIPE) {\r\n         fs::remove(m_header_file_path);\r\n         fs::remove(m_block_files_file_path);\r\ndiff --git a/src/kernel/blocktreestorage.h b/src/kernel/blocktreestorage.h\r\nindex b4a657d501..37e8ffe5c2 100644\r\n--- a/src/kernel/blocktreestorage.h\r\n+++ b/src/kernel/blocktreestorage.h\r\n@@ -12,6 +12,7 @@\r\n \r\n #include <cstdint>\r\n #include <functional>\r\n+#include <optional>\r\n #include <stdexcept>\r\n #include <string>\r\n #include <utility>\r\n@@ -29,6 +30,18 @@ class SignalInterrupt;\r\n \r\n namespace kernel {\r\n \r\n+class WriterLock\r\n+{\r\n+    fs::path m_dir;\r\n+\r\n+public:\r\n+    explicit WriterLock(const fs::path& dir);\r\n+    ~WriterLock();\r\n+\r\n+    WriterLock(const WriterLock&) = delete;\r\n+    WriterLock& operator=(const WriterLock&) = delete;\r\n+};\r\n+\r\n // Checksums are calculated from the serialized value and its position in the\r\n // file. This protects against out of order data and allows the same checksum\r\n // from the log file record to be used for the actual data files.\r\n@@ -146,6 +159,8 @@ private:\r\n     mutable Mutex m_mutex;\r\n     OpenMode m_mode;\r\n \r\n+    std::optional<WriterLock> m_writer_lock;\r\n+\r\n     void WriteFlag(const fs::path& path, bool value, bool directory_commit) const;\r\n \r\n     /**\r\ndiff --git a/test/functional/tool_bitcoin_chainstate.py b/test/functional/tool_bitcoin_chainstate.py\r\nindex 6b7128898d..75aae4f9a1 100755\r\n--- a/test/functional/tool_bitcoin_chainstate.py\r\n+++ b/test/functional/tool_bitcoin_chainstate.py\r\n@@ -13,6 +13,8 @@ snapshot and extend the snapshot chain with new blocks.\r\n \r\n import subprocess\r\n \r\n+from pathlib import Path\r\n+\r\n from test_framework.test_framework import BitcoinTestFramework\r\n from test_framework.util import assert_equal\r\n from test_framework.wallet import MiniWallet\r\n@@ -37,6 +39,31 @@ class BitcoinChainstateTest(BitcoinTestFramework):\r\n         self.add_nodes(2)\r\n         self.start_nodes()\r\n \r\n+    def writer_lock_test(self):\r\n+        assert self.nodes[0].is_node_stopped() is False\r\n+\r\n+        def run_chainstate(datadir):\r\n+            return subprocess.run(\r\n+                self.get_binaries().chainstate_argv() + [\"-regtest\", datadir],\r\n+                stdin=subprocess.DEVNULL,\r\n+                capture_output=True,\r\n+                text=True,\r\n+            )\r\n+\r\n+        self.log.info(\"Test kernel process refuses a datadir owned by a running node\")\r\n+        proc = run_chainstate(self.nodes[0].chain_path)\r\n+        assert proc.returncode != 0\r\n+        # The block tree store is opened before the (leveldb) coins db, so the\r\n+        # store's own writer lock is what rejects the process here, surfacing\r\n+        # this message.\r\n+        assert \"Another writer process is already using the block tree store\" in proc.stdout\r\n+\r\n+        self.log.info(\"Test kernel process on an unrelated datadir is unaffected\")\r\n+        other_datadir = Path(self.options.tmpdir) / \"chainstate_other\"\r\n+        proc = run_chainstate(other_datadir)\r\n+        assert proc.returncode == 0\r\n+        assert \"Another writer process is already using the block tree store\" not in proc.stdout\r\n+\r\n     def generate_snapshot_chain(self):\r\n         self.log.info(f\"Generate deterministic chain up to block {SNAPSHOT_BASE_BLOCK_HEIGHT} for node0 while node1 disconnected\")\r\n         n0 = self.nodes[0]\r\n@@ -98,6 +125,7 @@ class BitcoinChainstateTest(BitcoinTestFramework):\r\n         self.add_block(datadir, n0.getblock(new_tip_hash, 0), expected_stdout=\"Block tip changed\")\r\n \r\n     def run_test(self):\r\n+        self.writer_lock_test()\r\n         dump_output = self.generate_snapshot_chain()\r\n         self.basic_test()\r\n         self.assumeutxo_test(dump_output['path'])\r\n\r\n\r\n```\r\n</details>",
+      "user": {
+        "login": "stringintech",
+        "id": 157148846,
+        "node_id": "U_kgDOCV3mrg",
+        "avatar_url": "https://avatars.githubusercontent.com/u/157148846?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/stringintech",
+        "html_url": "https://github.com/stringintech",
+        "followers_url": "https://api.github.com/users/stringintech/followers",
+        "following_url": "https://api.github.com/users/stringintech/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/stringintech/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/stringintech/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/stringintech/subscriptions",
+        "organizations_url": "https://api.github.com/users/stringintech/orgs",
+        "repos_url": "https://api.github.com/users/stringintech/repos",
+        "events_url": "https://api.github.com/users/stringintech/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/stringintech/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/32427#issuecomment-4827817824",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/32427"
     }
   ],
   "comments": [
@@ -19813,60 +19871,6 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3482773937"
-        },
-        "pull_request": {
-          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/32427"
-        }
-      },
-      "start_line": null,
-      "original_start_line": null,
-      "start_side": null,
-      "line": 1,
-      "original_line": 1,
-      "side": "RIGHT"
-    },
-    {
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3488709953",
-      "pull_request_review_id": 4588252653,
-      "id": 3488709953,
-      "node_id": "PRRC_kwDOABII587P8X1B",
-      "diff_hunk": "",
-      "path": "src/kernel/blocktreestorage.cpp",
-      "position": 1,
-      "original_position": 1,
-      "commit_id": "c9488cb87aaf2779cfc5df6d573bd94551da7827",
-      "original_commit_id": "c9488cb87aaf2779cfc5df6d573bd94551da7827",
-      "in_reply_to_id": 3475510641,
-      "user": {
-        "login": "stringintech",
-        "id": 157148846,
-        "node_id": "U_kgDOCV3mrg",
-        "avatar_url": "https://avatars.githubusercontent.com/u/157148846?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/stringintech",
-        "html_url": "https://github.com/stringintech",
-        "followers_url": "https://api.github.com/users/stringintech/followers",
-        "following_url": "https://api.github.com/users/stringintech/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/stringintech/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/stringintech/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/stringintech/subscriptions",
-        "organizations_url": "https://api.github.com/users/stringintech/orgs",
-        "repos_url": "https://api.github.com/users/stringintech/repos",
-        "events_url": "https://api.github.com/users/stringintech/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/stringintech/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "body": "Re https://github.com/bitcoin/bitcoin/pull/32427#discussion_r3475510641: I'm thinking if it would make sense to add a separate directory lock for writers only, one that's taken for the whole lifetime of the store (in WRITE/WIPE mode) and **fails fast on a second writer process instead of busy-waiting** (similar to how bitcoind takes its datadir directory lock), while leaving the existing `StoreLock` solely for the writer-vs-reader clashes it already handles? That would go in the direction of treating a second writer as misuse to be rejected loudly, rather than trying to guarantee correctness for concurrent-writer scenarios.\r\n\r\nI experimented with this and tested it by extending the `tool_bitcoin_chainstate.py` functional test to run a kernel process (the `bitcoin-chainstate` binary) against a running node's datadir:\r\n\r\n<details>\r\n<summary>Diff</summary>\r\n\r\n```diff\r\ndiff --git a/src/kernel/blocktreestorage.cpp b/src/kernel/blocktreestorage.cpp\r\nindex 875c5b2f5e..0cc104c0e9 100644\r\n--- a/src/kernel/blocktreestorage.cpp\r\n+++ b/src/kernel/blocktreestorage.cpp\r\n@@ -37,6 +37,7 @@ using Checksum = uint32_t;\r\n using FilePosition = int64_t;\r\n \r\n static constexpr const char* STORE_LOCK_NAME{\".lock\"};\r\n+static constexpr const char* WRITER_LOCK_NAME{\".writer-lock\"};\r\n \r\n class StoreLock\r\n {\r\n@@ -65,6 +66,24 @@ public:\r\n     StoreLock& operator=(const StoreLock&) = delete;\r\n };\r\n \r\n+WriterLock::WriterLock(const fs::path& dir) : m_dir{dir}\r\n+{\r\n+    switch (util::LockDirectory(m_dir, m_dir / WRITER_LOCK_NAME)) {\r\n+    case util::LockResult::Success:\r\n+        return;\r\n+    case util::LockResult::ErrorWrite:\r\n+        throw BlockTreeStoreError(strprintf(\r\n+            \"Cannot create writer-lock file in %s\", fs::PathToString(m_dir)));\r\n+    case util::LockResult::ErrorLock:\r\n+        LogError(\"Another writer process is already using the block tree store in %s.\\n\",\r\n+                 fs::PathToString(m_dir));\r\n+        throw BlockTreeStoreError(strprintf(\r\n+            \"Another writer process is already using the block tree store in %s\", fs::PathToString(m_dir)));\r\n+    }\r\n+}\r\n+\r\n+WriterLock::~WriterLock() { UnlockDirectory(m_dir, m_dir / WRITER_LOCK_NAME); }\r\n+\r\n /** A wrapper for creating a constant-sized serialization without varint encoding */\r\n struct BlockFileInfoWrapper : CBlockFileInfo {\r\n     static constexpr size_t SERIALIZED_SIZE{36};\r\n@@ -186,6 +205,9 @@ BlockTreeStore::BlockTreeStore(const fs::path& path, const OpenMode open_mode)\r\n     assert(GetSerializeSize(BlockFileInfoWrapper{}) == BlockFileInfoWrapper::SERIALIZED_SIZE);\r\n     LOCK(m_mutex);\r\n     fs::create_directories(path);\r\n+    if (m_mode != OpenMode::READ) {\r\n+        m_writer_lock.emplace(path);\r\n+    }\r\n     if (m_mode == OpenMode::WIPE) {\r\n         fs::remove(m_header_file_path);\r\n         fs::remove(m_block_files_file_path);\r\ndiff --git a/src/kernel/blocktreestorage.h b/src/kernel/blocktreestorage.h\r\nindex b4a657d501..37e8ffe5c2 100644\r\n--- a/src/kernel/blocktreestorage.h\r\n+++ b/src/kernel/blocktreestorage.h\r\n@@ -12,6 +12,7 @@\r\n \r\n #include <cstdint>\r\n #include <functional>\r\n+#include <optional>\r\n #include <stdexcept>\r\n #include <string>\r\n #include <utility>\r\n@@ -29,6 +30,18 @@ class SignalInterrupt;\r\n \r\n namespace kernel {\r\n \r\n+class WriterLock\r\n+{\r\n+    fs::path m_dir;\r\n+\r\n+public:\r\n+    explicit WriterLock(const fs::path& dir);\r\n+    ~WriterLock();\r\n+\r\n+    WriterLock(const WriterLock&) = delete;\r\n+    WriterLock& operator=(const WriterLock&) = delete;\r\n+};\r\n+\r\n // Checksums are calculated from the serialized value and its position in the\r\n // file. This protects against out of order data and allows the same checksum\r\n // from the log file record to be used for the actual data files.\r\n@@ -146,6 +159,8 @@ private:\r\n     mutable Mutex m_mutex;\r\n     OpenMode m_mode;\r\n \r\n+    std::optional<WriterLock> m_writer_lock;\r\n+\r\n     void WriteFlag(const fs::path& path, bool value, bool directory_commit) const;\r\n \r\n     /**\r\ndiff --git a/test/functional/tool_bitcoin_chainstate.py b/test/functional/tool_bitcoin_chainstate.py\r\nindex 6b7128898d..75aae4f9a1 100755\r\n--- a/test/functional/tool_bitcoin_chainstate.py\r\n+++ b/test/functional/tool_bitcoin_chainstate.py\r\n@@ -13,6 +13,8 @@ snapshot and extend the snapshot chain with new blocks.\r\n \r\n import subprocess\r\n \r\n+from pathlib import Path\r\n+\r\n from test_framework.test_framework import BitcoinTestFramework\r\n from test_framework.util import assert_equal\r\n from test_framework.wallet import MiniWallet\r\n@@ -37,6 +39,31 @@ class BitcoinChainstateTest(BitcoinTestFramework):\r\n         self.add_nodes(2)\r\n         self.start_nodes()\r\n \r\n+    def writer_lock_test(self):\r\n+        assert self.nodes[0].is_node_stopped() is False\r\n+\r\n+        def run_chainstate(datadir):\r\n+            return subprocess.run(\r\n+                self.get_binaries().chainstate_argv() + [\"-regtest\", datadir],\r\n+                stdin=subprocess.DEVNULL,\r\n+                capture_output=True,\r\n+                text=True,\r\n+            )\r\n+\r\n+        self.log.info(\"Test kernel process refuses a datadir owned by a running node\")\r\n+        proc = run_chainstate(self.nodes[0].chain_path)\r\n+        assert proc.returncode != 0\r\n+        # The block tree store is opened before the (leveldb) coins db, so the\r\n+        # store's own writer lock is what rejects the process here, surfacing\r\n+        # this message.\r\n+        assert \"Another writer process is already using the block tree store\" in proc.stdout\r\n+\r\n+        self.log.info(\"Test kernel process on an unrelated datadir is unaffected\")\r\n+        other_datadir = Path(self.options.tmpdir) / \"chainstate_other\"\r\n+        proc = run_chainstate(other_datadir)\r\n+        assert proc.returncode == 0\r\n+        assert \"Another writer process is already using the block tree store\" not in proc.stdout\r\n+\r\n     def generate_snapshot_chain(self):\r\n         self.log.info(f\"Generate deterministic chain up to block {SNAPSHOT_BASE_BLOCK_HEIGHT} for node0 while node1 disconnected\")\r\n         n0 = self.nodes[0]\r\n@@ -98,6 +125,7 @@ class BitcoinChainstateTest(BitcoinTestFramework):\r\n         self.add_block(datadir, n0.getblock(new_tip_hash, 0), expected_stdout=\"Block tip changed\")\r\n \r\n     def run_test(self):\r\n+        self.writer_lock_test()\r\n         dump_output = self.generate_snapshot_chain()\r\n         self.basic_test()\r\n         self.assumeutxo_test(dump_output['path'])\r\n\r\n\r\n```\r\n</details>",
-      "created_at": "2026-06-28T23:31:03Z",
-      "updated_at": "2026-06-28T23:59:44Z",
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/32427#discussion_r3488709953",
-      "author_association": "CONTRIBUTOR",
-      "_links": {
-        "self": {
-          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3488709953"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/32427"
