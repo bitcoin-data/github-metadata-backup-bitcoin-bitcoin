@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2026-04-04T15:29:58Z",
-    "updated_at": "2026-06-30T20:28:03Z",
+    "updated_at": "2026-06-30T21:00:42Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -319,7 +319,7 @@
         "forks_count": 3,
         "stargazers_count": 6,
         "watchers_count": 6,
-        "size": 461798,
+        "size": 461870,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -453,7 +453,7 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39027,
+        "forks_count": 39026,
         "stargazers_count": 89585,
         "watchers_count": 89585,
         "size": 318395,
@@ -507,7 +507,7 @@
     "deletions": 7,
     "changed_files": 10,
     "commits": 5,
-    "review_comments": 116,
+    "review_comments": 118,
     "comments": 29
   },
   "events": [
@@ -12241,6 +12241,60 @@
       "start_side": null,
       "line": null,
       "original_line": 337,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3501817705",
+      "pull_request_review_id": 4604071815,
+      "id": 3501817705,
+      "node_id": "PRRC_kwDOABII587QuX9p",
+      "diff_hunk": "@@ -0,0 +1,160 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that inaccessible block files are properly handled through P2P paths.\"\"\"\n+\n+import contextlib\n+import os\n+import platform\n+import re\n+import stat\n+\n+from test_framework.blocktools import (\n+    create_block,\n+    create_empty_fork,\n+)\n+from test_framework.messages import (\n+    BlockTransactionsRequest,\n+    CInv,\n+    MSG_BLOCK,\n+    MSG_WITNESS_FLAG,\n+    msg_block,\n+    msg_getblocktxn,\n+    msg_getdata,\n+)\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_raises_rpc_error,\n+)\n+\n+\n+@contextlib.contextmanager\n+def simulate_io_error(blocks_path):\n+    # Make block files inaccessible by renaming the blocks directory\n+    blocks_bak = blocks_path.parent / \"blocks_bak\"\n+    parent_dir = blocks_path.parent\n+    old_mode = stat.S_IMODE(os.stat(parent_dir).st_mode)\n+\n+    os.rename(blocks_path, blocks_bak)\n+    os.chmod(parent_dir, 0o500)  # Prevent re-creation of blocks/\n+\n+    try:\n+        yield\n+    finally:\n+        os.chmod(parent_dir, old_mode)\n+        os.rename(blocks_bak, blocks_path)\n+\n+class P2PBlockIOErrorTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+        self.extra_args = [['-fastprune']]\n+\n+    def test_block_accept_on_broken_fs(self):\n+        self.log.info(\"Test block accept on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block = create_block(tmpl=node.getblocktemplate({\"rules\": [\"segwit\"]}))\n+        block.solve()\n+\n+        with simulate_io_error(node.blocks_path):\n+            with node.assert_debug_log(expected_msgs=[\"AcceptBlock FAILED (System error while saving block to disk\"]):\n+                peer.send_without_ping(msg_block(block))\n+                peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test\n+        self.start_node(0)\n+\n+    def test_block_connect_on_broken_fs(self):\n+        self.log.info(\"Test block connect on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        blocks = create_empty_fork(node, fork_length=2)\n+        large_block_hash = self.generatetodescriptor(node, 1, f\"raw({'55'*100_000})\")[0]\n+        peer.send_and_ping(msg_block(blocks[0]))\n+        # Remove access to the fork block only.\n+        (node.blocks_path / 'blk00002.dat').unlink()\n+        assert_raises_rpc_error(-1, 'Block not found on disk', node.getblock, blocks[0].hash_hex)\n+        node.getblock(large_block_hash) # can still access the tip\n+\n+        with node.assert_debug_log(expected_msgs=[\"ActivateBestChain failed (Failed to read block.)\"]):\n+            peer.send_without_ping(msg_block(blocks[1]))\n+            peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test\n+        self.start_node(0, extra_args=['-reindex'])\n+\n+    def test_getdata_on_broken_fs(self):\n+        \"\"\"The node should not swallow GETDATA requests during I/O issues\"\"\"\n+        self.log.info(\"Test GETDATA on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        self.generate(node, 6)\n+\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block_hash = node.getblockhash(3)  # Not in recent cache\n+        with simulate_io_error(node.blocks_path):\n+            # Bug: we currently swallow the GETDATA request, never reply to the other party, and log issue under debug-NET\n+            with node.assert_debug_log(expected_msgs=[\"[ProcessMessages] [net] ProcessMessages(getdata, 37 bytes): Exception 'filesystem error\"],\n+                                       timeout=30):\n+                peer.send_without_ping(msg_getdata([CInv(MSG_BLOCK | MSG_WITNESS_FLAG, int(block_hash, 16))]))\n+\n+            # And the node keeps running\n+            node.getblockcount()\n+\n+    def test_getblocktxn_fatal_on_block_io_error(self):\n+        \"\"\"GETBLOCKTXN block read failures should trigger a fatal error.",
+      "path": "test/functional/p2p_handle_io_errors.py",
+      "position": 1,
+      "original_position": 117,
+      "commit_id": "7d4d4b85304c6789eeeb6264b76c467b8cd140ea",
+      "original_commit_id": "356b0307d856d4647befd3a54b065cac2418a06b",
+      "in_reply_to_id": 3387232884,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Added coverage for `GETCFILTERS`, and txindex + spendtxoindex.",
+      "created_at": "2026-06-30T21:00:42Z",
+      "updated_at": "2026-06-30T21:00:42Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3501817705",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3501817705"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 117,
       "side": "RIGHT"
     }
   ]
