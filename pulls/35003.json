@@ -52,7 +52,7 @@
       }
     ],
     "created_at": "2026-04-04T15:29:58Z",
-    "updated_at": "2026-06-30T14:00:09Z",
+    "updated_at": "2026-06-30T15:46:25Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -507,7 +507,7 @@
     "deletions": 7,
     "changed_files": 10,
     "commits": 5,
-    "review_comments": 112,
+    "review_comments": 114,
     "comments": 28
   },
   "events": [
@@ -11669,6 +11669,222 @@
       "side": "RIGHT"
     },
     {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494414980",
+      "pull_request_review_id": 4595031612,
+      "id": 3494414980,
+      "node_id": "PRRC_kwDOABII587QSIqE",
+      "diff_hunk": "@@ -0,0 +1,162 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that inaccessible block files are properly handled through P2P paths.\"\"\"\n+\n+import contextlib\n+import os\n+import platform\n+import re\n+import stat\n+\n+from test_framework.blocktools import (\n+    create_block,\n+    create_empty_fork,\n+)\n+from test_framework.messages import (\n+    BlockTransactionsRequest,\n+    CInv,\n+    MSG_BLOCK,\n+    MSG_WITNESS_FLAG,\n+    msg_block,\n+    msg_getblocktxn,\n+    msg_getdata,\n+)\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_equal,\n+    assert_raises_rpc_error,\n+)\n+\n+\n+@contextlib.contextmanager\n+def simulate_io_error(blocks_path):\n+    # Make block files inaccessible by renaming the blocks directory\n+    blocks_bak = blocks_path.parent / \"blocks_bak\"\n+    parent_dir = blocks_path.parent\n+    old_mode = stat.S_IMODE(os.stat(parent_dir).st_mode)\n+\n+    os.rename(blocks_path, blocks_bak)\n+    try:\n+        os.chmod(parent_dir, 0o500)  # Prevent re-creation of blocks/\n+        yield\n+    finally:\n+        os.chmod(parent_dir, old_mode)\n+        os.rename(blocks_bak, blocks_path)\n+\n+class P2PBlockIOErrorTest(BitcoinTestFramework):\n+    def set_test_params(self):\n+        self.num_nodes = 1\n+        self.setup_clean_chain = True\n+        self.extra_args = [['-fastprune']]\n+\n+    def test_block_accept_on_broken_fs(self):\n+        self.log.info(\"Test block accept on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block = create_block(tmpl=node.getblocktemplate({\"rules\": [\"segwit\"]}))\n+        block.solve()\n+\n+        with simulate_io_error(node.blocks_path):\n+            with node.assert_debug_log(expected_msgs=[\"AcceptBlock FAILED (System error while saving block to disk\"]):\n+                peer.send_without_ping(msg_block(block))\n+                peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test\n+        self.start_node(0)\n+\n+    def test_block_connect_on_broken_fs(self):\n+        self.log.info(\"Test block connect on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        peer = node.add_p2p_connection(P2PInterface())\n+        blocks = create_empty_fork(node, fork_length=2)\n+        large_block_hash = self.generatetodescriptor(node, 1, f\"raw({'55'*70_000})\")[0]\n+        peer.send_and_ping(msg_block(blocks[0]))\n+        # Remove access to the fork block only.\n+        (node.blocks_path / 'blk00002.dat').unlink()\n+        assert_raises_rpc_error(-1, 'Block not found on disk', node.getblock, blocks[0].hash_hex)\n+        assert_equal(node.getblock(large_block_hash)[\"hash\"], large_block_hash) # can still access the tip\n+\n+        with node.assert_debug_log(expected_msgs=[\"ActivateBestChain failed (Failed to read block.)\"]):\n+            peer.send_without_ping(msg_block(blocks[1]))\n+            peer.wait_for_disconnect()\n+\n+        node.wait_until_stopped(\n+            expect_error=True,\n+            expected_stderr=re.compile(r\"fatal internal error\"),\n+        )\n+\n+        # Restart node for next test. Only the fork block file was deleted,\n+        # so reindexing the remaining block files must restore the old tip.\n+        self.start_node(0, extra_args=['-reindex'])\n+        self.wait_until(lambda: node.getbestblockhash() == large_block_hash)\n+\n+    def test_getdata_on_broken_fs(self):\n+        \"\"\"GETDATA handler must discard the failed request and disconnect during block I/O issues\"\"\"\n+        self.log.info(\"Test GETDATA on inaccessible filesystem\")\n+        node = self.nodes[0]\n+        self.generate(node, 6)\n+\n+        peer = node.add_p2p_connection(P2PInterface())\n+        block_hash = node.getblockhash(3)  # Not in recent cache\n+        with simulate_io_error(node.blocks_path):\n+            # Bug: we currently swallow the GETDATA request, never reply to the other party, and log issue under debug-NET\n+            with node.assert_debug_log(expected_msgs=[\"[ProcessMessages] [net] ProcessMessages(getdata, 37 bytes): Exception 'filesystem error\"],\n+                                       timeout=30):\n+                peer.send_without_ping(msg_getdata([CInv(MSG_BLOCK | MSG_WITNESS_FLAG, int(block_hash, 16))]))\n+\n+            # And the node keeps running\n+            node.getblockcount()\n+\n+    def test_getblocktxn_fatal_on_block_io_error(self):\n+        \"\"\"GETBLOCKTXN block read failures must trigger a fatal shutdown, not an assertion or silent catch.\n+\n+        Unlike GETDATA, this path operates on recent blocks that must be\n+        available for normal operation (reorgs). A failure here is\n+        unrecoverable and must not be swallowed by the P2P message handling\n+        general try-catch.\n+        \"\"\"\n+        self.log.info(\"Test GETBLOCKTXN triggers fatal error on inaccessible filesystem\")\n+        node = self.nodes[0]\n+\n+        # Generate block so that current tip is evicted from the cache.\n+        self.generate(node, 1)\n+        block_hash = node.getblockhash(node.getblockcount() - 1)\n+\n+        peer = node.add_p2p_connection(P2PInterface())\n+        with simulate_io_error(node.blocks_path):\n+            gbtn = msg_getblocktxn()\n+            gbtn.block_txn_request = BlockTransactionsRequest(blockhash=int(block_hash, 16), indexes=[0])\n+\n+            # Bug: we currently swallow the GETBLOCKTXN request, never reply to the other party, and log issue under debug-NET\n+            with node.assert_debug_log(expected_msgs=[\"[ProcessMessages] [net] ProcessMessages(getblocktxn, 34 bytes): Exception 'filesystem error\"],\n+                                       timeout=10):\n+                peer.send_without_ping(gbtn)\n+\n+            # And the node keeps running\n+            node.getblockcount()\n+\n+    def run_test(self):\n+        # On Windows, open files (like the DB) are locked and prevent renaming\n+        # their parent directory, so we can't trigger the expected filesystem error.\n+        # Also, when running as root, permission changes don't restrict access, so the\n+        # test condition can't be enforced either.\n+        if platform.system() == 'Windows' or os.geteuid() == 0:\n+            self.log.warning(\"Skipping test: unable to enforce dir permissions\")\n+            return",
+      "path": "test/functional/p2p_handle_io_errors.py",
+      "position": 153,
+      "original_position": 153,
+      "commit_id": "69bb470ab0ccc6967987ed3f64bbf516cf4035f6",
+      "original_commit_id": "69bb470ab0ccc6967987ed3f64bbf516cf4035f6",
+      "in_reply_to_id": 3470759826,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Done as suggested",
+      "created_at": "2026-06-29T20:07:04Z",
+      "updated_at": "2026-06-30T15:40:21Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3494414980",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494414980"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": 152,
+      "original_start_line": 152,
+      "start_side": "RIGHT",
+      "line": 153,
+      "original_line": 153,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494606430",
+      "pull_request_review_id": 4595031612,
+      "id": 3494606430,
+      "node_id": "PRRC_kwDOABII587QS3Ze",
+      "diff_hunk": "@@ -173,4 +174,107 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)\n     BOOST_CHECK_EQUAL(curr_tip, get_notify_tip());\n }\n \n+static void check_activate_best_chain_fatal_error(const std::string& expected_log, node::NodeContext& node, Chainstate& chainstate)\n+{\n+    ASSERT_DEBUG_LOG(expected_log);\n+    BlockValidationState state;\n+    BOOST_CHECK(!chainstate.ActivateBestChain(state));\n+    BOOST_CHECK_EQUAL(node.exit_status.load(), EXIT_FAILURE); // Ensure fatal error\n+    node.exit_status = EXIT_SUCCESS;\n+}\n+\n+// Verify ActivateBestChain triggers a fatal error when a block read fails\n+// during block connection (ConnectTip path).\n+BOOST_FIXTURE_TEST_CASE(activate_best_chain_connect_io_failure, TestChain100Setup)\n+{\n+    auto& chainman = m_node.chainman;\n+    auto& chainstate = chainman->ActiveChainstate();\n+    const auto blocks_dir = m_args.GetBlocksDirPath();\n+\n+    // Disconnect block without changing validity so ActivateBestChain\n+    // has a block to reconnect.\n+    {\n+        LOCK2(chainman->GetMutex(), chainstate.MempoolMutex());\n+        BlockValidationState state;\n+        BOOST_CHECK(chainstate.DisconnectTip(state, /*disconnectpool=*/nullptr));\n+    }\n+\n+    // Inaccessible block file must trigger a fatal error.\n+    const auto blk_file = blocks_dir / \"blk00000.dat\";\n+    SimulateFileSystemError(m_path_root, blk_file, [&]() {\n+        check_activate_best_chain_fatal_error(\"Failed to read block\", m_node, chainstate);\n+    });\n+\n+    // Inaccessible blocks directory must also trigger a fatal error.",
+      "path": "src/test/validation_chainstate_tests.cpp",
+      "position": 43,
+      "original_position": 43,
+      "commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "original_commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "in_reply_to_id": 3470940952,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Done as suggested",
+      "created_at": "2026-06-29T20:46:14Z",
+      "updated_at": "2026-06-30T15:40:21Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3494606430",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494606430"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 208,
+      "original_line": 208,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494623886",
+      "pull_request_review_id": 4595031612,
+      "id": 3494623886,
+      "node_id": "PRRC_kwDOABII587QS7qO",
+      "diff_hunk": "@@ -173,4 +174,107 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)\n     BOOST_CHECK_EQUAL(curr_tip, get_notify_tip());\n }\n \n+static void check_activate_best_chain_fatal_error(const std::string& expected_log, node::NodeContext& node, Chainstate& chainstate)\n+{\n+    ASSERT_DEBUG_LOG(expected_log);\n+    BlockValidationState state;\n+    BOOST_CHECK(!chainstate.ActivateBestChain(state));\n+    BOOST_CHECK_EQUAL(node.exit_status.load(), EXIT_FAILURE); // Ensure fatal error\n+    node.exit_status = EXIT_SUCCESS;",
+      "path": "src/test/validation_chainstate_tests.cpp",
+      "position": 18,
+      "original_position": 18,
+      "commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "original_commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "in_reply_to_id": 3470976171,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Done as suggested",
+      "created_at": "2026-06-29T20:49:41Z",
+      "updated_at": "2026-06-30T15:40:21Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3494623886",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494623886"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 183,
+      "original_line": 183,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494637713",
+      "pull_request_review_id": 4595031612,
+      "id": 3494637713,
+      "node_id": "PRRC_kwDOABII587QS_CR",
+      "diff_hunk": "@@ -173,4 +174,107 @@ BOOST_FIXTURE_TEST_CASE(chainstate_update_tip, TestChain100Setup)\n     BOOST_CHECK_EQUAL(curr_tip, get_notify_tip());\n }\n \n+static void check_activate_best_chain_fatal_error(const std::string& expected_log, node::NodeContext& node, Chainstate& chainstate)\n+{\n+    ASSERT_DEBUG_LOG(expected_log);\n+    BlockValidationState state;\n+    BOOST_CHECK(!chainstate.ActivateBestChain(state));\n+    BOOST_CHECK_EQUAL(node.exit_status.load(), EXIT_FAILURE); // Ensure fatal error\n+    node.exit_status = EXIT_SUCCESS;\n+}\n+\n+// Verify ActivateBestChain triggers a fatal error when a block read fails\n+// during block connection (ConnectTip path).\n+BOOST_FIXTURE_TEST_CASE(activate_best_chain_connect_io_failure, TestChain100Setup)\n+{\n+    auto& chainman = m_node.chainman;\n+    auto& chainstate = chainman->ActiveChainstate();\n+    const auto blocks_dir = m_args.GetBlocksDirPath();\n+\n+    // Disconnect block without changing validity so ActivateBestChain\n+    // has a block to reconnect.\n+    {\n+        LOCK2(chainman->GetMutex(), chainstate.MempoolMutex());\n+        BlockValidationState state;\n+        BOOST_CHECK(chainstate.DisconnectTip(state, /*disconnectpool=*/nullptr));\n+    }\n+\n+    // Inaccessible block file must trigger a fatal error.\n+    const auto blk_file = blocks_dir / \"blk00000.dat\";\n+    SimulateFileSystemError(m_path_root, blk_file, [&]() {\n+        check_activate_best_chain_fatal_error(\"Failed to read block\", m_node, chainstate);\n+    });\n+\n+    // Inaccessible blocks directory must also trigger a fatal error.\n+    const auto parent_dir = blocks_dir.parent_path();\n+    SimulateFileSystemError(m_path_root, parent_dir, [&]() {\n+        check_activate_best_chain_fatal_error(\"Failed to read block\", m_node, chainstate);\n+    });\n+\n+    // Sanity check: the block reconnects once the filesystem is restored.\n+    BlockValidationState state;\n+    BOOST_CHECK(chainstate.ActivateBestChain(state));\n+}\n+\n+// Verify ActivateBestChain triggers a fatal error when a block read fails\n+// during a reorg (DisconnectTip path).\n+BOOST_FIXTURE_TEST_CASE(activate_best_chain_disconnect_io_failure, TestChain100Setup)\n+{\n+    auto& chainman = m_node.chainman;\n+    auto& chainstate = chainman->ActiveChainstate();\n+    const auto blocks_dir = m_args.GetBlocksDirPath();\n+\n+    // Set up a scenario where ActivateBestChain must reorg:\n+    //\n+    //   Original chain: ... -> 100 -> 101 -> 102 -> 103   (more work)\n+    //   Fork:           ... -> 100 -> F101 -> F102        (currently active)\n+    //\n+    // The fork is active but has less work than the original chain, so\n+    // ActivateBestChain will disconnect the fork blocks via DisconnectTip\n+    // before reconnecting the original chain.\n+\n+    // Extend the chain by 3 blocks (heights 101–103).\n+    for (int i = 0; i < 3; i++) CreateAndProcessBlock({}, CScript() << OP_TRUE);\n+\n+    // Invalidate at height 101 to create room for a shorter fork.\n+    CBlockIndex* b101_index = WITH_LOCK(chainman->GetMutex(), return chainman->ActiveChain()[101]);\n+    BlockValidationState state;\n+    chainstate.InvalidateBlock(state, b101_index);\n+\n+    // Build a 2-block fork from height 100. The original chain is invalid,\n+    // so these become the active tip.\n+    for (int i = 0; i < 2; i++) CreateAndProcessBlock({}, CScript() << OP_TRUE << OP_TRUE);",
+      "path": "src/test/validation_chainstate_tests.cpp",
+      "position": 81,
+      "original_position": 81,
+      "commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "original_commit_id": "063fd2ce524ffb5626bf4431eda48b056cea93f2",
+      "in_reply_to_id": 3471042565,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "> We're doing OP_TRUE << OP_TRUE instead of previous OP_TRUE coinbases because the fork blocks need to be different from the original blocks created just above?\r\n\r\nYes. A quick way of getting a different hash. There wouldn't be a fork if blocks are the same.",
+      "created_at": "2026-06-29T20:52:31Z",
+      "updated_at": "2026-06-30T15:40:21Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3494637713",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3494637713"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 246,
+      "original_line": 246,
+      "side": "RIGHT"
+    },
+    {
       "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3498373026",
       "pull_request_review_id": 4599912165,
       "id": 3498373026,
@@ -11720,6 +11936,114 @@
       "start_side": null,
       "line": 49,
       "original_line": 49,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500006765",
+      "pull_request_review_id": 4595031612,
+      "id": 3500006765,
+      "node_id": "PRRC_kwDOABII587Qnd1t",
+      "diff_hunk": "@@ -37,8 +37,16 @@ FILE* FlatFileSeq::Open(const FlatFilePos& pos, bool read_only) const\n     if (pos.IsNull()) {\n         return nullptr;\n     }\n-    fs::path path = FileName(pos);\n-    fs::create_directories(path.parent_path());\n+    const fs::path path = FileName(pos);\n+    // Create parent path only if we are going to write.\n+    if (!read_only) {\n+        std::error_code ec;\n+        fs::create_directories(path.parent_path(), ec);\n+        if (ec) {\n+            LogError(\"Unable to open file '%s'. Error creating parent directories: %s\", fs::PathToString(path), ec.message());\n+            return nullptr;\n+        }\n+    }",
+      "path": "src/flatfile.cpp",
+      "position": 15,
+      "original_position": 15,
+      "commit_id": "d4f95399b5af4643b90bb396c4d172e908ae87c2",
+      "original_commit_id": "b9bc7297ef892a64d52432bf4e5eaef15cdecddc",
+      "in_reply_to_id": 3387729140,
+      "user": {
+        "login": "furszy",
+        "id": 5377650,
+        "node_id": "MDQ6VXNlcjUzNzc2NTA=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5377650?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/furszy",
+        "html_url": "https://github.com/furszy",
+        "followers_url": "https://api.github.com/users/furszy/followers",
+        "following_url": "https://api.github.com/users/furszy/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/furszy/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/furszy/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/furszy/subscriptions",
+        "organizations_url": "https://api.github.com/users/furszy/orgs",
+        "repos_url": "https://api.github.com/users/furszy/repos",
+        "events_url": "https://api.github.com/users/furszy/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/furszy/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Yeah. We agree on the future, just not on the first step. I understand your point, I'm just not in favor of leaving inconsistencies around since they are usually source of bugs. This error is not treated different by any caller, so I fail to see the point of having two error signaling paths.",
+      "created_at": "2026-06-30T15:39:33Z",
+      "updated_at": "2026-06-30T15:40:21Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3500006765",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500006765"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 49,
+      "original_line": 49,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500051076",
+      "pull_request_review_id": 4601898570,
+      "id": 3500051076,
+      "node_id": "PRRC_kwDOABII587QnoqE",
+      "diff_hunk": "@@ -0,0 +1,160 @@\n+#!/usr/bin/env python3\n+# Copyright (c) 2026-present The Bitcoin Core developers\n+# Distributed under the MIT software license, see the accompanying\n+# file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\"\"\"Test that inaccessible block files are properly handled through P2P paths.\"\"\"\n+\n+import contextlib\n+import os\n+import platform\n+import re\n+import stat\n+\n+from test_framework.blocktools import (\n+    create_block,\n+    create_empty_fork,\n+)\n+from test_framework.messages import (\n+    BlockTransactionsRequest,\n+    CInv,\n+    MSG_BLOCK,\n+    MSG_WITNESS_FLAG,\n+    msg_block,\n+    msg_getblocktxn,\n+    msg_getdata,\n+)\n+from test_framework.p2p import P2PInterface\n+from test_framework.test_framework import BitcoinTestFramework\n+from test_framework.util import (\n+    assert_raises_rpc_error,\n+)\n+\n+\n+@contextlib.contextmanager\n+def simulate_io_error(blocks_path):\n+    # Make block files inaccessible by renaming the blocks directory\n+    blocks_bak = blocks_path.parent / \"blocks_bak\"\n+    parent_dir = blocks_path.parent\n+    old_mode = stat.S_IMODE(os.stat(parent_dir).st_mode)\n+\n+    os.rename(blocks_path, blocks_bak)\n+    os.chmod(parent_dir, 0o500)  # Prevent re-creation of blocks/",
+      "path": "test/functional/p2p_handle_io_errors.py",
+      "position": 1,
+      "original_position": 41,
+      "commit_id": "7d4d4b85304c6789eeeb6264b76c467b8cd140ea",
+      "original_commit_id": "356b0307d856d4647befd3a54b065cac2418a06b",
+      "in_reply_to_id": 3394953429,
+      "user": {
+        "login": "maflcko",
+        "id": 6399679,
+        "node_id": "MDQ6VXNlcjYzOTk2Nzk=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6399679?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/maflcko",
+        "html_url": "https://github.com/maflcko",
+        "followers_url": "https://api.github.com/users/maflcko/followers",
+        "following_url": "https://api.github.com/users/maflcko/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/maflcko/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/maflcko/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/maflcko/subscriptions",
+        "organizations_url": "https://api.github.com/users/maflcko/orgs",
+        "repos_url": "https://api.github.com/users/maflcko/repos",
+        "events_url": "https://api.github.com/users/maflcko/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/maflcko/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "> > When the chmod fails, the test should also fail\r\n> \r\n> The suggestion was about renaming before we check for permissions.\r\n\r\nYes, I understand. I don't see the risk in renaming before changing permissions. Either changing the permissions will work fine, in which case nothing was gained. Or, changing the permissions will fail, in which case the test should fail anyway, and also nothing was gained by silently renaming back. In fact, it seems harmful, because it will silently be skipping the test.\r\n\r\nA test failure should lead to a loud failure, not a silent skip.",
+      "created_at": "2026-06-30T15:46:25Z",
+      "updated_at": "2026-06-30T15:46:25Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35003#discussion_r3500051076",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500051076"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35003"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 41,
       "side": "RIGHT"
     }
   ]
