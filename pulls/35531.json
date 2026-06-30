@@ -43,7 +43,7 @@
     "body": "The current txindex uses the full 32-byte txid as keys, which takes up about 66 GB of disk space today on mainnet. Using a 5-byte key prefix instead drops the disk usage to 29 GB - cutting the size to less than half.\r\n\r\nUsing the full 32-bytes is unnecessary since a 5-byte salted siphash will produce collisions in about 1 in 1.1 trillion. Some collisions will occur, but the penalty is just an extra disk read, deserialization and hash.\r\nThe tx position can be appended to the key instead of used as a value, and a LevelDB iterator can seek to the prefix and then scan for the correct tx. This is an almost identical approach to `txospenderindex`.\r\n\r\nAlso instead of storing the file position of the block, we can store only the block height and direct file position of the transaction. This can be packed into a single integer by multiplying the height by the max serialized block size and then adding the position. The height can be recovered by dividing by the max block size and the position can be recovered by modulo the max block size. This is a more compact representation, and the block file can be recovered by the CBlockIndex that is already in memory.\r\n\r\nHowever, this requires us to erase tx entries that are no longer part of the best chain. This is a breaking change, since today users can still look up txs in blocks that have been reorged out of the best chain.\r\n\r\nIf a tx is not found with this method, we fallback to looking up the legacy entry. With this method a user with an existing db can opt to erase the `indexes/txindex` folder and reindex, or keep the current index and new entries will be appended with the smaller footprint.\r\n\r\nThe time to index was faster on my machine with this method, 1h27m vs current 1h50m.\r\nLookups are roughly the same, around 0.2ms per lookup with `getrawtransaction`.\r\nWhen testing on mainnet, I got ~860k 2-way collisions, and 1 3-way collision that worst case could cause an extra 2 false positives when reading.\r\n",
     "labels": [],
     "created_at": "2026-06-14T22:33:23Z",
-    "updated_at": "2026-06-30T13:34:36Z",
+    "updated_at": "2026-06-30T18:11:11Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -289,10 +289,10 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39027,
-        "stargazers_count": 89583,
-        "watchers_count": 89583,
-        "size": 318385,
+        "forks_count": 39026,
+        "stargazers_count": 89584,
+        "watchers_count": 89584,
+        "size": 318395,
         "default_branch": "master",
         "open_issues_count": 669,
         "is_template": false,
@@ -311,9 +311,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-06-30T11:40:37Z",
+        "pushed_at": "2026-06-30T16:00:30Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-06-30T13:40:37Z",
+        "updated_at": "2026-06-30T18:29:29Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -343,7 +343,7 @@
     "deletions": 19,
     "changed_files": 6,
     "commits": 4,
-    "review_comments": 50,
+    "review_comments": 52,
     "comments": 37
   },
   "events": [
@@ -7085,6 +7085,114 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3499121703"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35531"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 72,
+      "original_line": 72,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500906069",
+      "pull_request_review_id": 4602942735,
+      "id": 3500906069,
+      "node_id": "PRRC_kwDOABII587Qq5ZV",
+      "diff_hunk": "@@ -71,27 +116,65 @@ TxIndex::TxIndex(std::unique_ptr<interfaces::Chain> chain, size_t n_cache_size,\n \n TxIndex::~TxIndex() = default;\n \n+interfaces::Chain::NotifyOptions TxIndex::CustomOptions()\n+{\n+    interfaces::Chain::NotifyOptions options;\n+    options.disconnect_data = true;\n+    return options;\n+}\n+\n bool TxIndex::CustomAppend(const interfaces::BlockInfo& block)\n {\n     // Exclude genesis block transaction because outputs are not spendable.\n     if (block.height == 0) return true;\n \n     assert(block.data);\n-    CDiskTxPos pos({block.file_number, block.data_pos}, GetSizeOfCompactSize(block.data->vtx.size()));\n-    std::vector<std::pair<Txid, CDiskTxPos>> vPos;\n-    vPos.reserve(block.data->vtx.size());\n-    for (const auto& tx : block.data->vtx) {\n-        vPos.emplace_back(tx->GetHash(), pos);\n-        pos.nTxOffset += ::GetSerializeSize(TX_WITH_WITNESS(*tx));\n-    }\n-    m_db->WriteTxs(vPos);\n+    m_db->WriteTxs(block);\n+    return true;\n+}\n+\n+bool TxIndex::CustomRemove(const interfaces::BlockInfo& block)\n+{\n+    m_db->WriteTxs(block, /*erase=*/true);\n     return true;\n }\n \n BaseIndex::DB& TxIndex::GetDB() const { return *m_db; }\n \n bool TxIndex::FindTx(const Txid& tx_hash, uint256& block_hash, CTransactionRef& tx) const\n {\n+    const txindex::TxHashKeyPrefix prefix{txindex::CreateKeyPrefix(m_db->m_hasher, tx_hash)};\n+    std::unique_ptr<CDBIterator> it{m_db->NewIterator()};\n+    it->Seek(std::pair{txindex::DB_TXINDEX_HASHED, prefix});\n+    txindex::DBKey key{prefix, {}};\n+    const auto header_offset{static_cast<uint32_t>(GetSerializeSize(CBlockHeader{}))};\n+    for (; it->Valid() && it->GetKey(key) && key.hash_prefix == prefix; it->Next()) {\n+        FlatFilePos tx_pos;\n+        CBlockIndex* block_index;\n+        {\n+            LOCK(cs_main);\n+            block_index = m_chainstate->m_chain[key.pos.block_height];\n+            if (!block_index) continue;\n+            tx_pos = FlatFilePos{block_index->nFile, block_index->nDataPos + header_offset + key.pos.tx_offset};",
+      "path": "src/index/txindex.cpp",
+      "position": 162,
+      "original_position": 162,
+      "commit_id": "8c5562e87667879ca88636b9e499e3fb79ed7175",
+      "original_commit_id": "8c5562e87667879ca88636b9e499e3fb79ed7175",
+      "in_reply_to_id": 3495345429,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Isn't that the case for `tx_pos` as well, any reason for constructing that inside but not the `candidate_block_hash`? Even if that's not the case, seems simpler to only expose what's strictly needed after the scope terminated.",
+      "created_at": "2026-06-30T18:06:49Z",
+      "updated_at": "2026-06-30T18:11:11Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35531#discussion_r3500906069",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500906069"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35531"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 158,
+      "original_line": 158,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500920057",
+      "pull_request_review_id": 4602942735,
+      "id": 3500920057,
+      "node_id": "PRRC_kwDOABII587Qq8z5",
+      "diff_hunk": "@@ -39,28 +46,66 @@ class TxIndex::DB : public BaseIndex::DB\n public:\n     explicit DB(size_t n_cache_size, bool f_memory = false, bool f_wipe = false);\n \n-    /// Read the disk location of the transaction data with the given hash. Returns false if the\n+    /// Read the legacy disk location of the transaction data with the given hash. Returns false if the\n     /// transaction hash is not indexed.\n     bool ReadTxPos(const Txid& txid, CDiskTxPos& pos) const;\n \n-    /// Write a batch of transaction positions to the DB.\n-    void WriteTxs(const std::vector<std::pair<Txid, CDiskTxPos>>& v_pos);\n+    /// Write or erase a block of transaction positions to the DB.\n+    void WriteTxs(const interfaces::BlockInfo& block, bool erase = false);\n+\n+    /// Used to hash the txid to compute the prefix.\n+    const PresaltedSipHasher m_hasher;\n+\n+    CBlockLocator ReadBestBlock() const override;\n+    void WriteBestBlock(CDBBatch& batch, const CBlockLocator& locator) override;\n };\n \n TxIndex::DB::DB(size_t n_cache_size, bool f_memory, bool f_wipe) :\n-    BaseIndex::DB(gArgs.GetDataDirNet() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe)\n+    BaseIndex::DB(gArgs.GetDataDirNet() / \"indexes\" / \"txindex\", n_cache_size, f_memory, f_wipe),\n+    m_hasher{[](CDBWrapper& db) {\n+        std::pair<uint64_t, uint64_t> siphash_key;\n+        if (!db.Read(\"siphash_key\", siphash_key)) {\n+            FastRandomContext rng{};\n+            siphash_key = {rng.rand64(), rng.rand64()};\n+            db.Write(\"siphash_key\", siphash_key, /*fSync=*/true);\n+        }\n+        return PresaltedSipHasher{siphash_key.first, siphash_key.second};",
+      "path": "src/index/txindex.cpp",
+      "position": 68,
+      "original_position": 68,
+      "commit_id": "8c5562e87667879ca88636b9e499e3fb79ed7175",
+      "original_commit_id": "8c5562e87667879ca88636b9e499e3fb79ed7175",
+      "in_reply_to_id": 3495386460,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "It simplifies usage and encapsulates the serialization. We can investigate if it's worth doing in a preceding PR instead. I can also accept if you don't think it's a good idea, but I'd like to explore it.",
+      "created_at": "2026-06-30T18:09:14Z",
+      "updated_at": "2026-06-30T18:11:11Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35531#discussion_r3500920057",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3500920057"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35531"
