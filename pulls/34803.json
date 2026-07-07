@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34803/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34803/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/f98889d10af3f8eb1e09d85138d5101e713c8b4b",
     "number": 34803,
     "state": "open",
     "locked": false,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "#### Motivation\r\n\r\nNow that we have the full linearization of mempool clusters, whenever a cluster in the mempool gets updated  either due to replacement, eviction for various reasons, or block connection — we now have the previous linearization of the affected cluster and the new linearization of the new clusters available.\r\n\r\nThis brings two advantages — the ability for outside observers to make decisions based on fee rate diagram updates without direct access to the mempool, and reduced lock contention.\r\n\r\nIt can used primarily for:\r\n1. Making `CBlockPolicyEstimator` package aware\r\n2. Preventing redundant block template builds in the proposed block template manager [BlockTemplateManager Proposal](https://github.com/bitcoin/bitcoin/issues/33389).\r\n\r\nDuring the development of cluster mempool those usage was discussed.\r\nNote: This is not the motivation behind cluster mempool just a part of it. \r\n\r\nSee discussion in [Package aware fee estimator](https://delvingbitcoin.org/t/package-aware-fee-estimator-post-cluster-mempool/312/2?u=ismaelsadeeq) and [Determining BlockTemplate Fee Increase Using Fee Rate Diagram](https://delvingbitcoin.org/t/determining-blocktemplate-fee-increase-using-fee-rate-diagram/2052/3).\r\n\r\n\r\nCurrently the fee estimator is asynchronous but not package-aware.\r\nAfter this PR it is possible to make it package-aware — a follow-up branch on top of this does exactly that see [commit](https://github.com/ismaelsadeeq/bitcoin/commit/fd88b167529aca80a4f65ed6aa77ec9372a41bce).\r\n\r\nFor the mining interface, the node every 1 seconds rebuilds a block template regardless of whether any significant mempool change occurred to the top block.\r\n\r\nEven after cluster mempool, building a block template is not free since we have to pause the node (holding cs_main). \r\n\r\nWith this notification, a proposed block template manager that observes the mempool update will only rebuild after an inflow in the mempool top block template warrants it.  Redundant builds where no significant fee rate change occurred are eliminated.\r\n\r\nAnd doing this becomes even more useful because of proposed improvements like mempool-based fee rate estimation, which also builds a block template. Right now, it uses a constant 7-second interval and rebuilds regardless of whether an inflow affects the top block template or not. This will fix that.\r\n\r\nA proposed [sendtemplate](https://github.com/bitcoin/bitcoin/pull/33191) in the p2p layer also builds a block template. I propose that it also use the proposed block template manager, which should be built on top of this, so that redundant block template builds are eliminated.\r\n\r\nThere is a different approach to determining updates in the top block template, but that still requires some direct interaction with the mempool. Since the fee estimator needs this notification anyway and we already have it, the block template manager can use it too and not interact with the mempool at all — it becomes a purely passive observer.\r\n\r\n\r\n#### Changes\r\n\r\n\r\n- `TxGraph::Chunk` a new struct that has with transaction `TxGraph::Ref`'s, and fee rate `FeeFrac` so the before/after diagram carries enough information to compute chunk hashes.\r\n- `MemPoolChunk` (`kernel/mempool_entry.h`) — new struct representing a mempool chunk: a `FeeFrac` fee rate and a `uint256` chunk hash identifying the set of witness transactions in the chunk, along with the vector of witnesses.\r\n\r\n- `MemPoolChunksUpdate` (`txmempool.h`) — new struct carrying:\r\n  - `old_chunks` — chunks before the update.\r\n  - `new_chunks` — chunks after the update\r\n  - `reason` — `MemPoolRemovalReason` identifying the update type\r\n  - `block_height` — set only when `reason == BLOCK`, carries the connecting block's height; defaults to `std::nullopt`\r\n- `MemPoolUpdate` — new `ValidationInterface` callback receiving a `MemPoolChunksUpdate`.\r\n\r\n- `GetHashFromWitnesses` (`src/util/witnesses_hash.{h,cpp}`) — sorts a vector of `Wtxid`s lexicographically and hashes them deterministically to produce a stable chunk hash. `GetPackageHash` in `src/policy/packages.cpp` is refactored to use this.\r\n\r\n- Caches the fee rate diagram computed in `GetAndSaveMainStagingDiagram` / `GetFeeRateDiagramChunks` so it is immediately available when the notification is emitted without recomputing.\r\n- Extract the dependency addition subroutine in `UpdateTransactionsFromBlock` to a new method private method `addDependenciesFromBlock`\r\n\r\n`MempoolUpdated` is fired after every mempool mutation. Specifically:\r\n\r\n- Transaction addition and RBF replacement: fired inside `CTxMemPool::ChangeSet::Apply` with reason `REPLACED`.\r\n- Block connection: fired inside `removeForBlock` with reason `BLOCK`. Confirmed transactions are fully removed before conflicts are evicted. The connecting block's height is carried in `block_height`.\r\n- Reorg: fired inside `removeForReorg` with reason `REORG`.\r\n- Recursive removal: fired inside `removeRecursive` with a caller-supplied reason e.g. `CONFLICT`, `EXPIRY`, `REORG`.\r\n- Expiry: fired inside `Expire` with reason `EXPIRY`.\r\n- Size limit eviction: fired inside `TrimToSize` with reason `SIZELIMIT`.\r\n- Post-reorg dependency update: fired inside `UpdateTransactionsFromBlock` with reason `SIZELIMIT`.\r\n\r\nIn all cases the before/after chunks are obtained from `changeSet->GetFeeRateDiagramChunks()` after committing the staging graph.\r\n\r\n- Note on `UpdateTransactionsFromBlock`, a naive single-pass approach calling `Trim()` directly on the main graph fails because oversized clusters cannot be linearized, so `GetMainStagingDiagram` cannot produce a valid before/after diff. The fix is a two-stage process:\r\n- Phase 1 (optimistic): Create a txgraph staging , call `addDependenciesFromBlock` to register all new parent-child relationship, then call `Trim()`.\r\n- If `Trim()` returns nothing — no cluster exceeded the limit — commit staging, compute the diagram, emit `MempoolUpdated(SIZELIMIT)`, done.\r\n\r\n- If `Trim()` returns evicted transactions, the optimistic path failed. Abort the staging we roll back to main, open a fresh staging, call `RemoveTransaction` for each evicted tx to remove them from staging, call `addDependenciesFromBlock` again (evicted txs are silently skipped since they are no longer in the graph), commit, compute the before/after diagram, emit `MempoolUpdated(SIZELIMIT)`, then call `RemoveStaged` to fully remove evicted transactions from the mempool.\r\n\r\n- Reorgs are rare, and reorgs that burst the cluster size limit are also rarer still, so in the optimistic common case, we apply dependencies only once.\r\n\r\n- Added a new `mempool_update_tests`: unit test suite covering all `MempoolUpdated` emission paths:\r\n- We compute the chunk hash lazily in the scheduler thread because the mempool update is a hot path. see thread https://github.com/bitcoin/bitcoin/pull/34803#discussion_r3141804475\r\n",
+    "body": "#### Motivation\r\n\r\nNow that we have the full linearization of mempool clusters, whenever a cluster in the mempool gets updated  either due to replacement, eviction for various reasons, or block connection, we now have the previous linearization of the affected cluster and the new linearization of the new clusters available.\r\n\r\nThis brings two advantages the ability for outside observers to make decisions based on fee rate diagram updates without direct access to the mempool, and reduced lock contention.\r\n\r\nIt can used primarily for:\r\n1. Making `CBlockPolicyEstimator` package aware\r\n2. Preventing redundant block template builds in the proposed block template manager [BlockTemplateManager Proposal](https://github.com/bitcoin/bitcoin/issues/33389).\r\n\r\nDuring the development of cluster mempool those usage was discussed.\r\nNote: This is not the motivation behind cluster mempool just a part of it. \r\n\r\nSee discussion in [Package aware fee estimator](https://delvingbitcoin.org/t/package-aware-fee-estimator-post-cluster-mempool/312/2?u=ismaelsadeeq) and [Determining BlockTemplate Fee Increase Using Fee Rate Diagram](https://delvingbitcoin.org/t/determining-blocktemplate-fee-increase-using-fee-rate-diagram/2052/3).\r\n\r\n\r\nCurrently the fee estimator is asynchronous but not package-aware.\r\nAfter this PR it is possible to make it package-aware, a follow-up branch on top of this does exactly that see [commit](https://github.com/ismaelsadeeq/bitcoin/commit/fd88b167529aca80a4f65ed6aa77ec9372a41bce).\r\n\r\nFor the mining interface, the node every 1 seconds rebuilds a block template regardless of whether any significant mempool change occurred to the top block.\r\n\r\nEven after cluster mempool, building a block template is not free since we have to pause the node (holding `cs_main`). \r\n\r\nWith this notification, a proposed block template manager that observes the mempool update will only rebuild after an inflow in the mempool top block template warrants it.  Redundant builds where no significant fee rate change occurred are eliminated.\r\n\r\nAnd doing this becomes even more useful because of proposed improvements like mempool-based fee rate estimation, which also builds a block template. Right now, it uses a constant 7-second interval and rebuilds regardless of whether an inflow affects the top block template or not. This will fix that.\r\n\r\nA proposed [sendtemplate](https://github.com/bitcoin/bitcoin/pull/33191) in the p2p layer also builds a block template. I propose that it also use the proposed block template manager, which should be built on top of this, so that redundant block template builds are eliminated.\r\n\r\nThere is a different approach to determining updates in the top block template, but that still requires some direct interaction with the mempool. Since the fee estimator needs this notification anyway and we already have it, the block template manager can use it too and not interact with the mempool at all, it becomes a purely passive observer.\r\n\r\n\r\n#### Changes\r\n\r\n\r\n  - Added `TxGraph::Chunk`, a new struct carrying a chunk fee rate plus the transaction `TxGraph::Ref`s in that chunk. This lets before/after fee-rate\r\n  diagrams carry enough information to build mempool chunk notifications.\r\n\r\n  - Added `MemPoolChunk` (`kernel/mempool_entry.h`), representing a mempool chunk with:\r\n    - `m_fee_rate` — chunk fee rate.\r\n    - `m_transactions` — transactions in the chunk.\r\n    - `m_sigops_cost` — total sigops cost for the chunk.\r\n    - `m_chunk_hash` — deterministic hash identifying the chunk transaction set, computed before dispatching the validation callback.\r\n\r\n  - Added `MemPoolChunksUpdate` (`kernel/mempool_entry.h`), carrying:\r\n    - `old_chunks` — chunks before the update.\r\n    - `new_chunks` — chunks after the update.\r\n    - `reason` — `MemPoolRemovalReason` identifying the update type.\r\n    - `block_height` — set only for block-connected removals; defaults to `std::nullopt`.\r\n\r\n  - Added a new `CValidationInterface::MempoolUpdated` callback receiving a `MemPoolChunksUpdate`.\r\n\r\n  - Added `GetHashFromWitnesses` (`src/util/hasher.{h,cpp}`), which sorts a vector of `Wtxid`s deterministically and hashes them to produce a stable chunk\r\n  hash. `GetPackageHash` in `src/policy/packages.cpp` now uses this helper.\r\n\r\n  - Changed `TxGraph::GetMainStagingDiagrams()` to return chunk objects instead of fee-rate-only diagrams.\r\n\r\n  - Cached the fee-rate diagram chunks inside `CTxMemPool::ChangeSet`, so the same snapshot can be reused for RBF feerate checks and later notification\r\n  emission without recomputing a different diagram.\r\n\r\n  - Extracted the dependency addition logic in `UpdateTransactionsFromBlock` into the private helper `addDependenciesFromBlock`.\r\n\r\n  `MempoolUpdated` is emitted for mempool update paths including:\r\n\r\n  - Transaction addition and RBF replacement: emitted in `CTxMemPool::ChangeSet::Apply` with reason `REPLACED`.\r\n  - Block connection: emitted in `removeForBlock` with reason `BLOCK`; `block_height` carries the connecting block height.\r\n  - Reorg removals: emitted in `removeForReorg` with reason `REORG`.\r\n  - Recursive removals: emitted in `removeRecursive` with the caller-supplied reason, such as `CONFLICT`, `EXPIRY`, or `REORG`.\r\n  - Expiry: emitted in `Expire` with reason `EXPIRY`.\r\n  - Size-limit eviction: emitted in `TrimToSize` with reason `SIZELIMIT`.\r\n  - Post-reorg dependency update: emitted in `UpdateTransactionsFromBlock` with reason `SIZELIMIT`.\r\n\r\n  The before/after chunks are snapshotted from the txgraph staging state before committing the staging graph. The mempool entries are removed afterward\r\n  through `RemoveStaged`.\r\n\r\n  Note on `UpdateTransactionsFromBlock`:\r\n\r\n  A naive single-pass approach that adds dependencies and trims directly can leave the staging graph oversized, and oversized clusters cannot produce a valid\r\n  fee-rate diagram. The implementation therefore uses a two-stage approach:\r\n\r\n  - Phase 1: create txgraph staging, call `addDependenciesFromBlock` to register newly discovered parent-child relationships, then call `Trim()`.\r\n\r\n  - If `Trim()` returns no transactions, no cluster exceeded the limit. The code snapshots the diagram, commits staging, emits `MempoolUpdated(SIZELIMIT)`,\r\n  and finishes.\r\n\r\n  - If `Trim()` returns transactions to evict, the oversized staging graph is discarded. A fresh staging graph is opened, the evicted txs are removed from\r\n  txgraph staging, dependencies are added again, the diagram is snapshotted, staging is committed, `MempoolUpdated(SIZELIMIT)` is emitted, and then\r\n  `RemoveStaged` fully removes the evicted entries from the mempool.\r\n\r\n  Reorgs are rare, and reorgs that exceed the cluster size limit are rarer still, so the common optimistic path only applies dependencies once.\r\n\r\n  Added `mempool_update_tests`, a unit test suite covering the `MempoolUpdated` emission paths and validating chunk contents, fee rates, block height\r\n  propagation, and deterministic chunk hashes.\r\n\r\n  Chunk hashes are computed in `ValidationSignals::MempoolUpdated` before the event is queued, so subscribers receive chunks with populated hashes while the\r\n  mempool mutation path avoids carrying hash computation logic directly.\r\n",
     "labels": [
       {
         "id": 164208572,
@@ -82,17 +82,17 @@
         "name": null,
         "patch_url": null
       },
-      "open_issues": 17,
-      "closed_issues": 46,
+      "open_issues": 21,
+      "closed_issues": 52,
       "created_at": "2026-02-20T12:46:51Z",
-      "updated_at": "2026-06-23T18:08:52Z"
+      "updated_at": "2026-07-07T12:35:06Z"
     },
     "created_at": "2026-03-11T13:39:00Z",
-    "updated_at": "2026-06-25T09:24:23Z",
+    "updated_at": "2026-07-07T14:51:29Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "375a4870681dde6d4b7c8e14b2de791b179aff02",
+    "merge_commit_sha": "561c3daeb939a32d1fcd4ee1ae00a9adf1399208",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -100,7 +100,7 @@
     "head": {
       "label": "ismaelsadeeq:03-2026-notify-mempool-update",
       "ref": "03-2026-notify-mempool-update",
-      "sha": "1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50",
+      "sha": "f98889d10af3f8eb1e09d85138d5101e713c8b4b",
       "user": {
         "login": "ismaelsadeeq",
         "id": 48946461,
@@ -200,7 +200,7 @@
         "forks_count": 1,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 311465,
+        "size": 311972,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -213,7 +213,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-06-24T09:59:27Z",
+        "pushed_at": "2026-07-07T14:45:41Z",
         "created_at": "2022-12-13T11:54:34Z",
         "updated_at": "2023-03-10T09:46:26Z",
         "allow_forking": true,
@@ -237,7 +237,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "aa1d0d7cd7355ab5154d44d831513f7fbc5028a2",
+      "sha": "a64df338e69b1736496e149c604e7ca928039b06",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -334,12 +334,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39022,
-        "stargazers_count": 89537,
-        "watchers_count": 89537,
-        "size": 318170,
+        "forks_count": 39036,
+        "stargazers_count": 89611,
+        "watchers_count": 89611,
+        "size": 318842,
         "default_branch": "master",
-        "open_issues_count": 668,
+        "open_issues_count": 681,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -356,9 +356,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-06-25T08:30:54Z",
+        "pushed_at": "2026-07-07T14:11:32Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-06-25T08:31:14Z",
+        "updated_at": "2026-07-07T14:15:01Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -384,11 +384,11 @@
     },
     "author_association": "MEMBER",
     "draft": false,
-    "additions": 842,
-    "deletions": 91,
-    "changed_files": 14,
+    "additions": 872,
+    "deletions": 94,
+    "changed_files": 15,
     "commits": 7,
-    "review_comments": 10,
+    "review_comments": 11,
     "comments": 6
   },
   "events": [
@@ -457,9 +457,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2026-03-11T13:40:09Z",
-      "updated_at": "2026-06-25T09:24:23Z",
+      "updated_at": "2026-07-07T14:46:07Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/34803.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [sedited](https://github.com/bitcoin/bitcoin/pull/34803#issuecomment-4060020254) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35581](https://github.com/bitcoin/bitcoin/pull/35581) (node: add block template manager and track waitNext fee inflow by ismaelsadeeq)\n* [#34075](https://github.com/bitcoin/bitcoin/pull/34075) (fees: Introduce Mempool Based Fee Estimation to reduce overestimation by ismaelsadeeq)\n* [#33922](https://github.com/bitcoin/bitcoin/pull/33922) (mining: add getMemoryLoad() and track template non-mempool memory footprint by Sjors)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible typos and grammar issues:\n\n- `Returns MemPoolChunkUpdate struct.` -> `Returns MemPoolChunksUpdate struct.` [The struct name is wrong here; the added type is `MemPoolChunksUpdate`, so this doc comment is misleading.]\n\n\n\n<sup>2026-05-06 10:46:54</sup>\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/34803.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [sedited](https://github.com/bitcoin/bitcoin/pull/34803#issuecomment-4060020254) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35581](https://github.com/bitcoin/bitcoin/pull/35581) (node: add block template manager and track waitNext fee inflow by ismaelsadeeq)\n* [#34075](https://github.com/bitcoin/bitcoin/pull/34075) (fees: Introduce Mempool Based Fee Estimation to reduce overestimation by ismaelsadeeq)\n* [#33922](https://github.com/bitcoin/bitcoin/pull/33922) (mining: add getMemoryLoad() and track template non-mempool memory footprint by Sjors)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -1365,286 +1365,6 @@
       "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34803"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDgzMjA2Mzc3OWY4NGMzNTcyN2Q2ZGZhOGY5ZTJkOWQ0YzYxZWIxZjI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/832063779f84c35727d6dfa8f9e2d9d4c61eb1f2",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/832063779f84c35727d6dfa8f9e2d9d4c61eb1f2",
-      "tree": {
-        "sha": "c8b7bd96801b72daa10078f72af0b6b771a57c4e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c8b7bd96801b72daa10078f72af0b6b771a57c4e"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree c8b7bd96801b72daa10078f72af0b6b771a57c4e\nparent 404470505a8b574b5e4b0e1ffc481ed3fc8caf77\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1769021593 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778063964 +0100\n\ntxgraph: populate chunk refs in `GetMainStagingDiagrams` result\n\nGetMainStagingDiagrams currently returns vector<FeeFrac> pair\ncontaining only chunk feerates.\nSome callers might need to know which transactions belong to\neach e.g chunk in order to compute chunk hash.\n\nThis commit introduces TxGraph::Chunk which pairs a chunk feerate with\nthe refs of all transactions in that chunk. Update GetMainStagingDiagrams\nto return pair of vector<TxGraph::Chunk> and rename AppendChunkFeerates\nto AppendChunks to reflect the richer return type.\n\nThis commit then added a SanityCheck coverage for the new behaviour.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsaXwAKCRAOOQjzZJiY\niB3NAQDn46lKJm6YIAlGbTAnyUmjYSmmD0XmQJ1DtOKu81e1iwD/f8IdxsQBoYM5\nrB5VKyKbMAs4l1Vf//l25O4mU1u1ug0=\n=HG4n\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/404470505a8b574b5e4b0e1ffc481ed3fc8caf77",
-          "sha": "404470505a8b574b5e4b0e1ffc481ed3fc8caf77",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/404470505a8b574b5e4b0e1ffc481ed3fc8caf77"
-        }
-      ],
-      "message": "txgraph: populate chunk refs in `GetMainStagingDiagrams` result\n\nGetMainStagingDiagrams currently returns vector<FeeFrac> pair\ncontaining only chunk feerates.\nSome callers might need to know which transactions belong to\neach e.g chunk in order to compute chunk hash.\n\nThis commit introduces TxGraph::Chunk which pairs a chunk feerate with\nthe refs of all transactions in that chunk. Update GetMainStagingDiagrams\nto return pair of vector<TxGraph::Chunk> and rename AppendChunkFeerates\nto AppendChunks to reflect the richer return type.\n\nThis commit then added a SanityCheck coverage for the new behaviour.",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:39:24Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-01-21T18:53:13Z"
-      },
-      "sha": "832063779f84c35727d6dfa8f9e2d9d4c61eb1f2"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDcxNTA0ODg4MDZhMGY1OGUwZjYzYWMyNGY5MGRlZTExMmI5YWM4ZjM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7150488806a0f58e0f63ac24f90dee112b9ac8f3",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7150488806a0f58e0f63ac24f90dee112b9ac8f3",
-      "tree": {
-        "sha": "9b9784358195d6158a0aed3438cf583ed79bad84",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9b9784358195d6158a0aed3438cf583ed79bad84"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 9b9784358195d6158a0aed3438cf583ed79bad84\nparent 832063779f84c35727d6dfa8f9e2d9d4c61eb1f2\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772540740 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064012 +0100\n\nrefactor: move-only: split GetPackageHash\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsajQAKCRAOOQjzZJiY\niMktAQDqV02isHJCNasXK5ZjDBCIYsFWeZAKB4Du4IeoMIXudAD/ZAP5bbKFIaZI\nvw3/8gkCbwLVnjTgJbY1HLG9NEarTgE=\n=C9OP\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/832063779f84c35727d6dfa8f9e2d9d4c61eb1f2",
-          "sha": "832063779f84c35727d6dfa8f9e2d9d4c61eb1f2",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/832063779f84c35727d6dfa8f9e2d9d4c61eb1f2"
-        }
-      ],
-      "message": "refactor: move-only: split GetPackageHash",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:12Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-03T12:25:40Z"
-      },
-      "sha": "7150488806a0f58e0f63ac24f90dee112b9ac8f3"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDZkYWM0MTllMzJkYWQ2NDU3ZDI5NjI2ZTYzM2E1ZTY3ZjRjM2NlY2Q",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6dac419e32dad6457d29626e633a5e67f4c3cecd",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/6dac419e32dad6457d29626e633a5e67f4c3cecd",
-      "tree": {
-        "sha": "5fd8addff5467f74306c0b8e25e65e331b1302e7",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5fd8addff5467f74306c0b8e25e65e331b1302e7"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 5fd8addff5467f74306c0b8e25e65e331b1302e7\nparent 7150488806a0f58e0f63ac24f90dee112b9ac8f3\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772540785 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064013 +0100\n\nmempool: cache fee rate diagrams as chunks in ChangeSet\n\nCalculateChunksForRBF extracts only the FeeFrac from each TxGraph::Chunk\nand discards the rest.\n\nCache the fee rate diagrams chunks in ChangeSet.\n\nThe cached chunks are going to be used in subsequent commit.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsajgAKCRAOOQjzZJiY\niMQSAP9kYY5kpP+EbyGJ+nhvE+esPgSwJ93yDibSUjlX2FngBwD+JsewYpjREzRp\nvuC2pB6/l4/4qdSb1EaNI+27yXMW9wI=\n=vpUe\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7150488806a0f58e0f63ac24f90dee112b9ac8f3",
-          "sha": "7150488806a0f58e0f63ac24f90dee112b9ac8f3",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7150488806a0f58e0f63ac24f90dee112b9ac8f3"
-        }
-      ],
-      "message": "mempool: cache fee rate diagrams as chunks in ChangeSet\n\nCalculateChunksForRBF extracts only the FeeFrac from each TxGraph::Chunk\nand discards the rest.\n\nCache the fee rate diagrams chunks in ChangeSet.\n\nThe cached chunks are going to be used in subsequent commit.",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:13Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-03T12:26:25Z"
-      },
-      "sha": "6dac419e32dad6457d29626e633a5e67f4c3cecd"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQ5NzBjNmE0YjNkNzFhNjYyY2UxNGJhMjhiODA4ZGQ5NzM4MTY5ZWQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4970c6a4b3d71a662ce14ba28b808dd9738169ed",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/4970c6a4b3d71a662ce14ba28b808dd9738169ed",
-      "tree": {
-        "sha": "fcfb2fcdb62dc5658430ecc177c17930c6383a12",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fcfb2fcdb62dc5658430ecc177c17930c6383a12"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree fcfb2fcdb62dc5658430ecc177c17930c6383a12\nparent 6dac419e32dad6457d29626e633a5e67f4c3cecd\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772641272 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064015 +0100\n\nmempool: add GetAndSaveMainStagingDiagram to ChangeSet\n\nGetAndSaveMainStagingDiagram is extracted from CalculateChunksForRBF so\nthe diagram snapshot can be taken on removal paths that do not go through\nthe RBF codepath.\n\nThe const fix to RemoveStaged is required because GetRemovals()\nreturns a const reference.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsakAAKCRAOOQjzZJiY\niBQqAQD/BeBLdPSH8oSx5iYd+fTHnGGUwDLNVpRyMuQ6B0m7pwD/ZWOGn0XI41AS\nnLbGd/kPN5XoI5lM/tPAEEjwmDjtOAQ=\n=yxC9\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6dac419e32dad6457d29626e633a5e67f4c3cecd",
-          "sha": "6dac419e32dad6457d29626e633a5e67f4c3cecd",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/6dac419e32dad6457d29626e633a5e67f4c3cecd"
-        }
-      ],
-      "message": "mempool: add GetAndSaveMainStagingDiagram to ChangeSet\n\nGetAndSaveMainStagingDiagram is extracted from CalculateChunksForRBF so\nthe diagram snapshot can be taken on removal paths that do not go through\nthe RBF codepath.\n\nThe const fix to RemoveStaged is required because GetRemovals()\nreturns a const reference.",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:15Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-04T16:21:12Z"
-      },
-      "sha": "4970c6a4b3d71a662ce14ba28b808dd9738169ed"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQyNmJiODdkYmM1NjRkOWRkZDQwNGM3YWRlMDAyMGIxZDQyYjMxNWM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d26bb87dbc564d9ddd404c7ade0020b1d42b315c",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d26bb87dbc564d9ddd404c7ade0020b1d42b315c",
-      "tree": {
-        "sha": "f681db91cdd928ac2d6b07222309b9480bbda127",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f681db91cdd928ac2d6b07222309b9480bbda127"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree f681db91cdd928ac2d6b07222309b9480bbda127\nparent 4970c6a4b3d71a662ce14ba28b808dd9738169ed\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1773225638 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064016 +0100\n\nrefactor: move-only: extract dependency addition into a seperate method\n\nThe newly created method addDependenciesFromBlock is going to be\nused multiple times in subsequent commit.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsakQAKCRAOOQjzZJiY\niNWaAQDzuXvoREapC1IE0F1WS6YwjF1UwT93X2/Pw0Z5/msxXAEAj3DLH44Nv8Sk\nWhRIQvkwRjQN4lt2A5etKvQ8Y0KHYwE=\n=fpq6\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4970c6a4b3d71a662ce14ba28b808dd9738169ed",
-          "sha": "4970c6a4b3d71a662ce14ba28b808dd9738169ed",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/4970c6a4b3d71a662ce14ba28b808dd9738169ed"
-        }
-      ],
-      "message": "refactor: move-only: extract dependency addition into a seperate method\n\nThe newly created method addDependenciesFromBlock is going to be\nused multiple times in subsequent commit.",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:16Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-11T10:40:38Z"
-      },
-      "sha": "d26bb87dbc564d9ddd404c7ade0020b1d42b315c"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDY1MTA2MDRiOTRkM2Q0ZmY4ZDg0YjkxN2NkNDViMTJiMTllNDc5NTQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6510604b94d3d4ff8d84b917cd45b12b19e47954",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/6510604b94d3d4ff8d84b917cd45b12b19e47954",
-      "tree": {
-        "sha": "5b6bf913a29707644e516e6335becdd930185425",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5b6bf913a29707644e516e6335becdd930185425"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 5b6bf913a29707644e516e6335becdd930185425\nparent d26bb87dbc564d9ddd404c7ade0020b1d42b315c\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772640749 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064018 +0100\n\nmempool: add and fire MempoolUpdated signal on each mempool update path\n\nAdd `MemPoolChunksUpdate` to `kernel/mempool_entry.h`.\n\nEach removal path now captures the before/after fee rate diagram chunks\nand fires MempoolUpdated so subscribers can observe every mempool change.\n\nThis signal allows subscribers to observe mempool fee rate diagram\nchanges in an asynchronous way without holding the mempool lock.\n\nThis changes the order of operations in removeForBlock: all block\ntransactions in the mempool are now removed before conflict\nremovals.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsakwAKCRAOOQjzZJiY\niFhmAQDtB5+LzhjovDYx2xV3P14Bd8IZnI35Bobr/fiWbPCKRAEA4J8WjPu1+fxh\nuM5PaJ4Yt2x6J9dSdGCIvYY5SLJ1xAA=\n=v7o5\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d26bb87dbc564d9ddd404c7ade0020b1d42b315c",
-          "sha": "d26bb87dbc564d9ddd404c7ade0020b1d42b315c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d26bb87dbc564d9ddd404c7ade0020b1d42b315c"
-        }
-      ],
-      "message": "mempool: add and fire MempoolUpdated signal on each mempool update path\n\nAdd `MemPoolChunksUpdate` to `kernel/mempool_entry.h`.\n\nEach removal path now captures the before/after fee rate diagram chunks\nand fires MempoolUpdated so subscribers can observe every mempool change.\n\nThis signal allows subscribers to observe mempool fee rate diagram\nchanges in an asynchronous way without holding the mempool lock.\n\nThis changes the order of operations in removeForBlock: all block\ntransactions in the mempool are now removed before conflict\nremovals.",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:18Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-04T16:12:29Z"
-      },
-      "sha": "6510604b94d3d4ff8d84b917cd45b12b19e47954"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDFiMmZlNWM4NjBlMGM5Zjg0OGE4MmY4ZTFkYzYzYzBlMWE1NWVhNTA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50",
-      "tree": {
-        "sha": "de358160768723b2a0d1fa0bbbbf10bc217b837e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/de358160768723b2a0d1fa0bbbbf10bc217b837e"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree de358160768723b2a0d1fa0bbbbf10bc217b837e\nparent 6510604b94d3d4ff8d84b917cd45b12b19e47954\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1773080596 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1778064019 +0100\n\ntest: add unit test to mempool update validation events\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCafsalAAKCRAOOQjzZJiY\niM5lAQC/BnSnfa/9rdka8614etiO6bvMGOnrKiPiv2FHgz9dcQD7BI+fPkvetFcm\nHvYlxlZeZfnVGhscb3IGHcGkLsCfzgE=\n=MUKf\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6510604b94d3d4ff8d84b917cd45b12b19e47954",
-          "sha": "6510604b94d3d4ff8d84b917cd45b12b19e47954",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/6510604b94d3d4ff8d84b917cd45b12b19e47954"
-        }
-      ],
-      "message": "test: add unit test to mempool update validation events",
-      "committer": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-05-06T10:40:19Z"
-      },
-      "author": {
-        "name": "ismaelsadeeq",
-        "email": "abubakarsadiqismail@proton.me",
-        "date": "2026-03-09T18:23:16Z"
-      },
-      "sha": "1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 25214440595,
       "node_id": "HRFPE_lADOABII587x5MS3zwAAAAXe5dST",
@@ -1732,6 +1452,317 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/34803#issuecomment-4387254864",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/34803"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGJkMWY5OWI2ODI0MTliNWU4MDVkZGUyMjdjN2QyZWUyZTgwMTNhYmQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd1f99b682419b5e805dde227c7d2ee2e8013abd",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/bd1f99b682419b5e805dde227c7d2ee2e8013abd",
+      "tree": {
+        "sha": "487eb786a0edb8612721faa3ef234e7ef4e5722e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/487eb786a0edb8612721faa3ef234e7ef4e5722e"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 487eb786a0edb8612721faa3ef234e7ef4e5722e\nparent 0a1bbec688b8c075ba45b6028b6f4fe3ef636be9\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1769021593 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434825 +0100\n\ntxgraph: populate chunk refs in `GetMainStagingDiagrams` result\n\nGetMainStagingDiagrams currently returns a pair of vector<FeeFrac>\ncontaining only chunk feerates. Some callers need to know which\ntransactions belong to each chunk in order to compute a chunk hash.\n\nIntroduce TxGraph::Chunk, which pairs a chunk feerate with the refs of\nall transactions in that chunk. Update GetMainStagingDiagrams to return a\npair of vector<TxGraph::Chunk>, and rename AppendChunkFeerates to\nAppendChunks to reflect the richer return type.\n\nAdd SanityCheck coverage for the new behaviour.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OSQAKCRAOOQjzZJiY\niDSXAQDSIh25ZTgR7MjIyaygB8B223wu3NnUrye/Mxu+UimkIQEAp1cP4nc5bBaF\nYZ5d4ZENu2WaR02eg0UNIGGC3U4EBAA=\n=G/N9\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/0a1bbec688b8c075ba45b6028b6f4fe3ef636be9",
+          "sha": "0a1bbec688b8c075ba45b6028b6f4fe3ef636be9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/0a1bbec688b8c075ba45b6028b6f4fe3ef636be9"
+        }
+      ],
+      "message": "txgraph: populate chunk refs in `GetMainStagingDiagrams` result\n\nGetMainStagingDiagrams currently returns a pair of vector<FeeFrac>\ncontaining only chunk feerates. Some callers need to know which\ntransactions belong to each chunk in order to compute a chunk hash.\n\nIntroduce TxGraph::Chunk, which pairs a chunk feerate with the refs of\nall transactions in that chunk. Update GetMainStagingDiagrams to return a\npair of vector<TxGraph::Chunk>, and rename AppendChunkFeerates to\nAppendChunks to reflect the richer return type.\n\nAdd SanityCheck coverage for the new behaviour.",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:45Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-01-21T18:53:13Z"
+      },
+      "sha": "bd1f99b682419b5e805dde227c7d2ee2e8013abd"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE4ZTMxMzc2MzBmZjE4MTFhZmU0OTg3OGZiODBkM2E2ZGQxNTllNzI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/18e3137630ff1811afe49878fb80d3a6dd159e72",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/18e3137630ff1811afe49878fb80d3a6dd159e72",
+      "tree": {
+        "sha": "8ff6629f96e0e466dbc39dfe0f4f543b8695e4fd",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8ff6629f96e0e466dbc39dfe0f4f543b8695e4fd"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 8ff6629f96e0e466dbc39dfe0f4f543b8695e4fd\nparent bd1f99b682419b5e805dde227c7d2ee2e8013abd\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772540740 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434825 +0100\n\nrefactor: move-only: split GetPackageHash\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OSgAKCRAOOQjzZJiY\niOrrAP9FqxUTRaVq5KuLRV0xEZsMC8ZYUuaN3WemW6rZGmA7FAEA1EsNKvXsLpng\nbpNm1lOYvvTJZTZuiVAFRYlXnBgexw8=\n=X2AU\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd1f99b682419b5e805dde227c7d2ee2e8013abd",
+          "sha": "bd1f99b682419b5e805dde227c7d2ee2e8013abd",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/bd1f99b682419b5e805dde227c7d2ee2e8013abd"
+        }
+      ],
+      "message": "refactor: move-only: split GetPackageHash",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:45Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-03-03T12:25:40Z"
+      },
+      "sha": "18e3137630ff1811afe49878fb80d3a6dd159e72"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGUxZTA0MmU1OTc3NjViMmQyMTYwZjUzMjYwNzliNWE0OTc5NGEzMjc",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e1e042e597765b2d2160f5326079b5a49794a327",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e1e042e597765b2d2160f5326079b5a49794a327",
+      "tree": {
+        "sha": "26f5f59390b177882743c000656764b3b62feda7",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/26f5f59390b177882743c000656764b3b62feda7"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 26f5f59390b177882743c000656764b3b62feda7\nparent 18e3137630ff1811afe49878fb80d3a6dd159e72\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1781769133 +0100\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434826 +0100\n\nmempool: cache fee rate diagrams as chunks in ChangeSet\n\nCalculateChunksForRBF extracts only the FeeFrac from each TxGraph::Chunk\nand discards the rest. Cache the fee rate diagram chunks in ChangeSet for\nuse in subsequent commits.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OSwAKCRAOOQjzZJiY\niIuMAQD8I8efEhSfzNg9Wp3QRwlPPPfpjmRspLb3QxhwsXZGwwEAw7q1VGfFu+zt\nDir00zuq8B8IDtqPbyygmIG4/6gOaQg=\n=bgzk\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/18e3137630ff1811afe49878fb80d3a6dd159e72",
+          "sha": "18e3137630ff1811afe49878fb80d3a6dd159e72",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/18e3137630ff1811afe49878fb80d3a6dd159e72"
+        }
+      ],
+      "message": "mempool: cache fee rate diagrams as chunks in ChangeSet\n\nCalculateChunksForRBF extracts only the FeeFrac from each TxGraph::Chunk\nand discards the rest. Cache the fee rate diagram chunks in ChangeSet for\nuse in subsequent commits.",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:46Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-06-18T07:52:13Z"
+      },
+      "sha": "e1e042e597765b2d2160f5326079b5a49794a327"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDk2YmY0MTIwMDA5NmVhYmFmY2U1YmIzYTViMTlhZmUyZmQ0ZTljYWY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/96bf41200096eabafce5bb3a5b19afe2fd4e9caf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/96bf41200096eabafce5bb3a5b19afe2fd4e9caf",
+      "tree": {
+        "sha": "ae5c11f1ac7f6d918295cbba05d60146faac3158",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/ae5c11f1ac7f6d918295cbba05d60146faac3158"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree ae5c11f1ac7f6d918295cbba05d60146faac3158\nparent e1e042e597765b2d2160f5326079b5a49794a327\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1772641272 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434827 +0100\n\nmempool: add SnapshotDiagrams to ChangeSet\n\nExtract SnapshotDiagrams from CalculateChunksForRBF so the diagram\nsnapshot can be taken on removal paths that do not go through the RBF\ncodepath.\n\nThe const fix to RemoveStaged is required because GetRemovals()\nreturns a const reference.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OSwAKCRAOOQjzZJiY\niHjfAQC84+PNyIu5S5Q8JKrKR0h45YYgeINvx86IPp1QV8RtEQD/bHLUgYFxs6uR\n7HMSJ+w3+fMFA35+i2fo+2+uPXfPtQA=\n=+XSO\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e1e042e597765b2d2160f5326079b5a49794a327",
+          "sha": "e1e042e597765b2d2160f5326079b5a49794a327",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e1e042e597765b2d2160f5326079b5a49794a327"
+        }
+      ],
+      "message": "mempool: add SnapshotDiagrams to ChangeSet\n\nExtract SnapshotDiagrams from CalculateChunksForRBF so the diagram\nsnapshot can be taken on removal paths that do not go through the RBF\ncodepath.\n\nThe const fix to RemoveStaged is required because GetRemovals()\nreturns a const reference.",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:47Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-03-04T16:21:12Z"
+      },
+      "sha": "96bf41200096eabafce5bb3a5b19afe2fd4e9caf"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGM1NjcwZmNmZDg3MzhjYTY2NWI0ZTQxN2U4MDJmMGVkYTFlYmFiNGI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c5670fcfd8738ca665b4e417e802f0eda1ebab4b",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c5670fcfd8738ca665b4e417e802f0eda1ebab4b",
+      "tree": {
+        "sha": "773c0e8063c353861e5ca38c5182668566d8c5a6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/773c0e8063c353861e5ca38c5182668566d8c5a6"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 773c0e8063c353861e5ca38c5182668566d8c5a6\nparent 96bf41200096eabafce5bb3a5b19afe2fd4e9caf\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1773225638 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434828 +0100\n\nrefactor: move-only: extract dependency addition into a separate method\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OTAAKCRAOOQjzZJiY\niM3cAP91YXgSE13p38qPswPMnoRftFKbmNxCa1bLpfQKe4jFzQEAiVzq6hLFYGd4\nX2B0q6IEEFp6CuMQrzrn7+Gs2+gdZQ4=\n=GGjm\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/96bf41200096eabafce5bb3a5b19afe2fd4e9caf",
+          "sha": "96bf41200096eabafce5bb3a5b19afe2fd4e9caf",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/96bf41200096eabafce5bb3a5b19afe2fd4e9caf"
+        }
+      ],
+      "message": "refactor: move-only: extract dependency addition into a separate method",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:48Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-03-11T10:40:38Z"
+      },
+      "sha": "c5670fcfd8738ca665b4e417e802f0eda1ebab4b"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDc0Y2VmYzdlMjZmZjliYWRjZmRjODNhMTMyOGRlNDk4ZGJlZmY1MmU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/74cefc7e26ff9badcfdc83a1328de498dbeff52e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/74cefc7e26ff9badcfdc83a1328de498dbeff52e",
+      "tree": {
+        "sha": "438b173e716fccad506c25db84ffcc6248d055fa",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/438b173e716fccad506c25db84ffcc6248d055fa"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 438b173e716fccad506c25db84ffcc6248d055fa\nparent c5670fcfd8738ca665b4e417e802f0eda1ebab4b\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1780922258 +0100\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434828 +0100\n\nmempool: add and fire MempoolUpdated signal on each mempool update path\n\nAdd MemPoolChunk and MemPoolChunksUpdate structs to\nkernel/mempool_entry.h and MakeMemPoolChunks helper to txmempool.cpp\nfor converting TxGraph::Chunk vectors into MemPoolChunk vectors.\n\nEach removal path now captures the before/after fee rate diagram chunks\nand fires MempoolUpdated so subscribers can observe every mempool change.\n\nThis signal allows subscribers to observe mempool fee rate diagram\nchanges in an asynchronous way without holding the mempool lock.\n\nThis changes the order of operations in removeForBlock: all block\ntransactions in the mempool are now removed before conflict\nremovals.\n\nIn blockencodings_tests, SyncWithValidationInterfaceQueue() drains the\nasync MempoolUpdated signal queue before LOCK2(cs_main, pool.cs).\nThe LOCK2 moves after the sync to avoid deadlock.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OTQAKCRAOOQjzZJiY\niO9eAQCE1Mrb4noRMUi8qYLOlW3pn2y+3m4q8zilM1EWLmbpzwEAneO7UEGWGjUc\nbLFV1J+D8PC67kui8nNS90l5wu4mDAQ=\n=t+/3\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c5670fcfd8738ca665b4e417e802f0eda1ebab4b",
+          "sha": "c5670fcfd8738ca665b4e417e802f0eda1ebab4b",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c5670fcfd8738ca665b4e417e802f0eda1ebab4b"
+        }
+      ],
+      "message": "mempool: add and fire MempoolUpdated signal on each mempool update path\n\nAdd MemPoolChunk and MemPoolChunksUpdate structs to\nkernel/mempool_entry.h and MakeMemPoolChunks helper to txmempool.cpp\nfor converting TxGraph::Chunk vectors into MemPoolChunk vectors.\n\nEach removal path now captures the before/after fee rate diagram chunks\nand fires MempoolUpdated so subscribers can observe every mempool change.\n\nThis signal allows subscribers to observe mempool fee rate diagram\nchanges in an asynchronous way without holding the mempool lock.\n\nThis changes the order of operations in removeForBlock: all block\ntransactions in the mempool are now removed before conflict\nremovals.\n\nIn blockencodings_tests, SyncWithValidationInterfaceQueue() drains the\nasync MempoolUpdated signal queue before LOCK2(cs_main, pool.cs).\nThe LOCK2 moves after the sync to avoid deadlock.",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:48Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-06-08T12:37:38Z"
+      },
+      "sha": "74cefc7e26ff9badcfdc83a1328de498dbeff52e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGY5ODg4OWQxMGFmM2Y4ZWIxZTA5ZDg1MTM4ZDUxMDFlNzEzYzhiNGI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f98889d10af3f8eb1e09d85138d5101e713c8b4b",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/f98889d10af3f8eb1e09d85138d5101e713c8b4b",
+      "tree": {
+        "sha": "09501bc18a5bcc02dcb4a76cce4fa09303b8835a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/09501bc18a5bcc02dcb4a76cce4fa09303b8835a"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 09501bc18a5bcc02dcb4a76cce4fa09303b8835a\nparent 74cefc7e26ff9badcfdc83a1328de498dbeff52e\nauthor ismaelsadeeq <abubakarsadiqismail@proton.me> 1773080596 +0000\ncommitter ismaelsadeeq <abubakarsadiqismail@proton.me> 1783434829 +0100\n\ntest: add unit test for mempool update validation events\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQTp92/X8LZmU6fYk5kOOQjzZJiYiAUCak0OTQAKCRAOOQjzZJiY\niEQ1AQCiozyL96nAo7fChM21OV4TrCWQm1I70AjRDjik3ShcdQD/TQbfSNUYnMwX\n6bRxaQBXLkbVjD8xUY//3RLOo74BrQk=\n=Vjiv\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/74cefc7e26ff9badcfdc83a1328de498dbeff52e",
+          "sha": "74cefc7e26ff9badcfdc83a1328de498dbeff52e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/74cefc7e26ff9badcfdc83a1328de498dbeff52e"
+        }
+      ],
+      "message": "test: add unit test for mempool update validation events",
+      "committer": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-07-07T14:33:49Z"
+      },
+      "author": {
+        "name": "ismaelsadeeq",
+        "email": "abubakarsadiqismail@proton.me",
+        "date": "2026-03-09T18:23:16Z"
+      },
+      "sha": "f98889d10af3f8eb1e09d85138d5101e713c8b4b"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 27669778196,
+      "node_id": "HRFPE_lADOABII587x5MS3zwAAAAZxP08U",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/27669778196",
+      "actor": {
+        "login": "ismaelsadeeq",
+        "id": 48946461,
+        "node_id": "MDQ6VXNlcjQ4OTQ2NDYx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/48946461?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ismaelsadeeq",
+        "html_url": "https://github.com/ismaelsadeeq",
+        "followers_url": "https://api.github.com/users/ismaelsadeeq/followers",
+        "following_url": "https://api.github.com/users/ismaelsadeeq/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ismaelsadeeq/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ismaelsadeeq/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ismaelsadeeq/subscriptions",
+        "organizations_url": "https://api.github.com/users/ismaelsadeeq/orgs",
+        "repos_url": "https://api.github.com/users/ismaelsadeeq/repos",
+        "events_url": "https://api.github.com/users/ismaelsadeeq/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "f98889d10af3f8eb1e09d85138d5101e713c8b4b",
+      "commit_url": "https://api.github.com/repos/ismaelsadeeq/bitcoin/commits/f98889d10af3f8eb1e09d85138d5101e713c8b4b",
+      "created_at": "2026-07-07T14:45:42Z"
     }
   ],
   "comments": [
@@ -1742,9 +1773,9 @@
       "node_id": "PRRC_kwDOABII5867LrHh",
       "diff_hunk": "@@ -1005,11 +1006,15 @@ std::vector<CTxMemPool::txiter> CTxMemPool::GatherClusters(const std::vector<Txi\n util::Result<std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>>> CTxMemPool::ChangeSet::CalculateChunksForRBF()\n {\n     LOCK(m_pool->cs);\n-\n     if (!CheckMemPoolPolicyLimits()) {\n         return util::Error{Untranslated(\"cluster size limit exceeded\")};\n     }\n+    return GetAndSaveMainStagingDiagram();\n+}\n \n+std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>> CTxMemPool::ChangeSet::GetAndSaveMainStagingDiagram()\n+{\n+    LOCK(m_pool->cs);",
       "path": "src/txmempool.cpp",
-      "position": 259,
+      "position": 266,
       "original_position": 23,
-      "commit_id": "1b2fe5c860e0c9f848a82f8e1dc63c0e1a55ea50",
+      "commit_id": "f98889d10af3f8eb1e09d85138d5101e713c8b4b",
       "original_commit_id": "8c38cd73cbf3abfe04d509a8a1b7171b2a945f47",
       "in_reply_to_id": null,
       "user": {
@@ -1785,7 +1816,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 1080,
+      "line": 1094,
       "original_line": 1017,
       "side": "RIGHT"
     },
@@ -1839,7 +1870,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -1893,7 +1924,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -1947,7 +1978,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -2001,7 +2032,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -2055,7 +2086,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -2109,7 +2140,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -2163,7 +2194,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": null,
+      "line": 121,
       "original_line": 121,
       "side": "RIGHT"
     },
@@ -2273,6 +2304,60 @@
       "start_side": null,
       "line": null,
       "original_line": 70,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3537433475",
+      "pull_request_review_id": 4646306649,
+      "id": 3537433475,
+      "node_id": "PRRC_kwDOABII587S2POD",
+      "diff_hunk": "@@ -1005,11 +1006,15 @@ std::vector<CTxMemPool::txiter> CTxMemPool::GatherClusters(const std::vector<Txi\n util::Result<std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>>> CTxMemPool::ChangeSet::CalculateChunksForRBF()\n {\n     LOCK(m_pool->cs);\n-\n     if (!CheckMemPoolPolicyLimits()) {\n         return util::Error{Untranslated(\"cluster size limit exceeded\")};\n     }\n+    return GetAndSaveMainStagingDiagram();\n+}\n \n+std::pair<std::vector<FeeFrac>, std::vector<FeeFrac>> CTxMemPool::ChangeSet::GetAndSaveMainStagingDiagram()\n+{\n+    LOCK(m_pool->cs);",
+      "path": "src/txmempool.cpp",
+      "position": 266,
+      "original_position": 23,
+      "commit_id": "f98889d10af3f8eb1e09d85138d5101e713c8b4b",
+      "original_commit_id": "8c38cd73cbf3abfe04d509a8a1b7171b2a945f47",
+      "in_reply_to_id": 3140399585,
+      "user": {
+        "login": "ismaelsadeeq",
+        "id": 48946461,
+        "node_id": "MDQ6VXNlcjQ4OTQ2NDYx",
+        "avatar_url": "https://avatars.githubusercontent.com/u/48946461?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ismaelsadeeq",
+        "html_url": "https://github.com/ismaelsadeeq",
+        "followers_url": "https://api.github.com/users/ismaelsadeeq/followers",
+        "following_url": "https://api.github.com/users/ismaelsadeeq/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ismaelsadeeq/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ismaelsadeeq/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ismaelsadeeq/subscriptions",
+        "organizations_url": "https://api.github.com/users/ismaelsadeeq/orgs",
+        "repos_url": "https://api.github.com/users/ismaelsadeeq/repos",
+        "events_url": "https://api.github.com/users/ismaelsadeeq/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ismaelsadeeq/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Yes, it's because we cannot annotate this method with mempool mutex.",
+      "created_at": "2026-07-07T14:51:28Z",
+      "updated_at": "2026-07-07T14:51:29Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34803#discussion_r3537433475",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3537433475"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34803"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 1094,
+      "original_line": 1017,
       "side": "RIGHT"
     }
   ]
