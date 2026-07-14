@@ -82,17 +82,17 @@
         "name": null,
         "patch_url": null
       },
-      "open_issues": 18,
-      "closed_issues": 56,
+      "open_issues": 17,
+      "closed_issues": 57,
       "created_at": "2026-02-20T12:46:51Z",
-      "updated_at": "2026-07-12T14:15:17Z"
+      "updated_at": "2026-07-14T07:45:53Z"
     },
     "created_at": "2026-02-20T03:09:59Z",
-    "updated_at": "2026-07-14T05:33:49Z",
+    "updated_at": "2026-07-14T15:13:37Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "d496e561794ad94b511d840433ebb2ba8c3b0792",
+    "merge_commit_sha": "7c7572dc23ee2cd395f6439d170d242bc227d347",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -401,12 +401,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39173,
-        "stargazers_count": 89745,
-        "watchers_count": 89745,
-        "size": 319245,
+        "forks_count": 39178,
+        "stargazers_count": 89755,
+        "watchers_count": 89755,
+        "size": 319277,
         "default_branch": "master",
-        "open_issues_count": 675,
+        "open_issues_count": 672,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -423,9 +423,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-07-13T21:54:13Z",
+        "pushed_at": "2026-07-14T14:12:12Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-07-14T05:31:17Z",
+        "updated_at": "2026-07-14T15:23:52Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -455,7 +455,7 @@
     "deletions": 120,
     "changed_files": 15,
     "commits": 13,
-    "review_comments": 84,
+    "review_comments": 85,
     "comments": 23
   },
   "events": [
@@ -9552,6 +9552,60 @@
       "start_side": null,
       "line": 662,
       "original_line": 662,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3580242127",
+      "pull_request_review_id": 4695782747,
+      "id": 3580242127,
+      "node_id": "PRRC_kwDOABII587VZijP",
+      "diff_hunk": "@@ -2272,28 +2348,126 @@ void PeerManagerImpl::SendPings()\n     for(auto& it : m_peer_map) it.second->m_ping_queued = true;\n }\n \n-void PeerManagerImpl::InitiateTxBroadcastToAll(const Txid& txid, const Wtxid& wtxid)\n+std::vector<Wtxid> InvToSendBucket::TakeForProcessing(CTxMemPool& mempool)\n {\n-    for (const PeerRef& peer_ref : GetAllPeers()) {\n-        if (!peer_ref) continue;\n-        Peer& peer{*peer_ref};\n+    AssertLockHeld(mempool.cs);\n \n-        auto tx_relay = peer.GetTxRelay();\n-        if (!tx_relay) continue;\n+    size_t n_to_take = static_cast<size_t>(std::max<double>(count_bucket.value() - count_floor, 0));\n \n-        LOCK(tx_relay->m_tx_inventory_mutex);\n-        // Only queue transactions for announcement once the version handshake\n-        // is completed. The time of arrival for these transactions is\n-        // otherwise at risk of leaking to a spy, if the spy is able to\n-        // distinguish transactions received during the handshake from the rest\n-        // in the announcement.\n-        if (tx_relay->m_next_inv_send_time == 0s) continue;\n+    std::vector<Wtxid> best;\n \n-        const uint256& hash{peer.m_wtxid_relay ? wtxid.ToUint256() : txid.ToUint256()};\n-        if (!tx_relay->m_tx_inventory_known_filter.contains(hash)) {\n-            tx_relay->m_tx_inventory_to_send.insert(wtxid);\n+    auto itervec = mempool.ExtractBestByMiningScoreWithTopology(backlog, n_to_take);\n+    bool tokens_left = true;\n+    for (auto txiter : itervec) {\n+        auto& wtxid = txiter->GetTx().GetWitnessHash();\n+        if (tokens_left) {\n+            best.push_back(wtxid);\n+            if (!decrement(txiter->GetTx().ComputeTotalSize())) {\n+                tokens_left = false;\n+            }\n+        } else {\n+            backlog.push_back(wtxid);\n         }\n     }\n+\n+    // if the backlog is now empty, consider shrinking it if it's oversized\n+    if (backlog.empty() && backlog.capacity() > INVENTORY_BUCKET_BACKLOG_CAPACITY) {\n+        std::vector<Wtxid> dummy;\n+        dummy.reserve(INVENTORY_BUCKET_BACKLOG_CAPACITY);\n+        dummy.swap(backlog);\n+    }\n+\n+    return best;\n+}\n+\n+void PeerManagerImpl::ProcessInvBacklog(NodeClock::time_point now, bool backlog_bumped)\n+{\n+    // Don't run the body of this function unless it's been a little\n+    // while since the last run, or we just added a new tx to the backlog.\n+    if (!backlog_bumped && now <= m_next_inv_bucket_check.load()) return;\n+    m_next_inv_bucket_check = now + INVENTORY_BUCKET_CHECK_DELAY;\n+\n+    LOCK(m_inv_to_send_mutex);\n+    m_inbound_inv_bucket.increment(now);\n+    m_outbound_inv_bucket.increment(now);\n+\n+    // Regular heartbeat logging when there's a backlog\n+    if (!m_next_inv_bucket_heartbeat.has_value()) {\n+        if (m_inbound_inv_bucket.backlog.size() >= INVENTORY_BUCKET_BACKLOG_HEARTBEAT_MIN || m_outbound_inv_bucket.backlog.size() >= INVENTORY_BUCKET_BACKLOG_HEARTBEAT_MIN) {\n+            m_next_inv_bucket_heartbeat = now;\n+        }\n+    }\n+    if (m_next_inv_bucket_heartbeat.has_value() && now >= *m_next_inv_bucket_heartbeat) {\n+        LogDebug(BCLog::NET, \"Transaction rate-limiting backlog inbound=%d itok=%.1f isz=%.1f outbound=%d otok=%.1f osz=%.1f\",\n+                 m_inbound_inv_bucket.backlog.size(),\n+                 m_inbound_inv_bucket.count_bucket.value(),\n+                 m_inbound_inv_bucket.size_bucket.value(),\n+                 m_outbound_inv_bucket.backlog.size(),\n+                 m_outbound_inv_bucket.count_bucket.value(),\n+                 m_outbound_inv_bucket.size_bucket.value());\n+        if (m_inbound_inv_bucket.backlog.empty() && m_outbound_inv_bucket.backlog.empty()) {\n+            m_next_inv_bucket_heartbeat = std::nullopt;\n+        } else {\n+            m_next_inv_bucket_heartbeat = now + INVENTORY_BUCKET_BACKLOG_HEARTBEAT;\n+        }\n+    }\n+\n+    // Early exit to skip pointlessly touching mempool lock\n+    bool in_avail = m_inbound_inv_bucket.avail();\n+    bool out_avail = m_outbound_inv_bucket.avail();\n+    if (!in_avail && !out_avail) return;\n+\n+    std::vector<Wtxid> for_inbound;\n+    std::vector<Wtxid> for_outbound;\n+\n+    {\n+        LOCK(m_mempool.cs);\n+        if (in_avail) for_inbound = m_inbound_inv_bucket.TakeForProcessing(m_mempool);\n+        if (out_avail) for_outbound = m_outbound_inv_bucket.TakeForProcessing(m_mempool);\n+    }\n+\n+    if (!for_inbound.empty() || !for_outbound.empty()) {\n+        bool any_inbound_connected = false;\n+        bool any_outbound_connected = false;\n+        for (const PeerRef& peer_ref : GetAllPeers()) {\n+            if (!peer_ref) continue;\n+            Peer& peer{*peer_ref};\n+            auto tx_relay = peer.GetTxRelay();\n+            if (!tx_relay) continue;\n+\n+            LOCK(tx_relay->m_tx_inventory_mutex);\n+            // Only queue transactions for announcement once the version handshake\n+            // is completed. The time of arrival for these transactions is\n+            // otherwise at risk of leaking to a spy, if the spy is able to\n+            // distinguish transactions received during the handshake from the rest\n+            // in the announcement.\n+            if (tx_relay->m_next_inv_send_time == 0s) continue;\n+            if (peer.m_is_inbound) {\n+                any_inbound_connected = true;\n+            } else {\n+                any_outbound_connected = true;\n+            }\n+            for (auto& i : (peer.m_is_inbound ? for_inbound : for_outbound)) {\n+                tx_relay->m_tx_inventory_to_send.push_back(i);\n+            }\n+        }\n+\n+        // if the node has no in/outbound connections, clear the corresponding backlog entirely\n+        // this reduces wasted memory, and avoids having the bucket artificially empty for when\n+        // future peers do connect.\n+        if (!any_inbound_connected) m_inbound_inv_bucket.backlog.clear();",
+      "path": "src/net_processing.cpp",
+      "position": 382,
+      "original_position": 382,
+      "commit_id": "349c72ee00a06581aa8cddaced6377c49a81d511",
+      "original_commit_id": "349c72ee00a06581aa8cddaced6377c49a81d511",
+      "in_reply_to_id": 3567143595,
+      "user": {
+        "login": "ajtowns",
+        "id": 127186,
+        "node_id": "MDQ6VXNlcjEyNzE4Ng==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/127186?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/ajtowns",
+        "html_url": "https://github.com/ajtowns",
+        "followers_url": "https://api.github.com/users/ajtowns/followers",
+        "following_url": "https://api.github.com/users/ajtowns/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/ajtowns/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/ajtowns/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/ajtowns/subscriptions",
+        "organizations_url": "https://api.github.com/users/ajtowns/orgs",
+        "repos_url": "https://api.github.com/users/ajtowns/repos",
+        "events_url": "https://api.github.com/users/ajtowns/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/ajtowns/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "If it was over capacity, it'll get cleared on the next call to `TakeForProcessing` that actually empties the backlog. Usually that should be when the next tx comes in; the unusual cases are if there is continually more new txs to relay than the rate limit bucket has capacity for, but the only downside is that the backlog vector will have extra space to not have to reallocate while the flood is ongoing. Current mempool is 100k entries at ~256MB, and 100k entries in the backlog is ~3.2MB of allocation here (potentially doubled to 6.4MB if you have no peers and are flooding your node with txs via sendrawtransaction, I guess?)",
+      "created_at": "2026-07-14T15:13:37Z",
+      "updated_at": "2026-07-14T15:13:37Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/34628#discussion_r3580242127",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3580242127"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/34628"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 2458,
+      "original_line": 2458,
       "side": "RIGHT"
     }
   ]
