@@ -53,7 +53,7 @@
       }
     ],
     "created_at": "2026-04-15T16:25:35Z",
-    "updated_at": "2026-07-28T08:51:18Z",
+    "updated_at": "2026-07-28T10:19:12Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -420,7 +420,7 @@
     "deletions": 302,
     "changed_files": 14,
     "commits": 11,
-    "review_comments": 13,
+    "review_comments": 16,
     "comments": 17
   },
   "events": [
@@ -4888,6 +4888,114 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3658648059"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35084"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 142,
+      "original_line": 142,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3664645092",
+      "pull_request_review_id": 4796155332,
+      "id": 3664645092,
+      "node_id": "PRRC_kwDOABII587abgvk",
+      "diff_hunk": "@@ -2,13 +2,198 @@\n // Distributed under the MIT software license, see the accompanying\n // file COPYING or http://www.opensource.org/licenses/mit-license.php.\n \n+#include <interfaces/init.h>\n+#include <ipc/capnp/mining.capnp.h>\n+#include <ipc/capnp/protocol.h>\n #include <ipc/process.h>\n+#include <ipc/protocol.h>\n+#include <ipc/test/ipc_test.capnp.h>\n+#include <ipc/test/ipc_test.capnp.proxy.h>\n #include <ipc/test/ipc_test.h>\n-\n+#include <mp/proxy-types.h>\n #include <test/util/common.h>\n #include <test/util/setup_common.h>\n+#include <tinyformat.h>\n+#include <util/log.h>\n+#include <validation.h>\n+\n+#include <future>\n+#include <thread>\n+#include <kj/common.h>\n+#include <kj/memory.h>\n+#include <kj/test.h>\n+#include <stdexcept>\n+\n #include <boost/test/unit_test.hpp>\n \n+static_assert(ipc::capnp::messages::MAX_MONEY == MAX_MONEY);\n+static_assert(ipc::capnp::messages::MAX_DOUBLE == std::numeric_limits<double>::max());\n+static_assert(ipc::capnp::messages::DEFAULT_BLOCK_RESERVED_WEIGHT == DEFAULT_BLOCK_RESERVED_WEIGHT);\n+static_assert(ipc::capnp::messages::DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS == DEFAULT_COINBASE_OUTPUT_MAX_ADDITIONAL_SIGOPS);\n+\n+//! Remote init class.\n+class TestInit : public interfaces::Init\n+{\n+public:\n+    std::unique_ptr<interfaces::Echo> makeEcho() override { return interfaces::MakeEcho(); }\n+};\n+\n+//! Generate a temporary path with temp_directory_path and mkstemp\n+static std::string TempPath(std::string_view pattern)\n+{\n+    std::string temp{fs::PathToString(fs::path{fs::temp_directory_path()} / fs::PathFromString(std::string{pattern}))};\n+    temp.push_back('\\0');\n+    int fd{mkstemp(temp.data())};\n+    BOOST_CHECK_GE(fd, 0);\n+    BOOST_CHECK_EQUAL(close(fd), 0);\n+    temp.resize(temp.size() - 1);\n+    fs::remove(fs::PathFromString(temp));\n+    return temp;\n+}\n+\n+//! Unit test that tests execution of IPC calls without actually creating a\n+//! separate process. This test is primarily intended to verify behavior of type\n+//! conversion code that converts C++ objects to Cap'n Proto messages and vice\n+//! versa.\n+//!\n+//! The test creates a thread which creates a FooImplementation object (defined\n+//! in ipc_test.h) and a two-way pipe accepting IPC requests which call methods\n+//! on the object through FooInterface (defined in ipc_test.capnp).\n+void IpcPipeTest()\n+{\n+    // Setup: create FooImplementation object and listen for FooInterface requests\n+    std::promise<std::unique_ptr<mp::ProxyClient<gen::FooInterface>>> foo_promise;\n+    std::thread thread([&]() {\n+        mp::EventLoop loop(\"IpcPipeTest\", [](bool raise, const std::string& log) { LogInfo(\"LOG%i: %s\", raise, log); });\n+        auto pipe = loop.m_io_context.provider->newTwoWayPipe();\n+\n+        auto connection_client = std::make_unique<mp::Connection>(loop, kj::mv(pipe.ends[0]));\n+        auto foo_client = std::make_unique<mp::ProxyClient<gen::FooInterface>>(\n+            connection_client->m_rpc_system->bootstrap(mp::ServerVatId().vat_id).castAs<gen::FooInterface>(),\n+            connection_client.get(), /* destroy_connection= */ true);\n+        (void)connection_client.release();\n+        foo_promise.set_value(std::move(foo_client));\n+\n+        auto connection_server = std::make_unique<mp::Connection>(loop, kj::mv(pipe.ends[1]), [&](mp::Connection& connection) {\n+            auto foo_server = kj::heap<mp::ProxyServer<gen::FooInterface>>(std::make_shared<FooImplementation>(), connection);\n+            return capnp::Capability::Client(kj::mv(foo_server));\n+        });\n+        connection_server->onDisconnect([&] { connection_server.reset(); });\n+        loop.loop();\n+    });\n+    std::unique_ptr<mp::ProxyClient<gen::FooInterface>> foo{foo_promise.get_future().get()};\n+\n+    // Test: make sure arguments were sent and return value is received\n+    BOOST_CHECK_EQUAL(foo->add(1, 2), 3);\n+\n+    COutPoint txout1{Txid::FromUint256(uint256{100}), 200};\n+    COutPoint txout2{foo->passOutPoint(txout1)};\n+    BOOST_CHECK(txout1 == txout2);\n+\n+    UniValue uni1{UniValue::VOBJ};\n+    uni1.pushKV(\"i\", 1);\n+    uni1.pushKV(\"s\", \"two\");\n+    UniValue uni2{foo->passUniValue(uni1)};\n+    BOOST_CHECK_EQUAL(uni1.write(), uni2.write());\n+\n+    CMutableTransaction mtx;\n+    mtx.version = 2;\n+    mtx.nLockTime = 3;\n+    mtx.vin.emplace_back(txout1);\n+    mtx.vout.emplace_back(COIN, CScript());\n+    CTransactionRef tx1{MakeTransactionRef(mtx)};\n+    CTransactionRef tx2{foo->passTransaction(tx1)};\n+    BOOST_CHECK(*Assert(tx1) == *Assert(tx2));\n+\n+    std::vector<CTransactionRef> txs1;\n+    txs1.push_back(tx1);\n+    txs1.push_back(nullptr);\n+    std::vector<CTransactionRef> txs2(foo->passTransactions(txs1));\n+    BOOST_CHECK_EQUAL(txs2.size(), 2);\n+    BOOST_CHECK(*Assert(txs1[0]) == *Assert(txs2[0]));\n+    BOOST_CHECK(!txs2[1]);\n+\n+    std::vector<char> vec1{'H', 'e', 'l', 'l', 'o'};\n+    std::vector<char> vec2{foo->passVectorChar(vec1)};\n+    BOOST_CHECK_EQUAL(std::string_view(vec1.begin(), vec1.end()), std::string_view(vec2.begin(), vec2.end()));\n+\n+    auto script1{CScript() << OP_11};\n+    auto script2{foo->passScript(script1)};\n+    BOOST_CHECK_EQUAL(HexStr(script1), HexStr(script2));\n+\n+    // Test cleanup: disconnect and join thread\n+    foo.reset();\n+    thread.join();\n+}\n+\n+//! Test ipc::Protocol connect() and serve() methods connecting over a socketpair.\n+void IpcSocketPairTest()\n+{\n+    int fds[2];\n+    BOOST_CHECK_EQUAL(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);\n+    std::unique_ptr<interfaces::Init> init{std::make_unique<TestInit>()};\n+    std::unique_ptr<ipc::Protocol> protocol{ipc::capnp::MakeCapnpProtocol()};\n+    std::promise<void> promise;\n+    std::thread thread([&]() {\n+        protocol->serve(fds[0], \"test-serve\", *init, [&] { promise.set_value(); });\n+    });\n+    promise.get_future().wait();\n+    std::unique_ptr<interfaces::Init> remote_init{protocol->connect(fds[1], \"test-connect\")};\n+    std::unique_ptr<interfaces::Echo> remote_echo{remote_init->makeEcho()};\n+    BOOST_CHECK_EQUAL(remote_echo->echo(\"echo test\"), \"echo test\");\n+    remote_echo.reset();\n+    remote_init.reset();\n+    thread.join();\n+}\n+\n+//! Test ipc::Process bind() and connect() methods connecting over a unix socket.\n+void IpcSocketTest(const fs::path& datadir)\n+{\n+    std::unique_ptr<interfaces::Init> init{std::make_unique<TestInit>()};\n+    std::unique_ptr<ipc::Protocol> protocol{ipc::capnp::MakeCapnpProtocol()};\n+    std::unique_ptr<ipc::Process> process{ipc::MakeProcess()};\n+\n+    std::string invalid_bind{\"invalid:\"};\n+    BOOST_CHECK_THROW(process->bind(datadir, \"test_bitcoin\", invalid_bind), std::invalid_argument);\n+    BOOST_CHECK_THROW(process->connect(datadir, \"test_bitcoin\", invalid_bind), std::invalid_argument);\n+\n+    auto bind_and_listen{[&](const std::string& bind_address) {\n+        std::string address{bind_address};\n+        int serve_fd = process->bind(datadir, \"test_bitcoin\", address);\n+        BOOST_CHECK_GE(serve_fd, 0);\n+        BOOST_CHECK_EQUAL(address, bind_address);\n+        protocol->listen(serve_fd, \"test-serve\", *init);\n+    }};\n+\n+    auto connect_and_test{[&](const std::string& connect_address) {\n+        std::string address{connect_address};\n+        int connect_fd{process->connect(datadir, \"test_bitcoin\", address)};\n+        BOOST_CHECK_EQUAL(address, connect_address);\n+        std::unique_ptr<interfaces::Init> remote_init{protocol->connect(connect_fd, \"test-connect\")};\n+        std::unique_ptr<interfaces::Echo> remote_echo{remote_init->makeEcho()};\n+        BOOST_CHECK_EQUAL(remote_echo->echo(\"echo test\"), \"echo test\");\n+    }};\n+\n+    // Need to specify explicit socket addresses outside the data directory, because the data\n+    // directory path is so long that the default socket address and any other\n+    // addresses in the data directory would fail with errors like:\n+    //   Address 'unix' path '\"/tmp/test_common_Bitcoin Core/ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff/test_bitcoin.sock\"' exceeded maximum socket path length\n+    std::vector<std::string> addresses{\n+        strprintf(\"unix:%s\", TempPath(\"bitcoin_sock0_XXXXXX\")),\n+        strprintf(\"unix:%s\", TempPath(\"bitcoin_sock1_XXXXXX\")),\n+    };\n+\n+    // Bind and listen on multiple addresses\n+    for (const auto& address : addresses) {\n+        bind_and_listen(address);\n+    }\n+\n+    // Connect and test each address multiple times.\n+    for (int i : {0, 1, 0, 0, 1}) {\n+        connect_and_test(addresses[i]);\n+    }\n+}\n+\n BOOST_FIXTURE_TEST_SUITE(ipc_tests, BasicTestingSetup)\n BOOST_AUTO_TEST_CASE(ipc_tests)",
+      "path": "src/ipc/test/ipc_tests.cpp",
+      "position": 198,
+      "original_position": 198,
+      "commit_id": "794940469e77b82462db33011fa4d5e8f533e543",
+      "original_commit_id": "794940469e77b82462db33011fa4d5e8f533e543",
+      "in_reply_to_id": 3658332664,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "This seems better for a followup.",
+      "created_at": "2026-07-28T10:12:19Z",
+      "updated_at": "2026-07-28T10:12:20Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35084#discussion_r3664645092",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3664645092"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35084"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 198,
+      "original_line": 198,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3664692715",
+      "pull_request_review_id": 4796214167,
+      "id": 3664692715,
+      "node_id": "PRRC_kwDOABII587absXr",
+      "diff_hunk": "@@ -130,14 +131,15 @@ class CapnpProtocol : public Protocol\n                 .log_fn = IpcLogFn,\n                 .log_level = GetRequestedIPCLogLevel()\n             };\n-            m_loop.emplace(exe_name, std::move(opts), &m_context);\n+            m_loop.emplace(m_exe_name, std::move(opts), &m_context);\n             m_loop_ref.emplace(*m_loop);\n             promise.set_value();\n             m_loop->loop();\n             m_loop.reset();\n         });\n         promise.get_future().wait();\n     }\n+    const char* m_exe_name;",
+      "path": "src/ipc/capnp/protocol.cpp",
+      "position": 65,
+      "original_position": 65,
+      "commit_id": "33d37f3c35efaac136863253b91799bf2711fd46",
+      "original_commit_id": "33d37f3c35efaac136863253b91799bf2711fd46",
+      "in_reply_to_id": 3658648059,
+      "user": {
+        "login": "Sjors",
+        "id": 10217,
+        "node_id": "MDQ6VXNlcjEwMjE3",
+        "avatar_url": "https://avatars.githubusercontent.com/u/10217?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Sjors",
+        "html_url": "https://github.com/Sjors",
+        "followers_url": "https://api.github.com/users/Sjors/followers",
+        "following_url": "https://api.github.com/users/Sjors/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Sjors/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Sjors/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Sjors/subscriptions",
+        "organizations_url": "https://api.github.com/users/Sjors/orgs",
+        "repos_url": "https://api.github.com/users/Sjors/repos",
+        "events_url": "https://api.github.com/users/Sjors/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Sjors/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I couldn't find a rationale for it in https://github.com/bitcoin/bitcoin/pull/19160 (which introduced the original code). But it seems unrelated to nonunix platform support, so could be a separate PR.",
+      "created_at": "2026-07-28T10:19:12Z",
+      "updated_at": "2026-07-28T10:19:12Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35084#discussion_r3664692715",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3664692715"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35084"
