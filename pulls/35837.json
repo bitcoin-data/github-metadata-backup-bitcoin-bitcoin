@@ -12,12 +12,12 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35837/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35837/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/9467446a9f1ef355e5525a469728340713d7cce4",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
     "number": 35837,
     "state": "open",
     "locked": false,
     "maintainer_can_modify": true,
-    "title": "rpc: fail scanblocks when block filter index is not caught up",
+    "title": "rpc: fail scanblocks when block filter range is unavailable",
     "user": {
       "login": "MicSm",
       "id": 9568528,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "### The issue\r\n\r\n`scanblocks` reads block filters over a range via `LookupFilterRange`. When the\r\nblock filter index is behind the active chain (e.g. right after startup, while\r\nit is still syncing in the background), the lookup for the not yet indexed range\r\nfails. The old code ignored that failure, advanced `start_index` to the end of\r\nthe chunk, and kept going - so the scan skipped every unindexed block and still\r\nreturned `\"completed\": true`.\r\n\r\nThe result is a silent gap: a caller gets a `relevant_blocks` list that looks\r\nfine but is missing any match in the unindexed range, with no way to\r\ndistinguish \"no matches\" from \"range was never scanned\". `getblockfilter`\r\nalready guards against this state and returns an error; `scanblocks` did not.\r\n\r\nNote that `\"completed\"` only means the scan was not aborted - it does not mean\r\nevery filter in the requested range was actually read.\r\n\r\n### Steps to reproduce\r\n\r\n1. Start a node with `-blockfilterindex=1` and let it mine/receive some blocks.\r\n2. Stop the node, delete `<datadir>/<chain>/indexes/blockfilter`, restart with\r\n   `-blockfilterindex=1`.\r\n3. Immediately (before the index finishes rebuilding) call\r\n   `scanblocks start '[\"addr(<addr>)\"]'`.\r\n\r\nBefore this change the call returns `\"completed\": true` with an empty/partial\r\n`relevant_blocks`, silently skipping the range the index had not rebuilt yet.\r\n\r\n### How it is fixed and why\r\n\r\n- Wait for the index before scanning: if `BlockUntilSyncedToCurrentChain()`\r\n  reports the index is still behind, throw the same \"still in the process of\r\n  being indexed\" error that `getblockfilter` uses. This is the correct layer to\r\n  fail at - the RPC cannot produce a complete answer until the index covers the\r\n  requested range, so it should say so instead of returning a partial one.\r\n- Treat a remaining `LookupFilterRange` failure as `RPC_INTERNAL_ERROR`. Once\r\n  the index is confirmed synced, a failed range read is unexpected and indicates\r\n  corruption, so failing loudly is preferable to skipping data.\r\n\r\nThe diff also reindents the match loop: inverting `if (LookupFilterRange(...))`\r\ninto an early `throw` removes one nesting level from the existing body. That\r\nreindentation is a consequence of the bug fix, not a standalone style change.\r\n\r\n### Tests\r\n\r\n- `test/functional/rpc_scanblocks.py` - new `test_scanblocks_requires_synced_index`\r\n  covers the modified code: it wipes the filter index, restarts, and calls\r\n  `scanblocks` in the window before the index catches up, asserting the indexing\r\n  error (and that the scan never reports `completed=true` over a skipped range);\r\n  after the index syncs it checks the same scan completes and finds the match.\r\n  It retries the restart to reliably hit the unsynced window on faster machines.\r\n- The existing `run_test` cases (which `wait_until(... synced ...)` before\r\n  scanning) continue to exercise the normal synced path and the\r\n  `RPC_INTERNAL_ERROR` branch stays on the corruption-only path.\r\n\r\n### AI / tooling note\r\n\r\nI found this regression while reviewing the RPC with an AI-assisted tool I\r\nmaintain, [Boffin](https://github.com/MicSm/boffin) 0.3.2. I reproduced the\r\nunsynced-index behavior myself, chose to mirror `getblockfilter`'s existing\r\nguard, and verified the fix with the functional test above. This PR text and\r\nany review replies are my own.",
+    "body": "### The issue\r\n\r\n`scanblocks` reads block filters over a range via `LookupFilterRange`. When the\r\nblock filter index is behind the active chain (e.g. right after startup, while\r\nit is still syncing in the background), the lookup for the not yet indexed range\r\nfails. The old code ignored that failure, advanced `start_index` to the end of\r\nthe chunk, and kept going - so the scan skipped every unindexed block and still\r\nreturned `\"completed\": true`.\r\n\r\nThe result is a silent gap: a caller gets a `relevant_blocks` list that looks\r\nfine but is missing any match in the unindexed range, with no way to\r\ndistinguish \"no matches\" from \"range was never scanned\".\r\n\r\nNote that `\"completed\"` only means the scan was not aborted - it does not mean\r\nevery filter in the requested range was actually read.\r\n\r\n### Steps to reproduce\r\n\r\n1. Start a node with `-blockfilterindex=1` and let it mine/receive some blocks.\r\n2. Stop the node, delete `<datadir>/<chain>/indexes/blockfilter`, restart with\r\n   `-blockfilterindex=1`.\r\n3. Immediately (before the index finishes rebuilding) call\r\n   `scanblocks start '[\"addr(<addr>)\"]'`.\r\n\r\nBefore this change the call returns `\"completed\": true` with an empty/partial\r\n`relevant_blocks`, silently skipping the range the index had not rebuilt yet.\r\n\r\n### How it is fixed and why\r\n\r\nMirror `getblockfilter`'s error classification:\r\n\r\n- Call `BlockUntilSyncedToCurrentChain()` only to obtain an `index_ready` flag.\r\n  Do **not** fail unconditionally when the index is still behind the tip - the\r\n  requested range may already be available.\r\n- If `LookupFilterRange` fails and the index is not ready, throw the same\r\n  \"still in the process of being indexed\" `RPC_MISC_ERROR` that\r\n  `getblockfilter` uses.\r\n- If `LookupFilterRange` fails after the index is ready, throw\r\n  `RPC_INTERNAL_ERROR` (unexpected / corruption), instead of skipping the chunk.\r\n\r\nThis closes the silent gap without rejecting scans whose range is already\r\ncovered while the index catches up to the tip.\r\n\r\nThe diff also reindents the match loop: inverting `if (LookupFilterRange(...))`\r\ninto an early `throw` removes one nesting level from the existing body. That\r\nreindentation is a consequence of the bug fix, not a standalone style change.\r\n\r\n### Tests\r\n\r\n- `test/functional/rpc_scanblocks.py` - new `test_scanblocks_unindexed_range`\r\n  covers the modified code: it pads the chain, wipes the filter index, restarts,\r\n  and while the index is behind the tip asserts that a scan to the tip returns\r\n  the indexing error, that a scan over an already-written prefix (genesis)\r\n  still succeeds, and that after sync the match is found.\r\n- The existing `run_test` cases (which `wait_until(... synced ...)` before\r\n  scanning) continue to exercise the normal synced path.\r\n\r\n### AI / tooling note\r\n\r\nI found this regression while reviewing the RPC with an AI-assisted tool.\r\nI reproduced the unsynced-index behavior myself, chose to mirror\r\n`getblockfilter`'s existing guard, and verified the fix with the\r\nfunctional test above. This PR text and any review replies are my own.\r\n",
     "labels": [
       {
         "id": 98279177,
@@ -49,14 +49,23 @@
         "name": "RPC/REST/ZMQ",
         "color": "0052cc",
         "default": false
+      },
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
       }
     ],
     "created_at": "2026-07-29T18:17:55Z",
-    "updated_at": "2026-07-30T06:52:43Z",
+    "updated_at": "2026-07-31T11:17:34Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "9f56752535a03ae43e8a84c2abbc1474495a6015",
+    "merge_commit_sha": "4dd71bb8df5474c4580077e5e321a057498934c7",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -64,7 +73,7 @@
     "head": {
       "label": "MicSm:rpc/scanblocks-require-synced-index",
       "ref": "rpc/scanblocks-require-synced-index",
-      "sha": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "sha": "120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
       "user": {
         "login": "MicSm",
         "id": 9568528,
@@ -163,7 +172,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 276387,
+        "size": 276549,
         "default_branch": "master",
         "open_issues_count": 0,
         "is_template": false,
@@ -176,7 +185,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-07-29T18:08:06Z",
+        "pushed_at": "2026-07-31T11:17:17Z",
         "created_at": "2026-07-29T15:26:28Z",
         "updated_at": "2026-07-29T15:26:28Z",
         "allow_forking": true,
@@ -200,7 +209,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "7e5952b0aa04429c88d8ad990f35862421c4fa9d",
+      "sha": "67efced1fc83a0b7215cc1513e7c4754fee0f12f",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -297,12 +306,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39165,
-        "stargazers_count": 89728,
-        "watchers_count": 89728,
-        "size": 320889,
+        "forks_count": 39173,
+        "stargazers_count": 89738,
+        "watchers_count": 89738,
+        "size": 321082,
         "default_branch": "master",
-        "open_issues_count": 680,
+        "open_issues_count": 691,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -319,9 +328,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-07-29T23:04:32Z",
+        "pushed_at": "2026-07-30T11:32:31Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-07-30T04:59:10Z",
+        "updated_at": "2026-07-31T20:40:16Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -347,54 +356,14 @@
     },
     "author_association": "NONE",
     "draft": false,
-    "additions": 72,
+    "additions": 81,
     "deletions": 13,
     "changed_files": 2,
     "commits": 1,
-    "review_comments": 0,
+    "review_comments": 2,
     "comments": 2
   },
   "events": [
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDk0Njc0NDZhOWYxZWYzNTVlNTUyNWE0Njk3MjgzNDA3MTNkN2NjZTQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9467446a9f1ef355e5525a469728340713d7cce4",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/9467446a9f1ef355e5525a469728340713d7cce4",
-      "tree": {
-        "sha": "f2ef37d36b64a0d6c05ac7c6471ef3a47342e067",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f2ef37d36b64a0d6c05ac7c6471ef3a47342e067"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7e5952b0aa04429c88d8ad990f35862421c4fa9d",
-          "sha": "7e5952b0aa04429c88d8ad990f35862421c4fa9d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7e5952b0aa04429c88d8ad990f35862421c4fa9d"
-        }
-      ],
-      "message": "rpc: fail scanblocks when block filter index is not caught up\n\nPreviously LookupFilterRange failures were ignored and the scan\ncontinued, so an unsynced filter index could return completed:true\nwith silent gaps. Require the index to be caught up before scanning\n(matching getblockfilter), and treat remaining lookup failures as\ninternal errors rather than skipping ranges.",
-      "committer": {
-        "name": "Mike Semikov",
-        "email": "mikhail.semikov@gmail.com",
-        "date": "2026-07-29T17:52:07Z"
-      },
-      "author": {
-        "name": "Mike Semikov",
-        "email": "mikhail.semikov@gmail.com",
-        "date": "2026-07-29T17:50:44Z"
-      },
-      "sha": "9467446a9f1ef355e5525a469728340713d7cce4"
-    },
     {
       "event": "labeled",
       "id": 28678856874,
@@ -460,9 +429,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2026-07-29T18:18:03Z",
-      "updated_at": "2026-07-30T06:52:43Z",
+      "updated_at": "2026-07-31T11:17:34Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/35837.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [maflcko](https://github.com/bitcoin/bitcoin/pull/35837#issuecomment-5127611820) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35582](https://github.com/bitcoin/bitcoin/pull/35582) (rpc: reject null for optional parameters by RuslanProgrammer)\n* [#35229](https://github.com/bitcoin/bitcoin/pull/35229) (refactor: Use CBlockIndex parameters as reference by optout21)\n* [#24230](https://github.com/bitcoin/bitcoin/pull/24230) (indexes: Stop using node internal types and locking cs_main, improve sync logic by ryanofsky)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/35837.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [maflcko](https://github.com/bitcoin/bitcoin/pull/35837#issuecomment-5127611820) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35582](https://github.com/bitcoin/bitcoin/pull/35582) (rpc: reject null for optional parameters by RuslanProgrammer)\n* [#35229](https://github.com/bitcoin/bitcoin/pull/35229) (refactor: Use CBlockIndex parameters as reference by optout21)\n* [#24230](https://github.com/bitcoin/bitcoin/pull/24230) (indexes: Stop using node internal types and locking cs_main, improve sync logic by ryanofsky)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible places where named args for integral literals may be used (e.g. `func(x, /*named_arg=*/0)` in C++, and `func(x, named_arg=0)` in Python):\n\n- `node.scanblocks(\"start\", [f\"addr({addr})\"], 0, tip)` in `test/functional/rpc_scanblocks.py`\n- `node.scanblocks(\"start\", [f\"addr({addr})\"], 0, 0)` in `test/functional/rpc_scanblocks.py`\n\n\n\n<sup>2026-07-31 11:17:34</sup>\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -545,7 +514,334 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/35837#issuecomment-5127611820",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35837"
+    },
+    {
+      "event": "reviewed",
+      "id": 4823109371,
+      "node_id": "PRR_kwDOABII588AAAABH3rO-w",
+      "url": null,
+      "actor": null,
+      "commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "commit_url": null,
+      "created_at": null,
+      "updated_at": "2026-07-30T20:47:45Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "> getblockfilter already guards against this state and returns an error; \r\n\r\nWhat this is doing here is different from what `getblockfilter` does. There we don't fail unconditionally if the index isn't synced. We only fail if we the range isn't available. This makes sense because we may have the range available even if the index isn't synced to the tip yet. I don't see why we shouldn't be able to do it the same way here.",
+      "user": {
+        "login": "fjahr",
+        "id": 1322187,
+        "node_id": "MDQ6VXNlcjEzMjIxODc=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1322187?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/fjahr",
+        "html_url": "https://github.com/fjahr",
+        "followers_url": "https://api.github.com/users/fjahr/followers",
+        "following_url": "https://api.github.com/users/fjahr/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/fjahr/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/fjahr/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/fjahr/subscriptions",
+        "organizations_url": "https://api.github.com/users/fjahr/orgs",
+        "repos_url": "https://api.github.com/users/fjahr/repos",
+        "events_url": "https://api.github.com/users/fjahr/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/fjahr/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35837#pullrequestreview-4823109371",
+      "submitted_at": "2026-07-30T20:47:45Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35837"
+    },
+    {
+      "event": "labeled",
+      "id": 28744532339,
+      "node_id": "LE_lADOABII588AAAABKsMFRc8AAAAGsU7Bcw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/28744532339",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-07-30T20:51:06Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "reviewed",
+      "id": 4823161118,
+      "node_id": "PRR_kwDOABII588AAAABH3uZHg",
+      "url": null,
+      "actor": null,
+      "commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "commit_url": null,
+      "created_at": null,
+      "updated_at": "2026-07-30T20:55:30Z",
+      "author_association": "CONTRIBUTOR",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35837#pullrequestreview-4823161118",
+      "submitted_at": "2026-07-30T20:55:29Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35837"
+    },
+    {
+      "event": "renamed",
+      "id": 28764828524,
+      "node_id": "RTE_lADOABII588AAAABKsMFRc8AAAAGsoRzbA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/28764828524",
+      "actor": {
+        "login": "MicSm",
+        "id": 9568528,
+        "node_id": "MDQ6VXNlcjk1Njg1Mjg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/9568528?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/MicSm",
+        "html_url": "https://github.com/MicSm",
+        "followers_url": "https://api.github.com/users/MicSm/followers",
+        "following_url": "https://api.github.com/users/MicSm/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/MicSm/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/MicSm/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/MicSm/subscriptions",
+        "organizations_url": "https://api.github.com/users/MicSm/orgs",
+        "repos_url": "https://api.github.com/users/MicSm/repos",
+        "events_url": "https://api.github.com/users/MicSm/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/MicSm/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-07-31T07:45:50Z",
+      "rename": {
+        "from": "rpc: fail scanblocks when block filter index is not caught up",
+        "to": "rpc: fail scanblocks when block filter range is unavailable"
+      }
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDEyMGI4ZTQyOTljM2UxYmVhMmNiNmQ0NGE2OWZiZjMyZjQyZDlmZTk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
+      "tree": {
+        "sha": "adcb65973681a6bffca5f2b09674347c3ae18370",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/adcb65973681a6bffca5f2b09674347c3ae18370"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7e5952b0aa04429c88d8ad990f35862421c4fa9d",
+          "sha": "7e5952b0aa04429c88d8ad990f35862421c4fa9d",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7e5952b0aa04429c88d8ad990f35862421c4fa9d"
+        }
+      ],
+      "message": "rpc: fail scanblocks when block filter range is unavailable\n\nscanblocks reads block filters over a range with LookupFilterRange. A\nfailed read was ignored, so the scan skipped the affected blocks and\nstill returned \"completed\": true, hiding the gap from the caller.\n\nReport the failure instead. As getblockfilter does, it is returned as\n\"still being indexed\" while the index is behind the tip and as an\ninternal error once synced, so a scan whose range is already available\nkeeps working.\n\nAdd functional test coverage for the unindexed-tip error and for a\nsuccessful scan over an already-indexed range.",
+      "committer": {
+        "name": "Mike Semikov",
+        "email": "mikhail.semikov@gmail.com",
+        "date": "2026-07-31T11:09:50Z"
+      },
+      "author": {
+        "name": "Mike Semikov",
+        "email": "mikhail.semikov@gmail.com",
+        "date": "2026-07-29T17:50:44Z"
+      },
+      "sha": "120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 28773284521,
+      "node_id": "HRFPE_lADOABII588AAAABKsMFRc8AAAAGswV6qQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/28773284521",
+      "actor": {
+        "login": "MicSm",
+        "id": 9568528,
+        "node_id": "MDQ6VXNlcjk1Njg1Mjg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/9568528?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/MicSm",
+        "html_url": "https://github.com/MicSm",
+        "followers_url": "https://api.github.com/users/MicSm/followers",
+        "following_url": "https://api.github.com/users/MicSm/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/MicSm/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/MicSm/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/MicSm/subscriptions",
+        "organizations_url": "https://api.github.com/users/MicSm/orgs",
+        "repos_url": "https://api.github.com/users/MicSm/repos",
+        "events_url": "https://api.github.com/users/MicSm/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/MicSm/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
+      "commit_url": "https://api.github.com/repos/MicSm/bitcoin/commits/120b8e4299c3e1bea2cb6d44a69fbf32f42d9fe9",
+      "created_at": "2026-07-31T11:17:18Z"
     }
   ],
-  "comments": []
+  "comments": [
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3686141427",
+      "pull_request_review_id": 4823109371,
+      "id": 3686141427,
+      "node_id": "PRRC_kwDOABII587btg3z",
+      "diff_hunk": "@@ -2646,6 +2646,13 @@ static RPCMethod scanblocks()\n         CHECK_NONFATAL(start_index);\n         CHECK_NONFATAL(stop_block);\n \n+        // Bail out if the filter index is behind the active chain, as getblockfilter",
+      "path": "src/rpc/blockchain.cpp",
+      "position": 1,
+      "original_position": 4,
+      "commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "original_commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "fjahr",
+        "id": 1322187,
+        "node_id": "MDQ6VXNlcjEzMjIxODc=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1322187?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/fjahr",
+        "html_url": "https://github.com/fjahr",
+        "followers_url": "https://api.github.com/users/fjahr/followers",
+        "following_url": "https://api.github.com/users/fjahr/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/fjahr/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/fjahr/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/fjahr/subscriptions",
+        "organizations_url": "https://api.github.com/users/fjahr/orgs",
+        "repos_url": "https://api.github.com/users/fjahr/repos",
+        "events_url": "https://api.github.com/users/fjahr/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/fjahr/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "This is incorrect, `getblockfilter` does not do this: https://github.com/bitcoin/bitcoin/blob/67efced1fc83a0b7215cc1513e7c4754fee0f12f/src/rpc/blockchain.cpp#L3008",
+      "created_at": "2026-07-30T20:47:21Z",
+      "updated_at": "2026-07-30T20:47:45Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35837#discussion_r3686141427",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3686141427"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35837"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 2649,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3686185158",
+      "pull_request_review_id": 4823161118,
+      "id": 3686185158,
+      "node_id": "PRRC_kwDOABII587btrjG",
+      "diff_hunk": "@@ -134,6 +135,56 @@ def run_test(self):\n         # test invalid command\n         assert_raises_rpc_error(-8, \"Invalid action 'foobar'\", node.scanblocks, \"foobar\")\n \n+        self.test_scanblocks_requires_synced_index()\n+\n+    def test_scanblocks_requires_synced_index(self):\n+        \"\"\"scanblocks must refuse to run while the filter index is behind the tip.\n+\n+        A scan over a not-yet-indexed range used to skip it silently and still\n+        report completed=true, so a caller could not tell an empty result from an\n+        incomplete one. getblockfilter already rejects that state; scanblocks\n+        should behave the same.\n+        \"\"\"\n+        node = self.nodes[0]\n+        wallet = MiniWallet(node)\n+\n+        _, spk, addr = getnewdestination()\n+        wallet.send_to(from_node=node, scriptPubKey=spk, amount=1 * COIN)\n+        match_hash = self.generate(node, 1)[0]\n+\n+        # The index sync runs in a background thread that is started during init,\n+        # before the RPC server comes up, so right after a restart with a wiped\n+        # filter index the node is briefly behind the tip. Catch that window and\n+        # confirm the scan is refused. A fast machine can finish the sync before we\n+        # get to scan, so retry until we actually observe the unsynced state.\n+        self.log.info(\"scanblocks errors while the filter index is still behind the tip\")\n+        for _ in range(10):\n+            self.stop_node(0)\n+            self.cleanup_folder(node.chain_path / \"indexes\" / \"blockfilter\")\n+            self.start_node(0, extra_args=[\"-blockfilterindex=1\"])\n+            behind_tip = not node.getindexinfo()[\"basic block filter index\"][\"synced\"]\n+            try:\n+                out = node.scanblocks(\"start\", [f\"addr({addr})\"])\n+            except JSONRPCException as e:\n+                assert_equal(e.error[\"code\"], -1)\n+                assert \"Block filters are still in the process of being indexed\" in e.error[\"message\"]\n+                break\n+            # The scan returned instead of erroring. If the index was still behind\n+            # the tip it must not have quietly skipped the missing range and marked\n+            # the scan completed -- that silent gap is the regression guarded here.\n+            if behind_tip:\n+                assert (not out[\"completed\"]) or (match_hash in out[\"relevant_blocks\"]), \\\n+                    \"scanblocks skipped an unindexed range but still reported completed=true\"\n+            # Index had already caught up; retry to catch it mid-sync.\n+        else:\n+            raise AssertionError(\"filter index synced too quickly to exercise the unsynced path\")",
+      "path": "test/functional/rpc_scanblocks.py",
+      "position": 1,
+      "original_position": 54,
+      "commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "original_commit_id": "9467446a9f1ef355e5525a469728340713d7cce4",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "the ci fails here:\n\n                                   AssertionError: filter index synced too quickly to exercise the unsynced path",
+      "created_at": "2026-07-30T20:55:29Z",
+      "updated_at": "2026-07-30T20:55:29Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35837#discussion_r3686185158",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3686185158"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35837"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": null,
+      "original_line": 180,
+      "side": "RIGHT"
+    }
+  ]
 }
