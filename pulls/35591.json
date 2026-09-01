@@ -43,11 +43,11 @@
     "body": "Erlay Project Tracking: [#30249](https://github.com/bitcoin/bitcoin/issues/30249)\r\nConceptual Discussion: [#34542](https://github.com/bitcoin/bitcoin/issues/34542)\r\n\r\n---\r\n\r\nThis is a full implementation of Erlay. Its purpose is to check the integrity and correctness of the implementation against changes/additions that may originate from the review process and/or rebases on top of newer functionality.\r\n\r\nThis is not to be merged. Functionality will be spread across multiple smaller PRs to ease the review process.\r\n\r\n---\r\n## Approach\r\n\r\nThis approach uses Erlay as a fallback mechanism for transaction propagation. Instead of mixing fanout and reconciliation into a single connection type, the current approach leaves the existing connections as they are, and adds additional low-bandwidth connections to be used in case the node is being eclipsed. This connections should have minimal cost under normal circumstances, and only undergo real traffic in case other 8 full-outbound connections are being captured.\r\n\r\n## outbound-full-reconciliation connections\r\n\r\nFor now, we are adding 4 additional reconciliation-only connections to the node while we test it's impact on real node running the approach. Further analysis may be needed to pick a meaningful value for this. The number of inbound connections should also be scaled based on how many connections we are adding.",
     "labels": [],
     "created_at": "2026-06-23T12:40:28Z",
-    "updated_at": "2026-08-31T18:12:20Z",
+    "updated_at": "2026-09-01T09:20:58Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "f8e183dffc8e59b176ed661b5a77c4d758cb9778",
+    "merge_commit_sha": "1d916a892e928a715bb44bc7ae321899a84ad5fa",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -289,12 +289,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39362,
-        "stargazers_count": 90060,
-        "watchers_count": 90060,
-        "size": 323279,
+        "forks_count": 39363,
+        "stargazers_count": 90077,
+        "watchers_count": 90077,
+        "size": 323354,
         "default_branch": "master",
-        "open_issues_count": 714,
+        "open_issues_count": 715,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -311,9 +311,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-08-31T17:57:38Z",
+        "pushed_at": "2026-09-01T08:52:04Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-08-31T18:57:50Z",
+        "updated_at": "2026-09-01T09:45:21Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -343,7 +343,7 @@
     "deletions": 311,
     "changed_files": 28,
     "commits": 34,
-    "review_comments": 3,
+    "review_comments": 5,
     "comments": 13
   },
   "events": [
@@ -3876,6 +3876,114 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3897104353"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35591"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 5484,
+      "original_line": 5484,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3902587961",
+      "pull_request_review_id": 5076192688,
+      "id": 3902587961,
+      "node_id": "PRRC_kwDOABII587onMQ5",
+      "diff_hunk": "@@ -0,0 +1,848 @@\n+// Copyright (c) 2022-present The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or http://www.opensource.org/licenses/mit-license.php.\n+\n+#include <logging.h>\n+#include <node/minisketchwrapper.h>\n+#include <node/txreconciliation.h>\n+#include <node/txreconciliation_impl.h>\n+\n+#include <common/system.h>\n+#include <util/check.h>\n+#include <util/log.h>\n+\n+#include <cmath>\n+#include <unordered_map>\n+#include <variant>\n+\n+namespace node {\n+uint32_t TxReconciliationState::ComputeShortID(const Wtxid& wtxid) const\n+{\n+    const uint32_t short_txid = 1 + (m_hasher(wtxid.ToUint256()) % 0xFFFFFFFF);\n+    return short_txid;\n+}\n+\n+bool TxReconciliationState::HasCollision(const Wtxid& wtxid, Wtxid& collision, uint32_t &short_id)\n+{\n+    short_id = TxReconciliationState::ComputeShortID(wtxid);\n+    const auto iter = m_short_id_mapping.find(short_id);\n+\n+    if (iter != m_short_id_mapping.end()) {\n+        collision = iter->second;\n+        return true;\n+    }\n+\n+    return false;\n+}\n+\n+uint32_t TxReconciliationState::EstimateSketchCapacity(size_t local_set_size) const\n+{\n+    const auto set_size_diff = static_cast<uint16_t>(std::abs(int(local_set_size) - int(m_remote_set_size)));\n+    const uint16_t min_size = std::min(uint16_t(local_set_size), m_remote_set_size);\n+    // Round up to match the bias the sender applied to q (check BIP-330) and to err on the side of a larger sketch\n+    // (an under-estimate forces an extension round-trip).\n+    const auto weighted_min_size = static_cast<uint32_t>(std::ceil(m_remote_q * min_size));\n+    const uint32_t estimated_diff = 1 + weighted_min_size + set_size_diff;\n+    return minisketch_compute_capacity(RECON_FIELD_SIZE, estimated_diff, RECON_FALSE_POSITIVE_COEF);\n+}\n+\n+Minisketch TxReconciliationState::ComputeBaseSketch(uint32_t capacity)\n+{\n+    // Make sure the capacity is within bounds\n+    Assume(capacity > 0 && capacity <= MAX_SKETCH_CAPACITY);\n+\n+    Minisketch sketch = node::MakeMinisketch32(capacity);\n+\n+    for (const auto& wtxid : m_local_set) {\n+        sketch.Add(ComputeShortID(wtxid));\n+    }\n+\n+    return sketch;\n+}\n+\n+Minisketch TxReconciliationState::ComputeExtendedSketch(uint32_t extended_capacity) const\n+{\n+    Assume(extended_capacity > 0);\n+    // This can't happen because we should have terminated reconciliation early.\n+    Assume(m_local_set_snapshot.size() > 0);\n+\n+    // For now, compute a sketch of twice the capacity were computed originally.\n+    // TODO: optimize by computing the extension *on top* of the existent sketch\n+    // instead of computing the lower order elements again. This may need upstream\n+    // changes to minisketch.\n+    Minisketch sketch = node::MakeMinisketch32(extended_capacity);\n+\n+    // We don't have to recompute short IDs here.\n+    for (const auto& [short_id, wtxid] : m_short_id_mapping_snapshot) {\n+        sketch.Add(short_id);\n+    }\n+    return sketch;\n+}\n+\n+void TxReconciliationState::SnapshotLocalSet()\n+{\n+    Assume(m_local_set_snapshot.empty());\n+    m_local_set_snapshot.insert(m_local_set.begin(), m_local_set.end());\n+    m_short_id_mapping_snapshot = m_short_id_mapping;\n+    m_local_set.clear();\n+    m_short_id_mapping.clear();\n+}\n+\n+void TxReconciliationState::Clear()\n+{\n+    // If we are in the middle of an extension phase, we want to keep the data stored in the local\n+    // set for the next round, as this contains transactions that have been received while reconciling\n+    if (m_we_initiate && m_phase != ReconciliationPhase::EXT_REQUESTED) ClearLocalSet();\n+    ClearLocalSetSnapshot();\n+    m_phase = ReconciliationPhase::NONE;\n+}\n+\n+void TxReconciliationState::PrepareForExtensionRequest(uint16_t sketch_capacity)\n+{\n+    Assume(!m_we_initiate);\n+    // Remember the current capacity so we can double it if the Sketch decoding fails on the peer's end.\n+    m_capacity_snapshot = sketch_capacity;\n+    SnapshotLocalSet();\n+}\n+\n+void TxReconciliationState::PrepareForExtensionResponse(const std::vector<uint8_t>& remote_sketch)\n+{\n+    Assume(m_we_initiate);\n+    m_remote_sketch_snapshot = remote_sketch;\n+    SnapshotLocalSet();\n+}\n+\n+std::vector<Wtxid> TxReconciliationState::GetAllTransactions(bool from_snapshot) const\n+{\n+    return from_snapshot ? std::vector<Wtxid>(m_local_set_snapshot.begin(), m_local_set_snapshot.end()) :\n+                        std::vector<Wtxid>(m_local_set.begin(), m_local_set.end());\n+}\n+\n+std::pair<std::vector<uint32_t>, std::vector<Wtxid>> TxReconciliationState::GetRelevantIDsFromShortIDs(const std::vector<uint64_t>& diff, bool from_snapshot) const\n+{\n+    const auto& working_mapping = from_snapshot ? m_short_id_mapping_snapshot : m_short_id_mapping;\n+\n+    std::vector<Wtxid> remote_missing{};\n+    std::vector<uint32_t> local_missing{};\n+    // diff elements are 64-bit since Minisketch::Decode works with 64-bit elements, no matter what the field element size is.\n+    // In our case, elements are always 32-bit long, so we can safely cast them down.\n+    for (const auto& diff_short_id : diff) {\n+        // Make sure we are within the 32-bit range.\n+        Assume(diff_short_id <= std::numeric_limits<uint32_t>::max());\n+        const auto local_tx = working_mapping.find(diff_short_id);\n+        if (local_tx != working_mapping.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        } else {\n+            local_missing.push_back(diff_short_id);\n+        }\n+    }\n+\n+    return std::make_pair(local_missing, remote_missing);\n+}\n+\n+std::vector<Wtxid> TxReconciliationState::GetWtxidsFromShortIDs(const std::vector<uint32_t>& remote_missing_short_ids) const\n+{\n+    std::vector<Wtxid> remote_missing;\n+    // A short id repeated by the peer refers to the same transaction, so only look each one up once.\n+    std::set<uint32_t> unique_short_ids{remote_missing_short_ids.begin(), remote_missing_short_ids.end()};\n+    for (const auto& missing_short_id : unique_short_ids) {\n+        const auto local_tx = m_short_id_mapping_snapshot.find(missing_short_id);\n+        if (local_tx != m_short_id_mapping_snapshot.end()) {\n+            remote_missing.push_back(local_tx->second);\n+        }\n+    }\n+    return remote_missing;\n+}\n+\n+/** Actual implementation for TxReconciliationTracker's data structure. */\n+class TxReconciliationTrackerImpl {\n+private:\n+    mutable Mutex m_txreconciliation_mutex;\n+\n+    // Local protocol version\n+    uint32_t m_recon_version;\n+\n+    /**\n+     * Keeps track of txreconciliation states of eligible peers.\n+     * For pre-registered peers, the locally generated salt is stored.\n+     * For registered peers, the locally generated salt is forgotten, and the state (including\n+     * \"full\" salt) is stored instead.\n+     */\n+    std::unordered_map<NodeId, std::variant<uint64_t, TxReconciliationState>> m_states GUARDED_BY(m_txreconciliation_mutex);\n+\n+    /**\n+     * Maintains a queue of reconciliations we should initiate. To achieve higher bandwidth conservation and avoid overflows,\n+     * we should reconcile in the same order, because then it’s easier to estimate set difference size.\n+     */\n+    std::deque<NodeId> m_queue GUARDED_BY(m_txreconciliation_mutex);\n+\n+    /** Make reconciliation requests periodically to make reconciliations efficient. */\n+    std::chrono::microseconds m_next_recon_request GUARDED_BY(m_txreconciliation_mutex){0};\n+\n+    TxReconciliationState* GetRegisteredPeerState(NodeId peer_id) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        AssertLockHeld(m_txreconciliation_mutex);\n+        auto salt_or_state = m_states.find(peer_id);\n+        if (salt_or_state == m_states.end()) return nullptr;\n+\n+        return std::get_if<TxReconciliationState>(&salt_or_state->second);\n+    }\n+\n+    /**\n+     * Schedules the a reconciliation request with the next outbound peer in our reconciliation queue.\n+     * The next time depends on the number of peers on our queue, so we can reconcile with all out outbound neighborhood\n+     * once every RECON_REQUEST_INTERVAL.\n+     */\n+    void ScheduleNextReconRequest(std::chrono::microseconds now) EXCLUSIVE_LOCKS_REQUIRED(m_txreconciliation_mutex)\n+    {\n+        // We have one timer for the entire queue. This is safe because we initiate reconciliations\n+        // with outbound connections, which are unlikely to game this timer in a serious way.\n+        // FIXME: This is not great. If two nodes get added back to back, the second peer would have to\n+        // wait for 3*RECON_REQUEST_INTERVAL/2 instead of RECON_REQUEST_INTERVAL/2 seconds to reconcile.\n+        Assume(!m_queue.empty());\n+        m_next_recon_request = now + (RECON_REQUEST_INTERVAL / m_queue.size());\n+    }\n+\n+    std::variant<HandleSketchResult, ReconciliationError> HandleInitialSketch(TxReconciliationState& peer_state, const NodeId peer_id, const std::vector<uint8_t>& skdata) const\n+    {\n+        Assume(peer_state.m_we_initiate);\n+        Assume(peer_state.m_phase == ReconciliationPhase::INIT_REQUESTED);\n+\n+        // The serialized remote sketch size needs to be a multiple of the sketch element size, otherwise we received a malformed sketch.\n+        if (skdata.size() % BYTES_PER_SKETCH_CAPACITY != 0) return ReconciliationError::PROTOCOL_VIOLATION;\n+\n+        auto remote_sketch_capacity = uint32_t(skdata.size() / BYTES_PER_SKETCH_CAPACITY);\n+        // Protocol violation: our peer exceeded the sketch capacity, or sent a malformed sketch.\n+        // TODO: benchmarks show decode is quadratic in capacity (~3s at MAX_SKETCH_CAPACITY), while a\n+        // conformant peer never needs more than ~MAX_RECONSET_SIZE. Consider lowering this bound.\n+        if (remote_sketch_capacity > MAX_SKETCH_CAPACITY) return ReconciliationError::PROTOCOL_VIOLATION;\n+\n+        std::optional<Minisketch> local_sketch, remote_sketch;\n+        if (remote_sketch_capacity != 0) {\n+            remote_sketch = node::MakeMinisketch32(remote_sketch_capacity).Deserialize(skdata);\n+\n+            if (!peer_state.m_local_set.empty()) {\n+                local_sketch = peer_state.ComputeBaseSketch(remote_sketch_capacity);\n+            }\n+        }\n+\n+        std::vector<uint32_t> txs_to_request;\n+        std::vector<Wtxid> txs_to_announce;\n+        std::optional<bool> result;\n+\n+        // Remote sketch is empty in two cases per which reconciliation is pointless:\n+        // 1. the peer has no transactions for us\n+        // 2. we told the peer we have no transactions for them while initiating reconciliation.\n+        // In case (2), local sketch is also empty.\n+        if (!remote_sketch.has_value() || !local_sketch.has_value()) {\n+            // Announce all transactions we have.\n+            txs_to_announce = peer_state.GetAllTransactions(/*from_snapshot=*/false);\n+            // Update local reconciliation state for the peer.\n+            peer_state.Clear();\n+\n+            result = false;\n+            LogDebug(BCLog::TXRECONCILIATION, \"Reconciliation we initiated with peer=%d terminated due to empty sketch. \" /* Continued */\n+                                              \"Announcing all %i transactions from the local set.\\n\", peer_id, txs_to_announce.size());\n+        } else {\n+            // Attempt to decode the set difference\n+            size_t max_elements = minisketch_compute_max_elements(RECON_FIELD_SIZE, remote_sketch_capacity, RECON_FALSE_POSITIVE_COEF);\n+            std::vector<uint64_t> differences(max_elements);\n+            if (local_sketch.value().Merge(remote_sketch.value()).Decode(differences)) {\n+                // Initial reconciliation step succeeded.\n+                // Identify locally/remotely missing transactions.\n+                std::tie(txs_to_request, txs_to_announce) = peer_state.GetRelevantIDsFromShortIDs(differences, /*from_snapshot=*/false);\n+                // Update local reconciliation state for the peer.\n+                peer_state.Clear();\n+\n+                result = true;\n+                LogDebug(BCLog::TXRECONCILIATION, \"Reconciliation we initiated with peer=%d has succeeded at initial step, request %i txs, announce %i txs.\\n\",\n+                    peer_id, txs_to_request.size(), txs_to_announce.size());\n+            } else {\n+                // Initial reconciliation step failed.\n+                // Update local reconciliation state for the peer.\n+                peer_state.PrepareForExtensionResponse(skdata);\n+                peer_state.m_phase = ReconciliationPhase::EXT_REQUESTED;\n+\n+                result = std::nullopt;\n+                LogDebug(BCLog::TXRECONCILIATION, \"Reconciliation we initiated with peer=%d has failed at initial step, request sketch extension.\\n\", peer_id);\n+            }\n+        }\n+\n+        return HandleSketchResult{txs_to_request, txs_to_announce, result};\n+    }\n+\n+    std::variant<HandleSketchResult, ReconciliationError> HandleSketchExtension(TxReconciliationState& peer_state, const NodeId peer_id, const std::vector<uint8_t>& skdata)\n+    {\n+        Assume(peer_state.m_we_initiate);\n+        Assume(peer_state.m_phase == ReconciliationPhase::EXT_REQUESTED);\n+\n+        // The serialized extension size needs to be a multiple of the sketch element size, otherwise we received a malformed extension.\n+        size_t extended_sketch_size = peer_state.m_remote_sketch_snapshot.size() + skdata.size();\n+        if (extended_sketch_size % BYTES_PER_SKETCH_CAPACITY != 0) return ReconciliationError::PROTOCOL_VIOLATION;\n+\n+        // We allow the peer to send an extension for any capacity, not just original capacity * 2,\n+        // but it should be within the limits. The limits are MAX_SKETCH_CAPACITY * 2, so that\n+        // they can extend even the largest (originally) sketch.\n+        // TODO: benchmarks show decode is quadratic in capacity (~12s at MAX_SKETCH_CAPACITY * 2),",
+      "path": "src/node/txreconciliation_impl.cpp",
+      "position": 286,
+      "original_position": 286,
+      "commit_id": "534a89069d594a05e6bfb15858046464b05fbc9e",
+      "original_commit_id": "534a89069d594a05e6bfb15858046464b05fbc9e",
+      "in_reply_to_id": 3897073818,
+      "user": {
+        "login": "sr-gi",
+        "id": 6665628,
+        "node_id": "MDQ6VXNlcjY2NjU2Mjg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6665628?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sr-gi",
+        "html_url": "https://github.com/sr-gi",
+        "followers_url": "https://api.github.com/users/sr-gi/followers",
+        "following_url": "https://api.github.com/users/sr-gi/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sr-gi/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sr-gi/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sr-gi/subscriptions",
+        "organizations_url": "https://api.github.com/users/sr-gi/orgs",
+        "repos_url": "https://api.github.com/users/sr-gi/repos",
+        "events_url": "https://api.github.com/users/sr-gi/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sr-gi/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Yes, I think it can. I left a comment on this earlier on the PR.\r\n\r\nGiven this is quadratic, I think limiting the size of the sketch (and potentially getting rid of extensions) will make it less of an issue.\r\n\r\nhttps://github.com/bitcoin/bitcoin/pull/35591#issuecomment-5354604209",
+      "created_at": "2026-09-01T09:11:05Z",
+      "updated_at": "2026-09-01T09:11:05Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35591#discussion_r3902587961",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3902587961"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35591"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 286,
+      "original_line": 286,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3902663460",
+      "pull_request_review_id": 5076282547,
+      "id": 3902663460,
+      "node_id": "PRRC_kwDOABII587onesk",
+      "diff_hunk": "@@ -5346,6 +5401,117 @@ void PeerManagerImpl::ProcessMessage(Peer& peer, CNode& pfrom, const std::string\n         return;\n     }\n \n+    // Only respond to reconciliation messages if this is a reconciliation connection.\n+    // Disconnect otherwise.\n+    if (!m_txreconciliation && (msg_type == NetMsgType::REQTXRCNCL || msg_type == NetMsgType::SKETCH ||\n+        msg_type == NetMsgType::REQSKETCHEXT || msg_type == NetMsgType::RECONCILDIFF)) {\n+        LogDebug(BCLog::NET, \"%s received, but we don't have reconciliation enabled, %s\", msg_type, pfrom.DisconnectMsg());\n+        pfrom.fDisconnect = true;\n+        return;\n+    }\n+\n+    if (msg_type == NetMsgType::REQTXRCNCL) {\n+        uint16_t peer_recon_set_size, peer_q;\n+        vRecv >> peer_recon_set_size >> peer_q;\n+        if (auto error = m_txreconciliation->HandleReconciliationRequest(pfrom.GetId(), peer_recon_set_size, peer_q); error.has_value()) {\n+            switch(error.value()) {\n+                case node::ReconciliationError::NOT_FOUND:\n+                    LogInfo(\"Peer is requesting reconciliation but never registered, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::WRONG_PHASE:\n+                    LogInfo(\"Peer is requesting reconciliation out of order, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::WRONG_ROLE:\n+                    LogInfo(\"Peer is requesting reconciliation but we are the initiator, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::PROTOCOL_VIOLATION:\n+                    LogInfo(\"Peer is requesting reconciliation with an out-of-range q, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                default: break; // No other error is returned by HandleReconciliationRequest\n+            }\n+            pfrom.fDisconnect = true;\n+        }\n+        return;\n+    }\n+\n+    if (msg_type == NetMsgType::SKETCH) {\n+        std::vector<uint8_t> skdata;\n+        vRecv >> skdata;\n+\n+        auto result = m_txreconciliation->HandleSketch(pfrom.GetId(), skdata);\n+        if (auto handle_sketch_result = std::get_if<node::HandleSketchResult>(&result)) {\n+            if (handle_sketch_result->m_succeeded.has_value()) {\n+                // Handles both successful and failed reconciliation (but not the case per which we want to request extension).\n+                MakeAndPushMessage(pfrom, NetMsgType::RECONCILDIFF, handle_sketch_result->m_succeeded.value(), handle_sketch_result->m_txs_to_request);\n+                AnnounceReconciliationTxs(handle_sketch_result->m_txs_to_announce, pfrom);\n+            } else {\n+                // No final result means we should request sketch extension to make another\n+                // reconciliation attempt without losing the initial data.\n+                MakeAndPushMessage(pfrom, NetMsgType::REQSKETCHEXT);\n+            }\n+        } else {\n+            // Disconnect peers that send reconciliation sketch violating the protocol.\n+            LogDebug(BCLog::NET, \"sketch from peer=%d violates reconciliation protocol; disconnecting\\n\", pfrom.GetId());\n+            pfrom.fDisconnect = true;\n+            return;\n+        }\n+        return;\n+    }\n+\n+    if (msg_type == NetMsgType::REQSKETCHEXT) {\n+        if (auto error = m_txreconciliation->HandleExtensionRequest(pfrom.GetId())) {\n+            switch(error.value()) {\n+                case node::ReconciliationError::NOT_FOUND:\n+                    LogInfo(\"Peer is requesting a reconciliation extension but never registered, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::WRONG_PHASE:\n+                    LogInfo(\"Peer is requesting a reconciliation extension out of order, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::WRONG_ROLE:\n+                    LogInfo(\"Peer is requesting a reconciliation extension but we are the initiator, %s\\n\", pfrom.DisconnectMsg());\n+                    break;\n+                case node::ReconciliationError::PROTOCOL_VIOLATION:\n+                default: break; // No other error is returned by HandleExtensionRequest\n+            }\n+            pfrom.fDisconnect = true;\n+        }\n+        return;\n+    }\n+\n+    // Among transactions requested by short ID here, we should send only those transactions\n+    // sketched (stored in local set snapshot), because otherwise we would leak privacy (mempool content).\n+    if (msg_type == NetMsgType::RECONCILDIFF) {\n+        bool recon_result;",
+      "path": "src/net_processing.cpp",
+      "position": 293,
+      "original_position": 293,
+      "commit_id": "534a89069d594a05e6bfb15858046464b05fbc9e",
+      "original_commit_id": "534a89069d594a05e6bfb15858046464b05fbc9e",
+      "in_reply_to_id": 3897104353,
+      "user": {
+        "login": "sr-gi",
+        "id": 6665628,
+        "node_id": "MDQ6VXNlcjY2NjU2Mjg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/6665628?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sr-gi",
+        "html_url": "https://github.com/sr-gi",
+        "followers_url": "https://api.github.com/users/sr-gi/followers",
+        "following_url": "https://api.github.com/users/sr-gi/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sr-gi/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sr-gi/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sr-gi/subscriptions",
+        "organizations_url": "https://api.github.com/users/sr-gi/orgs",
+        "repos_url": "https://api.github.com/users/sr-gi/repos",
+        "events_url": "https://api.github.com/users/sr-gi/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sr-gi/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "You're right, will change",
+      "created_at": "2026-09-01T09:20:57Z",
+      "updated_at": "2026-09-01T09:20:58Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35591#discussion_r3902663460",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3902663460"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35591"
