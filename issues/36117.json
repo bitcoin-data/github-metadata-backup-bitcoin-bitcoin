@@ -12,7 +12,7 @@
     "number": 36117,
     "state": "open",
     "state_reason": null,
-    "title": "InvalidateBlock assert with AddToBlockIndex",
+    "title": "InvalidateBlock concurrency issues",
     "body": "While reviewing https://github.com/bitcoin/bitcoin/pull/34254, I asked Claude to examine for any multi-threaded issues with `InvalidateBlock`. It came up with the following crash which I verified:\n\n- [rpc thread] in `InvalidateBlock`, populate the list of `highpow_outofchain_headers` [here](https://github.com/bitcoin/bitcoin/blob/05e49b342faa1412266951429c135e9f5daa30c2/src/validation.cpp#L3563-L3578) and then release cs_main. These headers are all better than the new tip we should be getting and will be used to update `m_best_header` later.\n- [other thread] acquire cs_main and call `AddToBlockIndex` with a header that is not better than `m_best_header` but is better than every header in `highpow_outofchain_headers`. This means `AddToBlockIndex` won't update `m_best_header` [here](https://github.com/bitcoin/bitcoin/blob/05e49b342faa1412266951429c135e9f5daa30c2/src/node/blockstorage.cpp#L249-L251)\n- [rpc thread] acquire cs_main in the loop and update `m_best_header` based on the candidates in `highpow_outofchain_headers` [here](https://github.com/bitcoin/bitcoin/blob/05e49b342faa1412266951429c135e9f5daa30c2/src/validation.cpp#L3652-L3655)\n- [rpc thread] calls `CheckBlockIndex` which fails on the assert since there is actually a header with more work than `m_best_header`: https://github.com/bitcoin/bitcoin/blob/05e49b342faa1412266951429c135e9f5daa30c2/src/validation.cpp#L5317-L5318\n\nHaven't really thought about how to fix this too much.\n\nVibe-coded functional test: https://github.com/Crypt-iQ/bitcoin/tree/08282026/rpc_invalidateblock_crash\nRun with: `<build_dir>/test/functional/test_runner.py rpc_invalidateblock.py --race-attempts=5000` and inspect stderr of node2 in the tmp test directory.",
     "user": {
       "login": "Crypt-iQ",
@@ -40,9 +40,9 @@
     "assignees": [],
     "author_association": "CONTRIBUTOR",
     "locked": false,
-    "comments": 4,
+    "comments": 5,
     "created_at": "2026-08-28T18:17:18Z",
-    "updated_at": "2026-08-28T20:11:54Z"
+    "updated_at": "2026-09-02T15:17:49Z"
   },
   "events": [
     {
@@ -400,6 +400,99 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/issues/36117#issuecomment-5457281440",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36117"
+    },
+    {
+      "event": "commented",
+      "id": 5511873244,
+      "node_id": "IC_kwDOABII588AAAABSIiC3A",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/5511873244",
+      "actor": {
+        "login": "Crypt-iQ",
+        "id": 15145615,
+        "node_id": "MDQ6VXNlcjE1MTQ1NjE1",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15145615?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Crypt-iQ",
+        "html_url": "https://github.com/Crypt-iQ",
+        "followers_url": "https://api.github.com/users/Crypt-iQ/followers",
+        "following_url": "https://api.github.com/users/Crypt-iQ/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Crypt-iQ/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Crypt-iQ/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Crypt-iQ/subscriptions",
+        "organizations_url": "https://api.github.com/users/Crypt-iQ/orgs",
+        "repos_url": "https://api.github.com/users/Crypt-iQ/repos",
+        "events_url": "https://api.github.com/users/Crypt-iQ/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Crypt-iQ/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-09-02T15:17:24Z",
+      "updated_at": "2026-09-02T15:17:24Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "This `m_best_header` [assert](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/validation.cpp#L5175) in `CheckBlockIndex` can be hit if an invalid block is given while an `InvalidateBlock` is happening:\n- The loop to populate `highpow_outofchain_headers` only considers valid headers, this runs [here](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/validation.cpp#L3552-L3567)\n- If we receive the block (via p2p/rpc) for a header in this multimap and it happens to be invalid, the check that may update `m_best_header` to one of these candidates headers does not then check if the candidate was marked invalid in the meantime [here](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/validation.cpp#L3641-L3644).\n- This may update `m_best_header` to an invalid block\n\nThis `CheckBlockIndex` [assert](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/validation.cpp#L5292) can be hit if `reconsiderblock` runs at the same time as `invalidateblock`:\n- the main loop will lock cs_main, mark disconnected blocks (and things in the candidate set) as `BLOCK_FAILED_VALID`, and release cs_main\n- `ReconsiderBlock` will lock cs_main and may call `ResetBlockFailureFlags` on one of those blocks [here](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/rpc/blockchain.cpp#L1777)\n- the disconnect loop continues to run\n- the assert is hit because there are valid blocks descending from invalid blocks\n\nVibe-coded reproducers for these two issues [here](https://github.com/Crypt-iQ/bitcoin/tree/09022026/invalidate_block_rpc_tests). The first issue could be fixed by checking that the candidates are valid before updating `m_best_header`. The second issue could be fixed by preventing `reconsiderblock` from competing with `invalidateblock` via a dedicated mutex or perhaps by moving the `CheckBlockIndex` call after the `InvalidChainFound` [here](https://github.com/bitcoin/bitcoin/blob/b811aeabad94ef48cd0f0fb1d2fcc456594aeedb/src/validation.cpp#L3681)?",
+      "user": {
+        "login": "Crypt-iQ",
+        "id": 15145615,
+        "node_id": "MDQ6VXNlcjE1MTQ1NjE1",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15145615?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Crypt-iQ",
+        "html_url": "https://github.com/Crypt-iQ",
+        "followers_url": "https://api.github.com/users/Crypt-iQ/followers",
+        "following_url": "https://api.github.com/users/Crypt-iQ/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Crypt-iQ/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Crypt-iQ/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Crypt-iQ/subscriptions",
+        "organizations_url": "https://api.github.com/users/Crypt-iQ/orgs",
+        "repos_url": "https://api.github.com/users/Crypt-iQ/repos",
+        "events_url": "https://api.github.com/users/Crypt-iQ/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Crypt-iQ/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/issues/36117#issuecomment-5511873244",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36117"
+    },
+    {
+      "event": "renamed",
+      "id": 30425528504,
+      "node_id": "RTE_lADOABII588AAAABOsZ8xc8AAAAHFYC4uA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/30425528504",
+      "actor": {
+        "login": "Crypt-iQ",
+        "id": 15145615,
+        "node_id": "MDQ6VXNlcjE1MTQ1NjE1",
+        "avatar_url": "https://avatars.githubusercontent.com/u/15145615?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/Crypt-iQ",
+        "html_url": "https://github.com/Crypt-iQ",
+        "followers_url": "https://api.github.com/users/Crypt-iQ/followers",
+        "following_url": "https://api.github.com/users/Crypt-iQ/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/Crypt-iQ/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/Crypt-iQ/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/Crypt-iQ/subscriptions",
+        "organizations_url": "https://api.github.com/users/Crypt-iQ/orgs",
+        "repos_url": "https://api.github.com/users/Crypt-iQ/repos",
+        "events_url": "https://api.github.com/users/Crypt-iQ/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/Crypt-iQ/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-09-02T15:17:49Z",
+      "rename": {
+        "from": "InvalidateBlock assert with AddToBlockIndex",
+        "to": "InvalidateBlock concurrency issues"
+      }
     }
   ]
 }
