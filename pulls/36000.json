@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "**Problem:** Block reading and deserialization happen immediately before block connection, so their mostly I/O-bound work does not overlap CPU-bound validation.\r\n\r\nThis is a follow-up to [#35295](https://github.com/bitcoin/bitcoin/pull/35295), which parallelized input prevout fetching during block connection.\r\n\r\n**Fix:** Add a `Chainstate`-owned block fetcher that reads later blocks from disk while the current block is connected. Start with synchronous 1-block read-ahead, then move reads to an eagerly started 2-worker pool that persists across activations. Keep blocks provided by the caller on the existing direct path and maintain a sliding queue of up to 4 disk reads. During reorgs, start reading the first sibling while disconnecting the old tip.\r\n\r\nThis PR deliberately uses 2 readers and a fixed queue size of 4. Current measurements favor 2 readers with queue sizes of 4 or 8, so this uses the smaller queue. The worker count and queue size can be made configurable later if further measurements justify tuning them.\r\n\r\n**Credit:** The idea comes from [bitcoindev1337](https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-08-11#1245429), who had already implemented a similar design and reported comparable results.\r\n<details><summary>Benchmark results</summary>\r\n\r\n```python\r\n1d6656c6b0 refactor: prepare block fetcher wiring\r\n3547915bfb doc: add block read-ahead release note\r\n\r\n2026-09-02 | reindex-chainstate | 964469 blocks | dbcache 2000 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 threads | 62Gi RAM | HDD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (abs ≡):        30017.350 s               [User: 44516.820 s, System: 1392.820 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (abs ≡):        19609.006 s               [User: 46710.915 s, System: 1466.050 s]\r\n\r\nRelative speed comparison\r\n        1.53          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n```python\r\n2026-09-02 | reindex-chainstate | 964469 blocks | dbcache 2000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 threads | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (mean ± σ):     14954.582 s ± 47.740 s    [User: 41200.553 s, System: 1293.087 s]\r\n  Range (min … max):   14920.825 s … 14988.339 s    2 runs\r\n \r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (mean ± σ):     9499.382 s ± 26.187 s    [User: 42840.137 s, System: 1291.391 s]\r\n  Range (min … max):   9480.865 s … 9517.899 s    2 runs\r\n \r\nRelative speed comparison\r\n        1.57 ±  0.01  COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n```python\r\n2026-09-02 | IBD | 964469 blocks | dbcache 2000 | ssd-ryzen | x86_64 | AMD Ryzen 7 3700X 8-Core Processor | 16 threads | 62Gi RAM | ext4 | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (mean ± σ):     18325.931 s ± 713.652 s    [User: 40928.980 s, System: 4110.338 s]\r\n  Range (min … max):   17821.303 s … 18830.559 s    2 runs\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (mean ± σ):     16192.131 s ± 232.698 s    [User: 40349.710 s, System: 2982.493 s]\r\n  Range (min … max):   16027.589 s … 16356.674 s    2 runs\r\n\r\nRelative speed comparison\r\n        1.13 ±  0.05  COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n</details>\r\n",
+    "body": "**Problem:** Block reading and deserialization happen immediately before block connection, so their mostly I/O-bound work does not overlap CPU-bound validation.\r\n\r\nThis is a follow-up to [#35295](https://github.com/bitcoin/bitcoin/pull/35295), which parallelized input prevout fetching during block connection.\r\n\r\n**Fix:** Add a `Chainstate`-owned block fetcher that reads later blocks from disk while the current block is connected. Start with synchronous 1-block read-ahead, then move reads to an eagerly started 2-worker pool that persists across activations. Keep blocks provided by the caller on the existing direct path and maintain a sliding queue of up to 4 disk reads. During reorgs, start reading the first sibling while disconnecting the old tip.\r\n\r\nThis PR deliberately uses 2 readers and a fixed queue size of 4. Current measurements favor 2 readers with queue sizes of 4 or 8, so this uses the smaller queue. The worker count and queue size can be made configurable later if further measurements justify tuning them.\r\n\r\n**Credit:** The idea comes from [bitcoindev1337](https://bitcoin-irc.chaincode.com/bitcoin-core-dev/2026-08-11#1245429), who had already implemented a similar design and reported comparable results.\r\n<details><summary>Benchmark results</summary>\r\n\r\n```python\r\n1d6656c6b0 refactor: prepare block fetcher wiring\r\n3547915bfb doc: add block read-ahead release note\r\n\r\n2026-09-02 | reindex-chainstate | 964469 blocks | dbcache 2000 | i7-hdd | x86_64 | Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz | 8 threads | 62Gi RAM | HDD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (abs ≡):        30017.350 s               [User: 44516.820 s, System: 1392.820 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (abs ≡):        19609.006 s               [User: 46710.915 s, System: 1466.050 s]\r\n\r\nRelative speed comparison\r\n        1.53          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n```python\r\n2026-09-02 | reindex-chainstate | 964469 blocks | dbcache 2000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 threads | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (mean ± σ):     14954.582 s ± 47.740 s    [User: 41200.553 s, System: 1293.087 s]\r\n  Range (min … max):   14920.825 s … 14988.339 s    2 runs\r\n \r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (mean ± σ):     9499.382 s ± 26.187 s    [User: 42840.137 s, System: 1291.391 s]\r\n  Range (min … max):   9480.865 s … 9517.899 s    2 runs\r\n \r\nRelative speed comparison\r\n        1.57 ±  0.01  COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n```python\r\n2026-09-02 | reindex-chainstate | 964469 blocks | dbcache 2000 | rpi5-16-2 | aarch64 | Cortex-A76 | 4 threads | 15Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (abs ≡):        37266.870 s               [User: 77596.462 s, System: 5504.890 s]\r\n \r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (abs ≡):        31224.887 s               [User: 76833.950 s, System: 5281.869 s]\r\n \r\nRelative speed comparison\r\n        1.19          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -reindex-chainstate -assumevalid=00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac -blocksonly -disablewallet -connect=0 -listen=0 -dnsseed=0 -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n```python\r\n2026-09-02 | IBD | 964469 blocks | dbcache 2000 | ssd-ryzen | x86_64 | AMD Ryzen 7 3700X 8-Core Processor | 16 threads | 62Gi RAM | ext4 | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n  Time (mean ± σ):     18325.931 s ± 713.652 s    [User: 40928.980 s, System: 4110.338 s]\r\n  Range (min … max):   17821.303 s … 18830.559 s    2 runs\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n  Time (mean ± σ):     16192.131 s ± 232.698 s    [User: 40349.710 s, System: 2982.493 s]\r\n  Range (min … max):   16027.589 s … 16356.674 s    2 runs\r\n\r\nRelative speed comparison\r\n        1.13 ±  0.05  COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 1d6656c6b024578db910f45f4a131f18d75a2ed0)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=964469 -dbcache=2000 -blocksonly -printtoconsole=0 (COMMIT = 3547915bfb240f280188954c7c5b60ec90145ac5)\r\n```\r\n\r\n</details>\r\n",
     "labels": [
       {
         "id": 118379652,
@@ -52,11 +52,11 @@
       }
     ],
     "created_at": "2026-08-17T22:31:46Z",
-    "updated_at": "2026-09-02T23:03:13Z",
+    "updated_at": "2026-09-03T15:11:47Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "8923f741613f7581c86ad7a8b76a59be385cb126",
+    "merge_commit_sha": "61a86c2cb1d3d5bcf066fbbde337fcadac44592c",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -164,9 +164,9 @@
         "forks_count": 2,
         "stargazers_count": 6,
         "watchers_count": 6,
-        "size": 381480,
+        "size": 381487,
         "default_branch": "master",
-        "open_issues_count": 118,
+        "open_issues_count": 119,
         "is_template": false,
         "topics": [],
         "has_issues": false,
@@ -177,7 +177,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-09-02T23:33:03Z",
+        "pushed_at": "2026-09-03T04:32:16Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2026-09-02T18:57:08Z",
         "allow_forking": true,
@@ -298,12 +298,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39368,
-        "stargazers_count": 90079,
-        "watchers_count": 90079,
-        "size": 323302,
+        "forks_count": 39371,
+        "stargazers_count": 90089,
+        "watchers_count": 90089,
+        "size": 323421,
         "default_branch": "master",
-        "open_issues_count": 727,
+        "open_issues_count": 726,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -320,9 +320,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-09-02T13:55:09Z",
+        "pushed_at": "2026-09-03T13:50:46Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-09-02T23:06:02Z",
+        "updated_at": "2026-09-03T15:50:33Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -352,7 +352,7 @@
     "deletions": 9,
     "changed_files": 9,
     "commits": 6,
-    "review_comments": 18,
+    "review_comments": 19,
     "comments": 5
   },
   "events": [
@@ -1508,6 +1508,44 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/36000#issuecomment-5503631055",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36000"
+    },
+    {
+      "event": "reviewed",
+      "id": 5103607330,
+      "node_id": "PRR_kwDOABII588AAAABMDLeIg",
+      "url": null,
+      "actor": null,
+      "commit_id": "3547915bfb240f280188954c7c5b60ec90145ac5",
+      "commit_url": null,
+      "created_at": null,
+      "updated_at": "2026-09-03T15:11:47Z",
+      "author_association": "CONTRIBUTOR",
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36000#pullrequestreview-5103607330",
+      "submitted_at": "2026-09-03T15:11:47Z",
+      "state": "COMMENTED",
+      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36000"
     }
   ],
   "comments": [
@@ -2481,6 +2519,60 @@
       "start_side": null,
       "line": null,
       "original_line": 3195,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3925912202",
+      "pull_request_review_id": 5103607330,
+      "id": 3925912202,
+      "node_id": "PRRC_kwDOABII587qAKqK",
+      "diff_hunk": "@@ -0,0 +1,59 @@\n+// Copyright (c) The Bitcoin Core developers\n+// Distributed under the MIT software license, see the accompanying\n+// file COPYING or https://www.opensource.org/licenses/mit-license.php.\n+\n+#include <node/blockfetcher.h>\n+\n+#include <chain.h>\n+#include <flatfile.h>\n+#include <kernel/cs_main.h>\n+#include <primitives/block.h>\n+#include <sync.h>\n+#include <uint256.h>\n+#include <util/expected.h>\n+#include <util/threadpool.h>\n+\n+#include <cstddef>\n+#include <memory>\n+#include <utility>\n+\n+namespace node {\n+bool BlockFetcher::ShouldEnqueue(const CBlockIndex* index) { return index && (index->nStatus & BLOCK_HAVE_DATA); }\n+\n+std::shared_ptr<const CBlock> BlockFetcher::PopFollowup()\n+{\n+    if (m_followups.empty()) return nullptr;\n+    auto followup{std::move(m_followups[0])};\n+    m_followups.pop_front();\n+    return followup.get();\n+}\n+\n+bool BlockFetcher::Enqueue(const CBlockIndex& index)\n+{\n+    auto followup{m_pool.Submit([&read_block = m_read_block, hash = index.GetBlockHash(), pos = index.GetBlockPos()]() -> std::shared_ptr<const CBlock> {",
+      "path": "src/node/blockfetcher.cpp",
+      "position": 33,
+      "original_position": 33,
+      "commit_id": "3547915bfb240f280188954c7c5b60ec90145ac5",
+      "original_commit_id": "3547915bfb240f280188954c7c5b60ec90145ac5",
+      "in_reply_to_id": null,
+      "user": {
+        "login": "andrewtoth",
+        "id": 237213,
+        "node_id": "MDQ6VXNlcjIzNzIxMw==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/237213?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/andrewtoth",
+        "html_url": "https://github.com/andrewtoth",
+        "followers_url": "https://api.github.com/users/andrewtoth/followers",
+        "following_url": "https://api.github.com/users/andrewtoth/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/andrewtoth/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/andrewtoth/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/andrewtoth/subscriptions",
+        "organizations_url": "https://api.github.com/users/andrewtoth/orgs",
+        "repos_url": "https://api.github.com/users/andrewtoth/repos",
+        "events_url": "https://api.github.com/users/andrewtoth/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/andrewtoth/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Since we have multiple worker threads now, maybe we can take advantage of the multi-`Submit` overload whenever we have an empty `m_followups`? That would awaken all threads at once. This would happen on every `ActivateBestChainStep` call, so could show some improvement?\n\nAlso, if we have multiple threads and queue depth, we might want to allow disabling this mechanism for low memory systems. Maybe worth it to just be an on/off toggle (that defaults to on)? Or maybe a configuration of threads only and the queue depth is 2*threads? Just trying to think of ways to make it simple instead of adding all kinds of configuration options.",
+      "created_at": "2026-09-03T15:11:47Z",
+      "updated_at": "2026-09-03T15:11:47Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36000#discussion_r3925912202",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/3925912202"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36000"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 33,
+      "original_line": 33,
       "side": "RIGHT"
     }
   ]
