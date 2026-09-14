@@ -1,23 +1,23 @@
 {
   "type": "pull",
   "pull": {
-    "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238",
-    "id": 4519639154,
-    "node_id": "PR_kwDOABII588AAAABDWQ4cg",
-    "html_url": "https://github.com/bitcoin/bitcoin/pull/36238",
-    "diff_url": "https://github.com/bitcoin/bitcoin/pull/36238.diff",
-    "patch_url": "https://github.com/bitcoin/bitcoin/pull/36238.patch",
-    "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36238",
-    "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238/commits",
-    "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238/comments",
+    "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36245",
+    "id": 4524454120,
+    "node_id": "PR_kwDOABII588AAAABDa2w6A",
+    "html_url": "https://github.com/bitcoin/bitcoin/pull/36245",
+    "diff_url": "https://github.com/bitcoin/bitcoin/pull/36245.diff",
+    "patch_url": "https://github.com/bitcoin/bitcoin/pull/36245.patch",
+    "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36245",
+    "commits_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36245/commits",
+    "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36245/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
-    "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36238/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-    "number": 36238,
+    "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36245/comments",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/4d2dc3c327fe5293e481b2a80805adfeb16ba642",
+    "number": 36245,
     "state": "open",
     "locked": false,
     "maintainer_can_modify": true,
-    "title": "wallet, rpc: fix importdescriptors crash on int32_t range end overflow",
+    "title": "wallet: start descriptor top up at range_start instead of index 0",
     "user": {
       "login": "kriss39",
       "id": 93033289,
@@ -40,22 +40,31 @@
       "name": null,
       "patch_url": null
     },
-    "body": "`importdescriptors` aborts the node when the inclusive range end is `2147483647`:\n\n```\nbitcoin-cli -regtest -rpcwallet=w importdescriptors \\\n  '[{\"desc\":\"wpkh(tpub.../0/*)#checksum\",\"range\":[2147483647,2147483647],\"timestamp\":\"now\"}]'\n```\n\n```\nAssertion failed: (m_wallet_descriptor.GetEnd() - 1 == m_max_cached_index),\nfunction TopUpWithDB, file scriptpubkeyman.cpp, line 1165.\n```\n\n`WalletDescriptor` keeps the exclusive range end in an `int32_t`, but `ProcessDescriptorImport()` computes it as `int64_t` and lets the narrowing happen implicitly when it constructs the descriptor. `ParseDescriptorRange()` only rejects an inclusive end of `2^31` and above, so `INT32_MAX` gets through and becomes an exclusive end of `2^31`, which wraps to `INT32_MIN`.\n\n`TopUpWithDB()` then does:\n\n```cpp\nint32_t new_range_end = std::max(m_wallet_descriptor.GetNext() + (int32_t)target_size, m_wallet_descriptor.GetEnd());\n```\n\nThat addition is `int32_t` too, so it overflows on its own once the next index gets within `target_size` of `INT32_MAX`. Either way `new_range_end` ends up negative, the loop below derives nothing, and the invariant on the next line doesn't hold.\n\nThe wrapped value is written to the wallet database before the abort, so the descriptor stays broken after a restart:\n\n```\n\"range\": [2147483647, -2147482650], \"next_index\": 2147483647\n```\n\nThe first commit saturates the addition. The second rejects a range end that isn't representable as an `int32_t`, reusing the existing \"End of range is too high\" error.\n\n`deriveaddresses` and `scantxoutset` aren't affected, since they walk the range as `int64_t` and never store it. I checked that both still accept `[2147483647, 2147483647]`.\n\nThe new case in `wallet_importdescriptors.py` uses a descriptor the wallet can actually expand. My first attempt reused the `sh(wpkh(xpriv/...))` descriptor the surrounding checks use, but in a watch-only wallet that one fails earlier with -4 and never reaches the code that crashes.\n\nWithout the fix the test dies with `RemoteDisconnected` and node1's stderr has the assertion above. With it, it passes. I also ran wallet_descriptor, wallet_keypool, wallet_keypool_topup, wallet_basic, rpc_deriveaddresses and rpc_scantxoutset.\n",
-    "labels": [],
-    "created_at": "2026-09-13T16:18:34Z",
-    "updated_at": "2026-09-14T08:25:49Z",
+    "body": "DescriptorScriptPubKeyMan::TopUpWithDB() expands the descriptor from m_max_cached_index + 1, which is 0 for a freshly imported descriptor regardless of its range_start. Importing a descriptor with \"range\": [N, M] therefore derives and watches every index in [0, M), so the cost of an import is O(M) rather than O(M - N) and the wallet treats scriptPubKeys below N as its own. Load() only expands [range_start, range_end), so those scriptPubKeys stop being IsMine the next time the wallet is opened, and a transaction picked up for one of them during the import rescan is no longer credited to the wallet.\r\n\r\nSince ParseDescriptorRange() only bounds the size of the range and not its start, \"range\": [2146483648, 2147483647] is accepted and expands 2^31 indexes into m_map_script_pub_keys before the RPC returns.\r\n\r\nStart the top up loop at range_start and record the index that was actually cached instead of counting from -1, so that Load() and TopUpWithDB() agree on m_max_cached_index for descriptors with a non-zero range_start. Before this change Load() left m_max_cached_index at range_end - range_start - 1 for such descriptors, which made the first top up after opening the wallet re-expand the stored range.\r\n\r\nImporting wpkh(xpub/0/*) with \"range\": [600000, 600009] into a blank watch-only wallet goes from 19.5s to 0.09s on this machine.\r\n\r\n<!--\r\n*** Please remove the following help text before submitting: ***\r\n\r\nPull requests may be closed immediately if they:\r\n- do not have a rationale and clear improvement\r\n- do not adhere to doc/AI_POLICY.md\r\n\r\nGUI-related pull requests should be opened against\r\nhttps://github.com/bitcoin-core/gui first.\r\nSee CONTRIBUTING.md\r\n-->\r\n\r\n<!--\r\nPlease provide clear motivation for your patch and explain how it improves\r\nBitcoin Core user experience or Bitcoin Core developer experience\r\nsignificantly:\r\n\r\n* Any test improvements or new tests that improve coverage are always welcome.\r\n* All other changes should have accompanying unit tests (see `src/test/`) or\r\n  functional tests (see `test/`). Contributors should note which tests cover\r\n  modified code. If no tests exist for a region of modified code, new tests\r\n  should accompany the change.\r\n* Bug fixes are most welcome when they come with steps to reproduce or an\r\n  explanation of the potential issue as well as reasoning for the way the bug\r\n  was fixed.\r\n* Features are welcome, but might be rejected due to design or scope issues.\r\n  If a feature is based on a lot of dependencies, contributors should first\r\n  consider building the system outside of Bitcoin Core, if possible.\r\n* Refactoring changes are only accepted if they are required for a feature or\r\n  bug fix or otherwise improve developer experience significantly. For example,\r\n  most \"code style\" refactoring changes require a thorough explanation why they\r\n  are useful, what downsides they have and why they *significantly* improve\r\n  developer experience or avoid serious programming bugs. Note that code style\r\n  is often a subjective matter. Unless they are explicitly mentioned to be\r\n  preferred in the [developer notes](/doc/developer-notes.md), stylistic code\r\n  changes are usually rejected.\r\n-->\r\n\r\n<!--\r\nBitcoin Core has a thorough review process and even the most trivial change\r\nneeds to pass a lot of eyes and requires non-zero or even substantial time\r\neffort to review. There is a huge lack of active reviewers on the project, so\r\npatches often sit for a long time.\r\n-->\r\n",
+    "labels": [
+      {
+        "id": 149424,
+        "node_id": "MDU6TGFiZWwxNDk0MjQ=",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Wallet",
+        "name": "Wallet",
+        "color": "08a781",
+        "default": false
+      }
+    ],
+    "created_at": "2026-09-14T08:34:00Z",
+    "updated_at": "2026-09-14T08:34:15Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "d6a3e2e6f2131297109bfc48e4aed76a313f7300",
+    "merge_commit_sha": "2d222a7d508092ce227f46a25119dea41eb85f60",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
     "rebaseable": true,
     "head": {
-      "label": "kriss39:fix-importdescriptors-range-end-overflow",
-      "ref": "fix-importdescriptors-range-end-overflow",
-      "sha": "766924cd44d98e9ae65b539c5a0de9dbb5683d32",
+      "label": "kriss39:fix-topup-cache-from-range-start",
+      "ref": "fix-topup-cache-from-range-start",
+      "sha": "4d2dc3c327fe5293e481b2a80805adfeb16ba642",
       "user": {
         "login": "kriss39",
         "id": 93033289,
@@ -191,7 +200,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "17817818da3cb67c95320b7a5d4d69bd649c1fbf",
+      "sha": "d25470d992b72b1960729478e677473f5bf860a8",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -333,32 +342,32 @@
     },
     "_links": {
       "self": {
-        "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238"
+        "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36245"
       }
     },
     "author_association": "CONTRIBUTOR",
     "draft": false,
-    "additions": 18,
-    "deletions": 2,
-    "changed_files": 3,
-    "commits": 2,
-    "review_comments": 1,
+    "additions": 43,
+    "deletions": 3,
+    "changed_files": 2,
+    "commits": 1,
+    "review_comments": 0,
     "comments": 1
   },
   "events": [
     {
       "event": "committed",
       "id": null,
-      "node_id": "C_kwDOABII59oAKDMyZTVlYTlmNWVhMGZiYjUzNmZhNDkwNTZmYWE3ZjI3ZTQzMzJjMWI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b",
+      "node_id": "C_kwDOABII59oAKDRkMmRjM2MzMjdmZTUyOTNlNDgxYjJhODA4MDVhZGZlYjE2YmE2NDI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4d2dc3c327fe5293e481b2a80805adfeb16ba642",
       "actor": null,
       "commit_id": null,
       "commit_url": null,
       "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b",
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4d2dc3c327fe5293e481b2a80805adfeb16ba642",
       "tree": {
-        "sha": "11d732351ba38cc1913b376eaaca2bf98298a5fd",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/11d732351ba38cc1913b376eaaca2bf98298a5fd"
+        "sha": "d9fb31edf27afbb50b90a9715e378e3e32a18b0c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d9fb31edf27afbb50b90a9715e378e3e32a18b0c"
       },
       "verification": {
         "verified": false,
@@ -368,69 +377,29 @@
       },
       "parents": [
         {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/17817818da3cb67c95320b7a5d4d69bd649c1fbf",
-          "sha": "17817818da3cb67c95320b7a5d4d69bd649c1fbf",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/17817818da3cb67c95320b7a5d4d69bd649c1fbf"
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d25470d992b72b1960729478e677473f5bf860a8",
+          "sha": "d25470d992b72b1960729478e677473f5bf860a8",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d25470d992b72b1960729478e677473f5bf860a8"
         }
       ],
-      "message": "wallet: avoid int32_t overflow computing descriptor range end\n\nTopUpWithDB() computed the new range end as\n\n    GetNext() + (int32_t)target_size\n\nwhich is signed int32_t arithmetic. When the descriptor's next index is\nwithin target_size of INT32_MAX this overflows, which is undefined\nbehaviour and in practice wraps to a negative range end.\n\nSaturate the addition instead, so a next index near INT32_MAX clamps to\nINT32_MAX rather than wrapping.",
+      "message": "wallet: start descriptor top up at range_start instead of index 0\n\nDescriptorScriptPubKeyMan::TopUpWithDB() expands the descriptor from\nm_max_cached_index + 1, which is 0 for a freshly imported descriptor\nregardless of its range_start. Importing a descriptor with\n\"range\": [N, M] therefore derives and watches every index in [0, M),\nso the cost of an import is O(M) rather than O(M - N) and the wallet\ntreats scriptPubKeys below N as its own. Load() only expands\n[range_start, range_end), so those scriptPubKeys stop being IsMine the\nnext time the wallet is opened, and a transaction picked up for one of\nthem during the import rescan is no longer credited to the wallet.\n\nSince ParseDescriptorRange() only bounds the size of the range and not\nits start, \"range\": [2146483648, 2147483647] is accepted and expands\n2^31 indexes into m_map_script_pub_keys before the RPC returns.\n\nStart the top up loop at range_start and record the index that was\nactually cached instead of counting from -1, so that Load() and\nTopUpWithDB() agree on m_max_cached_index for descriptors with a\nnon-zero range_start. Before this change Load() left m_max_cached_index\nat range_end - range_start - 1 for such descriptors, which made the\nfirst top up after opening the wallet re-expand the stored range.\n\nImporting wpkh(xpub/0/*) with \"range\": [600000, 600009] into a blank\nwatch-only wallet goes from 19.5s to 0.09s on this machine.",
       "committer": {
         "name": "kriss39",
         "email": "senanmammadov0@gmail.com",
-        "date": "2026-09-13T16:15:32Z"
+        "date": "2026-09-14T08:22:45Z"
       },
       "author": {
         "name": "kriss39",
         "email": "senanmammadov0@gmail.com",
-        "date": "2026-09-13T16:15:32Z"
+        "date": "2026-09-14T08:22:45Z"
       },
-      "sha": "32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b"
+      "sha": "4d2dc3c327fe5293e481b2a80805adfeb16ba642"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDc2NjkyNGNkNDRkOThlOWFlNjViNTM5YzVhMGRlOWRiYjU2ODNkMzI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-      "tree": {
-        "sha": "2a9ea1a042f7ee2052b75c65c4f9a42b10130276",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2a9ea1a042f7ee2052b75c65c4f9a42b10130276"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b",
-          "sha": "32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/32e5ea9f5ea0fbb536fa49056faa7f27e4332c1b"
-        }
-      ],
-      "message": "rpc: reject importdescriptors range end above int32_t max\n\nWalletDescriptor stores the exclusive range end as an int32_t, but\nProcessDescriptorImport() computed it as int64_t and let the narrowing\nhappen implicitly in the constructor.\n\nParseDescriptorRange() only rejects an inclusive end of 2^31 or above,\nso an inclusive end of INT32_MAX was accepted and produced an exclusive\nend of 2^31, which wrapped to INT32_MIN. TopUpWithDB() then derived no\nkeys and tripped its\n\n    assert(m_wallet_descriptor.GetEnd() - 1 == m_max_cached_index)\n\ninvariant, aborting the node. The wrapped range end was also written to\nthe wallet database, leaving the descriptor unusable after restart.\n\nReject a range end that is not representable as an int32_t, reusing the\nexisting \"End of range is too high\" error.\n\nThe inclusive end stays valid for deriveaddresses and scantxoutset,\nwhich iterate the range as int64_t and never store it.",
-      "committer": {
-        "name": "kriss39",
-        "email": "senanmammadov0@gmail.com",
-        "date": "2026-09-13T16:15:41Z"
-      },
-      "author": {
-        "name": "kriss39",
-        "email": "senanmammadov0@gmail.com",
-        "date": "2026-09-13T16:15:41Z"
-      },
-      "sha": "766924cd44d98e9ae65b539c5a0de9dbb5683d32"
-    },
-    {
-      "event": "commented",
-      "id": 5654476578,
-      "node_id": "IC_kwDOABII588AAAABUQh3Ig",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/5654476578",
+      "event": "labeled",
+      "id": 31087255885,
+      "node_id": "LE_lADOABII588AAAABRKvWSs8AAAAHPPHhTQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/31087255885",
       "actor": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -455,10 +424,45 @@
       },
       "commit_id": null,
       "commit_url": null,
-      "created_at": "2026-09-13T16:18:41Z",
-      "updated_at": "2026-09-14T08:25:49Z",
+      "created_at": "2026-09-14T08:34:04Z",
+      "label": {
+        "name": "Wallet",
+        "color": "08a781"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 5661237263,
+      "node_id": "IC_kwDOABII588AAAABUW-gDw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/5661237263",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-09-14T08:34:08Z",
+      "updated_at": "2026-09-14T08:34:15Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/36238.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\nA summary of reviews will appear here.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#36236](https://github.com/bitcoin/bitcoin/pull/36236) (wallet, rpc: add verify_balance option to importdescriptors by musaHaruna)\n* [#35989](https://github.com/bitcoin/bitcoin/pull/35989) (wallet: fix crash on importdescriptors with a range ending at 2^31-1 by shuv-amp)\n* [#35377](https://github.com/bitcoin/bitcoin/pull/35377) (wallet: Allow importing of descriptors without private keys when the wallet has the private keys by achow101)\n* [#34861](https://github.com/bitcoin/bitcoin/pull/34861) (wallet: Add importdescriptors interface by polespinasa)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/36245.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\nA summary of reviews will appear here.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -481,103 +485,9 @@
         "name": null,
         "patch_url": null
       },
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/36238#issuecomment-5654476578",
-      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36238"
-    },
-    {
-      "event": "reviewed",
-      "id": 5195032232,
-      "node_id": "PRR_kwDOABII588AAAABNaXmqA",
-      "url": null,
-      "actor": null,
-      "commit_id": "766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-      "commit_url": null,
-      "created_at": null,
-      "updated_at": "2026-09-14T08:25:46Z",
-      "author_association": "CONTRIBUTOR",
-      "body": "But why would one decide to derive and watch the address at this specific index :-)? Being a reachable crash, however, it's worth the fix. Balancing between `practicability` and `correctness`, I will lean towards correctness. Editing my A-C-K cause this conflicts with #35989",
-      "user": {
-        "login": "vicjuma",
-        "id": 30392363,
-        "node_id": "MDQ6VXNlcjMwMzkyMzYz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/30392363?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/vicjuma",
-        "html_url": "https://github.com/vicjuma",
-        "followers_url": "https://api.github.com/users/vicjuma/followers",
-        "following_url": "https://api.github.com/users/vicjuma/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/vicjuma/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/vicjuma/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/vicjuma/subscriptions",
-        "organizations_url": "https://api.github.com/users/vicjuma/orgs",
-        "repos_url": "https://api.github.com/users/vicjuma/repos",
-        "events_url": "https://api.github.com/users/vicjuma/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/vicjuma/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/36238#pullrequestreview-5195032232",
-      "submitted_at": "2026-09-14T07:40:19Z",
-      "state": "COMMENTED",
-      "pull_request_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238"
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36245#issuecomment-5661237263",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36245"
     }
   ],
-  "comments": [
-    {
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4003043166",
-      "pull_request_review_id": 5195032232,
-      "id": 4003043166,
-      "node_id": "PRRC_kwDOABII587umZde",
-      "diff_hunk": "",
-      "path": "src/wallet/rpc/backup.cpp",
-      "position": 1,
-      "original_position": 1,
-      "commit_id": "766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-      "original_commit_id": "766924cd44d98e9ae65b539c5a0de9dbb5683d32",
-      "in_reply_to_id": null,
-      "user": {
-        "login": "vicjuma",
-        "id": 30392363,
-        "node_id": "MDQ6VXNlcjMwMzkyMzYz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/30392363?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/vicjuma",
-        "html_url": "https://github.com/vicjuma",
-        "followers_url": "https://api.github.com/users/vicjuma/followers",
-        "following_url": "https://api.github.com/users/vicjuma/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/vicjuma/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/vicjuma/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/vicjuma/subscriptions",
-        "organizations_url": "https://api.github.com/users/vicjuma/orgs",
-        "repos_url": "https://api.github.com/users/vicjuma/repos",
-        "events_url": "https://api.github.com/users/vicjuma/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/vicjuma/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "body": "The crash indeed happens before adding this check, though\n\n**Before**\n<img width=\"2134\" height=\"1218\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/afd72087-d598-421d-8485-e1950fd317aa\" />\n\n**After**\n\n<img width=\"2144\" height=\"902\" alt=\"Image\" src=\"https://github.com/user-attachments/assets/5b87fe92-019f-4396-98b8-2ad6d6dae8b4\" />\n\n",
-      "created_at": "2026-09-14T07:34:01Z",
-      "updated_at": "2026-09-14T07:40:20Z",
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/36238#discussion_r4003043166",
-      "author_association": "CONTRIBUTOR",
-      "_links": {
-        "self": {
-          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4003043166"
-        },
-        "pull_request": {
-          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36238"
-        }
-      },
-      "start_line": null,
-      "original_start_line": null,
-      "start_side": null,
-      "line": 1,
-      "original_line": 1,
-      "side": "RIGHT"
-    }
-  ]
+  "comments": []
 }
