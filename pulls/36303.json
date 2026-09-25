@@ -91,13 +91,13 @@
         "name": null,
         "patch_url": null
       },
-      "open_issues": 11,
-      "closed_issues": 132,
+      "open_issues": 9,
+      "closed_issues": 134,
       "created_at": "2026-02-20T12:46:51Z",
-      "updated_at": "2026-09-25T08:32:54Z"
+      "updated_at": "2026-09-25T11:42:29Z"
     },
     "created_at": "2026-09-20T16:18:10Z",
-    "updated_at": "2026-09-25T09:51:56Z",
+    "updated_at": "2026-09-25T11:32:01Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -344,11 +344,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 39404,
-        "stargazers_count": 90246,
-        "watchers_count": 90246,
+        "stargazers_count": 90248,
+        "watchers_count": 90248,
         "size": 328665,
         "default_branch": "master",
-        "open_issues_count": 724,
+        "open_issues_count": 722,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -365,9 +365,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-09-25T08:32:51Z",
+        "pushed_at": "2026-09-25T11:42:27Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-09-25T08:33:14Z",
+        "updated_at": "2026-09-25T11:50:18Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -397,7 +397,7 @@
     "deletions": 47,
     "changed_files": 3,
     "commits": 2,
-    "review_comments": 16,
+    "review_comments": 19,
     "comments": 6
   },
   "events": [
@@ -2147,6 +2147,168 @@
       "start_side": null,
       "line": 783,
       "original_line": 783,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4103984829",
+      "pull_request_review_id": 5317010174,
+      "id": 4103984829,
+      "node_id": "PRRC_kwDOABII5870nda9",
+      "diff_hunk": "@@ -741,55 +747,101 @@ def check_pipelined_data_is_throttled(self):\n             body\n         ).encode(\"ascii\")\n \n-        # Non-blocking send: When the server stops reading from the buffer\n-        # due to TCP backpressure, Python will raise an error. If the socket\n-        # was set to blocking, we would have to wait for an ambiguous timeout.\n+        # Save a debug log checkpoint\n+        dl_start_size = self.node.debug_log_size(encoding=\"utf-8\")\n+\n+        # Non-blocking send: When the server stops reading from the buffer,\n+        # Python will raise an error. That stop could be due to actual\n+        # backpressure from the server or any other throttle in the TCP chain.\n+        # If the socket was set to blocking, we would have to wait for a timeout.\n         conn.conn.sock.setblocking(False)\n \n-        # Kernel socket buffer sizes vary widely across platforms,\n-        # so we can't rely on counting sent() bytes to determine if the\n-        # server is actually draining its end of the socket.\n-        # When the server is busy, a continuous flood from the client SHOULD,\n-        # at some point, stall indefinitely. An unpatched server will continue\n-        # to accept data from the socket, at some rate, indefinitely.\n-\n-        # If send() is blocked for this many seconds, we assume the server\n-        # is behaving correctly.\n-        STALL_TIMEOUT = 5\n-        # If send() continues to progress for this many seconds, we assume\n-        # the server is vulnerable to memory exhaustion.\n-        PROGRESS_TIMEOUT = 10\n-\n-        sent = 0\n-        stuck_since = None\n-        start = time.monotonic()\n-        while True:\n-            try:\n-                sent += conn.conn.sock.send(flood[sent % len(flood):])\n-                # Progress: the server is still reading\n-                stuck_since = None\n-                self.log.debug(f\"sent: {sent}\")\n-                assert sent <= len(flood) * 10, (\n-                    f\"Server accepted {sent} bytes of pipelined data while a \"\n-                    \"request was still in flight: the receive buffer is not throttled\")\n-            except BlockingIOError:\n-                # The kernel send buffer is full (EAGAIN).\n-                # That's good, but we still need to determine if we are\n-                # feeling backpressure from the server or the client-side buffer.\n-                if stuck_since is None:\n-                    stuck_since = time.monotonic()\n-                elif time.monotonic() - stuck_since > STALL_TIMEOUT:\n-                    # No progress: the server has stopped reading.\n-                    break\n-            if stuck_since is None and time.monotonic() - start > PROGRESS_TIMEOUT:\n-                # Continuous progress: the server is still draining the\n-                # receive buffer while a request is in flight.\n-                raise AssertionError(\n-                    f\"Server kept reading pipelined data ({sent} bytes) while a \"\n-                    f\"request was still in flight for {PROGRESS_TIMEOUT}s.\")\n-            time.sleep(0.05)\n-\n-        self.log.info(f\"Pipelined flood stalled after {sent} bytes; no progress for {STALL_TIMEOUT}s.\")\n+        # Use a background thread to push flood data until either an absurd\n+        # limit has been reached (server is not throttling) or the foreground\n+        # thread has determined that the server is throttling correctly.\n+        # We can't rely on TCP backpressure at the client socket to assert\n+        # server behavior because different platforms (macos in particular)\n+        # like to open and close the TCP window size based on heuristics\n+        # out of our control, and delay transmission when windows get too small.\n+        flood_open = True\n+\n+        def send_flood(self, conn):\n+            sent_total = 0\n+            blocked = False\n+            while flood_open:\n+                try:\n+                    sent = conn.conn.sock.send(flood)\n+                    sent_total += sent\n+                    blocked = False\n+                    self.log.debug(f\"Client sent {sent} (total {sent_total})\")\n+                except BlockingIOError:\n+                    if not blocked:\n+                        blocked = True\n+                        self.log.debug(f\"Client socket blocked after sending {sent_total}\")\n+                if sent_total > len(flood) * 10:\n+                    # Don't use AssertionError here or it'll get excepted below\n+                    raise Exception(f\"Client sent too much data: {sent_total}\")",
+      "path": "test/functional/interface_http.py",
+      "position": 104,
+      "original_position": 104,
+      "commit_id": "b481e99e3018ce218570b4d8173b729c548a5ce3",
+      "original_commit_id": "b481e99e3018ce218570b4d8173b729c548a5ce3",
+      "in_reply_to_id": 4103315938,
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "ok, reverting this",
+      "created_at": "2026-09-25T11:19:15Z",
+      "updated_at": "2026-09-25T11:19:15Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36303#discussion_r4103984829",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4103984829"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36303"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 783,
+      "original_line": 783,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4104041307",
+      "pull_request_review_id": 5317080083,
+      "id": 4104041307,
+      "node_id": "PRRC_kwDOABII5870nrNb",
+      "diff_hunk": "@@ -741,55 +747,92 @@ def check_pipelined_data_is_throttled(self):\n             body\n         ).encode(\"ascii\")\n \n-        # Non-blocking send: When the server stops reading from the buffer\n-        # due to TCP backpressure, Python will raise an error. If the socket\n-        # was set to blocking, we would have to wait for an ambiguous timeout.\n+        # Save a debug log checkpoint\n+        dl_start_size = self.node.debug_log_size(encoding=\"utf-8\")\n+\n+        # Non-blocking send: When the server stops reading from the buffer,\n+        # Python will raise an error. That stop could be due to actual\n+        # backpressure from the server or any other throttle in the TCP chain.\n+        # If the socket was set to blocking, we would have to wait for a timeout.\n         conn.conn.sock.setblocking(False)\n \n-        # Kernel socket buffer sizes vary widely across platforms,\n-        # so we can't rely on counting sent() bytes to determine if the\n-        # server is actually draining its end of the socket.\n-        # When the server is busy, a continuous flood from the client SHOULD,\n-        # at some point, stall indefinitely. An unpatched server will continue\n-        # to accept data from the socket, at some rate, indefinitely.\n-\n-        # If send() is blocked for this many seconds, we assume the server\n-        # is behaving correctly.\n-        STALL_TIMEOUT = 5\n-        # If send() continues to progress for this many seconds, we assume\n-        # the server is vulnerable to memory exhaustion.\n-        PROGRESS_TIMEOUT = 10\n-\n-        sent = 0\n-        stuck_since = None\n-        start = time.monotonic()\n-        while True:\n-            try:\n-                sent += conn.conn.sock.send(flood[sent % len(flood):])\n-                # Progress: the server is still reading\n-                stuck_since = None\n-                self.log.debug(f\"sent: {sent}\")\n-                assert sent <= len(flood) * 10, (\n-                    f\"Server accepted {sent} bytes of pipelined data while a \"\n-                    \"request was still in flight: the receive buffer is not throttled\")\n-            except BlockingIOError:\n-                # The kernel send buffer is full (EAGAIN).\n-                # That's good, but we still need to determine if we are\n-                # feeling backpressure from the server or the client-side buffer.\n-                if stuck_since is None:\n-                    stuck_since = time.monotonic()\n-                elif time.monotonic() - stuck_since > STALL_TIMEOUT:\n-                    # No progress: the server has stopped reading.\n+        # Use a background thread to push flood data until either an absurd\n+        # limit has been reached (server is not throttling) or the foreground\n+        # thread has determined that the server is throttling correctly.\n+        # We can't rely on TCP backpressure at the client socket to assert\n+        # server behavior because different platforms (macos in particular)\n+        # like to open and close the TCP window size based on heuristics\n+        # out of our control, and delay transmission when windows get too small.\n+        flood_open = True\n+\n+        def send_flood(self, conn):\n+            sent_total = 0\n+            blocked = False\n+            while flood_open:\n+                try:\n+                    sent = conn.conn.sock.send(flood)\n+                    sent_total += sent\n+                    blocked = False\n+                    self.log.debug(f\"Client sent {sent} (total {sent_total})\")",
+      "path": "test/functional/interface_http.py",
+      "position": 97,
+      "original_position": 87,
+      "commit_id": "b481e99e3018ce218570b4d8173b729c548a5ce3",
+      "original_commit_id": "f86eb92d9a5b2ef349c7002fb3bcb44f371870e0",
+      "in_reply_to_id": 4097957303,
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "👍 ",
+      "created_at": "2026-09-25T11:26:38Z",
+      "updated_at": "2026-09-25T11:26:39Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36303#discussion_r4104041307",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4104041307"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36303"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 776,
+      "original_line": 776,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4104076688",
+      "pull_request_review_id": 5317125345,
+      "id": 4104076688,
+      "node_id": "PRRC_kwDOABII5870nz2Q",
+      "diff_hunk": "@@ -741,55 +747,92 @@ def check_pipelined_data_is_throttled(self):\n             body\n         ).encode(\"ascii\")\n \n-        # Non-blocking send: When the server stops reading from the buffer\n-        # due to TCP backpressure, Python will raise an error. If the socket\n-        # was set to blocking, we would have to wait for an ambiguous timeout.\n+        # Save a debug log checkpoint\n+        dl_start_size = self.node.debug_log_size(encoding=\"utf-8\")\n+\n+        # Non-blocking send: When the server stops reading from the buffer,\n+        # Python will raise an error. That stop could be due to actual\n+        # backpressure from the server or any other throttle in the TCP chain.\n+        # If the socket was set to blocking, we would have to wait for a timeout.\n         conn.conn.sock.setblocking(False)\n \n-        # Kernel socket buffer sizes vary widely across platforms,\n-        # so we can't rely on counting sent() bytes to determine if the\n-        # server is actually draining its end of the socket.\n-        # When the server is busy, a continuous flood from the client SHOULD,\n-        # at some point, stall indefinitely. An unpatched server will continue\n-        # to accept data from the socket, at some rate, indefinitely.\n-\n-        # If send() is blocked for this many seconds, we assume the server\n-        # is behaving correctly.\n-        STALL_TIMEOUT = 5\n-        # If send() continues to progress for this many seconds, we assume\n-        # the server is vulnerable to memory exhaustion.\n-        PROGRESS_TIMEOUT = 10\n-\n-        sent = 0\n-        stuck_since = None\n-        start = time.monotonic()\n-        while True:\n-            try:\n-                sent += conn.conn.sock.send(flood[sent % len(flood):])\n-                # Progress: the server is still reading\n-                stuck_since = None\n-                self.log.debug(f\"sent: {sent}\")\n-                assert sent <= len(flood) * 10, (\n-                    f\"Server accepted {sent} bytes of pipelined data while a \"\n-                    \"request was still in flight: the receive buffer is not throttled\")\n-            except BlockingIOError:\n-                # The kernel send buffer is full (EAGAIN).\n-                # That's good, but we still need to determine if we are\n-                # feeling backpressure from the server or the client-side buffer.\n-                if stuck_since is None:\n-                    stuck_since = time.monotonic()\n-                elif time.monotonic() - stuck_since > STALL_TIMEOUT:\n-                    # No progress: the server has stopped reading.\n+        # Use a background thread to push flood data until either an absurd\n+        # limit has been reached (server is not throttling) or the foreground\n+        # thread has determined that the server is throttling correctly.\n+        # We can't rely on TCP backpressure at the client socket to assert\n+        # server behavior because different platforms (macos in particular)\n+        # like to open and close the TCP window size based on heuristics\n+        # out of our control, and delay transmission when windows get too small.\n+        flood_open = True",
+      "path": "test/functional/interface_http.py",
+      "position": 77,
+      "original_position": 77,
+      "commit_id": "f86eb92d9a5b2ef349c7002fb3bcb44f371870e0",
+      "original_commit_id": "f86eb92d9a5b2ef349c7002fb3bcb44f371870e0",
+      "in_reply_to_id": 4098283758,
+      "user": {
+        "login": "pinheadmz",
+        "id": 2084648,
+        "node_id": "MDQ6VXNlcjIwODQ2NDg=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2084648?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pinheadmz",
+        "html_url": "https://github.com/pinheadmz",
+        "followers_url": "https://api.github.com/users/pinheadmz/followers",
+        "following_url": "https://api.github.com/users/pinheadmz/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pinheadmz/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pinheadmz/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pinheadmz/subscriptions",
+        "organizations_url": "https://api.github.com/users/pinheadmz/orgs",
+        "repos_url": "https://api.github.com/users/pinheadmz/repos",
+        "events_url": "https://api.github.com/users/pinheadmz/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pinheadmz/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "Interesting suggestion! I'll try it out",
+      "created_at": "2026-09-25T11:32:00Z",
+      "updated_at": "2026-09-25T11:32:01Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36303#discussion_r4104076688",
+      "author_association": "MEMBER",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4104076688"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36303"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 766,
+      "original_line": 766,
       "side": "RIGHT"
     }
   ]
