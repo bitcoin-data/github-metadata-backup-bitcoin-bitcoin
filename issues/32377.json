@@ -12,8 +12,8 @@
     "number": 32377,
     "state": "open",
     "state_reason": null,
-    "title": "Verify AssumeUTXO snapshot hashes during full validation as well",
-    "body": "### Summary\n\nWe already hard‑code the AssumeUTXO height/UTXO-snapshot-hash/tx-count pairs (e.g. for mainnet we have heights **840,000** and **880,000**) in https://github.com/bitcoin/bitcoin/blob/master/src/kernel/chainparams.cpp#L170-L183.\nCurrently, this commitment is enforced only when a node explicitly activates a snapshot via `loadtxoutset`.\n\nDuring a regular initial block download, `-reindex`, or `-reindex-chainstate`, the node never cross‑checks the live chainstate against these values.\n\n### Proposal\n\nSince the expected UTXO set hash is known at the snapshot heights, we could verify it during full validation to cover both IBD and stored AssumeUTXO data.\nThis self‑consistency check would synchronize the outcomes of both seeding approaches.\nWhile iterating transactions we'd compute the current hash, and when reaching a snapshot height, we'd assert that the UTXO set hash and transaction count match the hardcoded values.\n\nThis cross‑reference would increase confidence in both mechanisms.\n\nOptionally, we could gate this behavior behind the `assumevalid` flag.",
+    "title": "AssumeUTXO: crowdsource trust through independent snapshot verification",
+    "body": "## Problem\n\nAssumeUTXO lets a node load a snapshot and validate new blocks before validating the history that produced it. Until background validation finishes, the node relies on the snapshot hash shipped with Core. It can therefore be caught up while its history is still unvalidated, a distinction that needs special RPC and wallet reporting, as [#33259](https://github.com/bitcoin/bitcoin/pull/33259) and [#28616](https://github.com/bitcoin/bitcoin/pull/28616) illustrate.\n\nSupporting that transition requires two chainstates with different roles, which notifications, pruning, cache allocation, indexes, and reorgs all have to handle. These roles reach into validation code and create interactions such as cache rebalancing replacing a database while an RPC still uses it ([#35744](https://github.com/bitcoin/bitcoin/pull/35744)). Even an ordinary validation fix needs extra reasoning about both chainstates ([#34521](https://github.com/bitcoin/bitcoin/pull/34521#pullrequestreview-3761920357)), making the most critical part of the codebase harder to understand and review.\n\nWe already bake the expected UTXO set hash at the snapshot block into the source code and binary, but normal IBD ignores it completely. Checking it there would be inexpensive, so we could make it the default and let users opt out, crowdsourcing trust instead of relying on people to opt in.\n\nI would like to use that check to make snapshot trust clearer and reduce these special cases in validation, while keeping both fast snapshot startup and local historical validation available to users who choose them.\n\n## Proposed approach\n\n### 1. Check the snapshot hash during IBD\n\nWhen IBD reaches the snapshot height, the node could hash the flushed UTXO set, compare the result with the hash in Core, and report whether it matched and how long the check took. These routine checks would give snapshot users confidence that others are independently verifying the state they bootstrap from.\n\nThe hash would still be selected in chainparams, but everyone doing IBD with the default settings would check it, so one honest participant could reveal a wrong value. Snapshot users would still not have validated the history locally, and the network would not prove that others ran the check. The assurance would come from independent validators finding and reporting mismatches, and from those reports being investigated.\n\n### 2. Keep only the latest snapshot hash per network\n\nA single hash gives every node running a release the same UTXO set to check, without rescanning it at each older snapshot height. Older snapshots would still work with a compatible older release, but retiring them would affect unfinished snapshot datadirs and which snapshots peers can provide. We should discuss that compatibility separately from the hash check.\n\n[David Harding's original feedback](https://github.com/jamesob/assumeutxo-docs/blob/2019-04-proposal/proposal/feedback-david-harding.txt) already questioned keeping old snapshots and requiring every snapshot user to replay history, while calling for easy hash checks by ordinary nodes.\n\n### 3. Make snapshot trust an explicit choice\n\nOnce IBD checks the hash by default, users could choose to continue from a snapshot without replaying its history in the background. Deciding this upfront would let their node validate new blocks with one chainstate, removing the role changes, cache splitting, progress reports, and download scheduling that background replay needs.\n\nThis gives a different assurance from local historical validation. An incorrect UTXO set could still match a bad hash, leaving its users at risk even if others reported the problem. We would need to define what happens after a reorg below the snapshot height and how wallet history, indexes, restart, recovery, and serving old blocks work. Snapshot loading and parser fixes should remain independently reviewable.\n\n## Why the IBD check is not a new checkpoint\n\nThe IBD check would compare against a hash that already exists, without changing the rules for accepting blocks or choosing the valid chain with the most work. The node would report a mismatch instead of stopping IBD, which addresses the checkpoint concern raised here. I would therefore drop my original suggestion to assert on it, while imported snapshots would still have to match the hash in Core.\n\nUsers who continue from a snapshot would still trust its starting state, and the hash does not tell the node how to handle a reorg below the snapshot height. That choice is separate from the IBD hash check and needs its own discussion.\n\n## Cost and related work\n\nWith one snapshot hash, an uninterrupted IBD would scan the UTXO set once, although reindexing or reconnecting the snapshot block could repeat the scan. On my M4 Max laptop, hashing the UTXO set already on disk took 67–81 seconds across three runs of a Release build, so less than two minutes. Anyone who does not want to pay that cost could disable the check.\n\n[Earlier measurements](https://github.com/bitcoin/bitcoin/issues/32029#issuecomment-2715987586) range from about a minute for `gettxoutsetinfo` on an M4 to much longer snapshot checks under different build and runtime conditions. We still need Release-build measurements of disk writes, scanning, total IBD time, and pauses on slower hardware.\n\nThe hash check could also cover the UTXO set produced by [pruneassumevalid (#36476)](https://github.com/bitcoin/bitcoin/issues/36476), increasing confidence in the result without proving that skipped witness checks or every intermediate validation rule were correct. [SwiftSync](https://github.com/bitcoin/bips/pull/2152) could benefit from simpler validation and independent UTXO hash checks as well, while still needing its own verification.\n\nMy main concern with [P2P UTXO sharing (#35054)](https://github.com/bitcoin/bitcoin/pull/35054#issuecomment-4488453829) was extending the use of two chainstates. If we make snapshot trust explicit and simplify validation around one starting state, I would be comfortable supporting P2P snapshot distribution, although its protocol and resource limits would still need review.\n\n## Previous discussion\n\n[Sipa already discussed P2P snapshots without background replay](https://github.com/bitcoin/bitcoin/pull/35054#issuecomment-4501781606), covering bandwidth, simpler validation, and trust in the software review process. [Fjahr disagreed with dropping background replay](https://github.com/bitcoin/bitcoin/pull/35054#issuecomment-4530515268) because Fjahr's intended users want their nodes to eventually validate the history locally. This proposal adds default IBD hash checks to Sipa's idea, but we still need to resolve that disagreement before treating removal of background replay as an agreed cleanup.\n\n[Russ raised the same concern about code complexity in the original implementation PR](https://github.com/bitcoin/bitcoin/pull/15606#issuecomment-869986387), arguing that validation outside `ChainstateManager` should not need to know about the different AssumeUTXO phases and roles. That was a call for clearer code rather than for removing historical validation, but it targets the complexity this proposal aims to reduce.\n\n## Concrete maintenance examples\n\n* [#35744](https://github.com/bitcoin/bitcoin/pull/35744): cache rebalancing can replace a database during an RPC scan. The fix waits for the scan, which can stall work that needs `cs_main`.\n* [#32975](https://github.com/bitcoin/bitcoin/pull/32975#discussion_r2264099546): script-check logs need to distinguish snapshot and background validation.\n* [#34521](https://github.com/bitcoin/bitcoin/pull/34521#pullrequestreview-3761920357): a validation fix had to account for block candidates in both chainstates.\n* [#32029](https://github.com/bitcoin/bitcoin/issues/32029): restarting needs extra completion checks, even for a fully validated snapshot.\n* [#36220](https://github.com/bitcoin/bitcoin/pull/36220): RPCs report different progress for the same background chainstate.\n\nWe can fix each bug, but the extra cases make validation harder to review and easier to get wrong. I would start with the IBD hash check and measurements, keep import fixes separate, and use this issue to agree on what users would trust and which history stays available before changing the chainstate lifecycle.\n",
     "user": {
       "login": "l0rinc",
       "id": 1841944,
@@ -67,7 +67,7 @@
     "locked": false,
     "comments": 4,
     "created_at": "2025-04-29T13:34:28Z",
-    "updated_at": "2026-01-15T09:21:56Z"
+    "updated_at": "2026-10-09T08:22:09Z"
   },
   "events": [
     {
@@ -436,6 +436,41 @@
       "label": {
         "name": "Validation",
         "color": "6060aa"
+      }
+    },
+    {
+      "event": "renamed",
+      "id": 32858610434,
+      "node_id": "RTE_lADOABII5860gWoizwAAAAemhpsC",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/32858610434",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-10-09T08:22:02Z",
+      "rename": {
+        "from": "Verify AssumeUTXO snapshot hashes during full validation as well",
+        "to": "AssumeUTXO: crowdsource trust through independent snapshot verification"
       }
     }
   ]
