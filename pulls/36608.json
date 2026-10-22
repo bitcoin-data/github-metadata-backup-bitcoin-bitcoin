@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36608/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36608/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/d353967eb0590dbede7bbe4cdc6d3333be01a899",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/463f9859bb70cfc4d64aff327e4d4f7582b77edf",
     "number": 36608,
     "state": "open",
     "locked": false,
@@ -41,21 +41,29 @@
       "patch_url": null
     },
     "body": "## Goals\r\n\r\nGoal 1: Remove reliance on, and probes about, internal node state from private broadcast\r\n\r\nGoal 2: Specify observable behavior to aid reimplementation and reduce profile fingerprints across versions\r\n\r\n### Layout\r\n\r\nFour parts, each starting with an empty marker commit:\r\n\r\n1. support: moves shared code into the common library; no behavior change\r\n2. bitcoin-privbcast: the specification and the standalone tool\r\n3. bitcoind -privatebroadcast as jobs: the node runs the tool's job; the old relay and connections are removed\r\n4. package mode: one parent and its child. Its validation commits (saturating fee sum, test-accept as submission, self-paying parent) serve only this part.\r\n\r\nFor the v33 release, I think 1 through 3 should be the goal, but the roadmap could be trimmed down to remove tool-only code if the conceptual support for the standalone tool is not there.\r\n\r\nThe tool itself introduces about 600 loc of logic, and also necessitates some of the prep move-only commits putting things in common. The vast majority is the shared Job machinery.\r\n\r\n\r\n## Node-less state\r\n\r\nThe primary failure mode of the in-master private broadcast is that it relies on node state for operation, and this has led to a number of \"careful coding\" fixes:\r\n\r\n1. The v2->v1 retry connected directly, without the proxy: #35319 (merged in #35410)\r\n2. Discouraging a misbehaving peer gave a clearnet oracle: #36312\r\n3. Eager job completion via mempool inspection: #36277\r\n4. Private broadcast connections wrote to addrman: #35032\r\n\r\nThere are many other sources of fingerprints as well, some harder than others to exploit, and to fix. The solution: remove reliance on node state entirely to drive attempts. The spec states the goals as:\r\n\r\n- A job reveals neither the sender's IP address, onion address nor node identity to any party.\r\n- A hostile recipient, DNS seed or Tor exit learns no more than an honest one. It can only affect delivery.\r\n\r\n### Jobs, slots and opportunities\r\n\r\n- **Job**: one broadcast of one transaction, from submission to its report. A job spends its first 12 s finding candidates (IPv4/IPv6 addresses from the DNS seeds, resolved through Tor exits), then delivers. It runs for at most 10 min.\r\n- **Slot**: one of a job's 6 independent delivery targets. Each slot tries to announce the transaction to one peer and serve it when asked. Slots 0–2 open when delivery starts; slot 3 opens 35–180 s later; slots 4–5 open 185–240 s later, at least 5 s apart. Each of these times is drawn at random within its range.\r\n- **Opportunity**: one of a slot's 4 scheduled connection times: a first attempt and up to 3 fallbacks, each 50–60 s after the previous. A fallback runs only if the slot's previous attempt failed before announcing; once a slot announces, its remaining opportunities are dropped.\r\n\r\nThe times are drawn at job start, and each opportunity's candidate is fixed when discovery ends, before any peer is contacted. Nothing a peer does moves them (C1–C4). A job makes at most 24 connections, at most 6 of them at once.\r\n\r\n### Differences at a glance\r\n\r\n| | master | this PR |\r\n|---|---|---|\r\n| Where it runs | Inside `bitcoind` only | `bitcoind -privatebroadcast`, or the standalone `bitcoin-privbcast` with no node; the same job either way (U3), with a JSON report of every connection |\r\n| Recipients | `addrman.Select()` over onion, I2P, and IPv4/IPv6 through the proxy; networks follow `-onlynet` | DNS seed names resolved through Tor exits (RESOLVE), IPv4/IPv6 only; no node state used (R1, R6) |\r\n| Connections | `CConnman` peers of type `PRIVATE_BROADCAST`, visible in `getpeerinfo` | The job's own proxy streams, each with fresh SOCKS credentials, so each gets its own circuit; not peers of the node |\r\n| Plan | 3 connections, then more whenever the tx is stale (5 min, then 1 min) until it comes back from the network | 6 slots of 4 opportunities, all scheduled at job start; no retries; at most 10 min |\r\n| Transport | v2 when addrman advertises it, otherwise v1, with a v2→v1 retry | BIP324 v2 only, with one constant VERSION per release (B4, E1) |\r\n| Node settings | Shape which networks and peers are used | Peer-selection settings don't apply to jobs (U2) |\r\n| Packages | — | `submitpackage` with one parent and one child: announce the child, serve the parent on request |\r\n\r\n### No addrman\r\n\r\nUnder master, the node's private broadcast destinations are drawn from the node's addrman. Other parties write to that table through addr gossip, which makes it a unique fingerprint vector, and inherently attacker influenced. This rules out drawing recipients from anything the node or its peers can write to.\r\n\r\nIts replacement is querying DNS seeds in a predetermined way under a static profile. This is inherently less robust than the p2p network in terms of liveness, but leaves no fingerprint within a release. The marginal fingerprint is the set of DNS seeds per release, which affects who is queried and exactly how. Each RESOLVE returns one address and exits cache answers, so each seed is asked through several exits: 4 Tor circuits, each querying all 7 seeds, for up to 28 results, which are assigned to the 6x4 opportunities before any dialing happens. A circuit per query, 28 in all, kept Tor busy enough that overlapping discoveries lost answers.\r\n\r\nIf the list shrinks, grows, or is modified, the release is revealed to the Tor exits carrying the queries, which see every seed name queried. A DNS seed learns only that it is on the list, and only when the exit has no cached answer.\r\n\r\nThe fingerprint potential also precludes fixed seeds, which change greatly each release, and which degrade in connectivity over time regardless.\r\n\r\n### Minimal release fingerprint\r\n\r\nOnce a release is cut, behavior profiles are intended to be identical per user. This precludes user knobs and per-instance parameters, and requires a constant user agent and VERSION.\r\n\r\nAcross releases, the reimplemented p2p message state machine allows better control of unnecessary profile breaks going forward.\r\n\r\n### Specification\r\n\r\n`doc/design/private-broadcast-tool.md` comes before any code in part 2. It has goals, a threat model per party (recipient, exit, seed, network observer, guard), 54 numbered invariants (A–U, N), parameters, interface, assumptions, non-goals and a rationale. Code comments and tests cite the invariant IDs, so review can check code against a stated property. Concept review of the goals, threat model and non-goals is most useful first, then review of the implementation against the invariants.\r\n\r\nThis implementation is actually the second implementation, initially implemented solely via the spec and black box tests, which were handed to an otherwise blind agent.\r\n\r\n### Tradeoffs\r\n\r\n- Needs Tor, including Tor's RESOLVE extension. I2P is gone, and so are onion recipients. To re-add these, we need a connect->GETADDR step, and then have to filter out most of the addresses that do not answer when dialed.\r\n- DNS seeds and Tor exits learn that a job ran, in addition to end recipients.\r\n- No retries beyond the scheduled fallbacks. Retrying would act on whether the transaction comes back, which the adversary controls; the user resubmits instead.\r\n- `getprivatebroadcastinfo` now reports jobs, and the connections no longer show in `getpeerinfo`.\r\n",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2026-10-22T14:47:27Z",
-    "updated_at": "2026-10-22T14:48:35Z",
-    "mergeable": true,
-    "mergeable_state": "blocked",
+    "updated_at": "2026-10-22T15:18:05Z",
+    "mergeable_state": "unknown",
     "merged": false,
-    "merge_commit_sha": "ffc815f3158ae2713f7aa74482d522269c8be201",
+    "merge_commit_sha": "ebddf6008893e9b4ff43c90db951276831761f16",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
-    "rebaseable": true,
     "head": {
       "label": "instagibbs:privbcast-4-package",
       "ref": "privbcast-4-package",
-      "sha": "d353967eb0590dbede7bbe4cdc6d3333be01a899",
+      "sha": "463f9859bb70cfc4d64aff327e4d4f7582b77edf",
       "user": {
         "login": "instagibbs",
         "id": 5767891,
@@ -168,7 +176,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-10-22T13:58:49Z",
+        "pushed_at": "2026-10-22T15:15:38Z",
         "created_at": "2013-10-27T20:56:53Z",
         "updated_at": "2026-10-21T18:55:14Z",
         "allow_forking": true,
@@ -289,12 +297,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39387,
+        "forks_count": 39389,
         "stargazers_count": 90456,
         "watchers_count": 90456,
         "size": 330355,
         "default_branch": "master",
-        "open_issues_count": 769,
+        "open_issues_count": 766,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -311,9 +319,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-10-22T10:50:57Z",
+        "pushed_at": "2026-10-22T15:53:16Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-10-22T14:27:03Z",
+        "updated_at": "2026-10-22T15:53:24Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -339,12 +347,12 @@
     },
     "author_association": "MEMBER",
     "draft": false,
-    "additions": 17212,
+    "additions": 17227,
     "deletions": 4442,
     "changed_files": 121,
     "commits": 35,
     "review_comments": 0,
-    "comments": 1
+    "comments": 2
   },
   "events": [
     {
@@ -588,1166 +596,6 @@
       "sha": "6a0027f99bfa87ff9f5b40bd136f3786458ae924"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDdkNDVjMDNhZjcwMmI1ZWVlMTg4MGYzZDY2ODkzZGNjYjg3MWJlM2U",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7d45c03af702b5eee1880f3d66893dccb871be3e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7d45c03af702b5eee1880f3d66893dccb871be3e",
-      "tree": {
-        "sha": "8ee77565b7f59804563d4f2d62375eab3ac5d821",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8ee77565b7f59804563d4f2d62375eab3ac5d821"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6a0027f99bfa87ff9f5b40bd136f3786458ae924",
-          "sha": "6a0027f99bfa87ff9f5b40bd136f3786458ae924",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/6a0027f99bfa87ff9f5b40bd136f3786458ae924"
-        }
-      ],
-      "message": "doc: add the private broadcast specification\n\nThis is the design the following commits implement: what a private\nbroadcast job guarantees, the values peers and observers see, and the\ninterfaces of the tool and the node. Later commits cite its items by\nnumber.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T15:34:00Z"
-      },
-      "sha": "7d45c03af702b5eee1880f3d66893dccb871be3e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDNkNGVhZmJlYWY1NzM2ZmUzMmZmNWRmMTQ0NmI2ZGYzMTY0NDViY2E",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3d4eafbeaf5736fe32ff5df1446b6df316445bca",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/3d4eafbeaf5736fe32ff5df1446b6df316445bca",
-      "tree": {
-        "sha": "8519ad897e46b7b0bacd7fdd5d2ce30d35b98138",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8519ad897e46b7b0bacd7fdd5d2ce30d35b98138"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7d45c03af702b5eee1880f3d66893dccb871be3e",
-          "sha": "7d45c03af702b5eee1880f3d66893dccb871be3e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7d45c03af702b5eee1880f3d66893dccb871be3e"
-        }
-      ],
-      "message": "privbcast: add the parameters and the schedule\n\nStart bitcoin_privbcast, the library that will run private broadcast\njobs for bitcoin-privbcast and the node. params.h holds the values of\nthe specification. DrawPlan draws a job's plan from the job's own\nrandomness: the schedule, the order of the DNS seeds and the seed of\nthe order in which each DNS seed hands out its candidates.\nMIN_DNS_SEEDS is the floor R3 sets for the mainnet seed list, and a\nunit test holds the list to it, so a release that drops seeds below\nwhat fills a job fails the test rather than leaving opportunities\nempty.\n\nImplements C1 and R3; the values of Parameters.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T15:51:39Z"
-      },
-      "sha": "3d4eafbeaf5736fe32ff5df1446b6df316445bca"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGZkNDhiY2MzN2UxNmI2NTYyMDA4OWFkNWE4YmM3Mjc2NjZhYWI5OGM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fd48bcc37e16b65620089ad5a8bc727666aab98c",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/fd48bcc37e16b65620089ad5a8bc727666aab98c",
-      "tree": {
-        "sha": "bccf39bb7c59a694e20f0b00632f7e8a1bbf245e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/bccf39bb7c59a694e20f0b00632f7e8a1bbf245e"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3d4eafbeaf5736fe32ff5df1446b6df316445bca",
-          "sha": "3d4eafbeaf5736fe32ff5df1446b6df316445bca",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/3d4eafbeaf5736fe32ff5df1446b6df316445bca"
-        }
-      ],
-      "message": "privbcast: add candidate assignment\n\nAssign fixes every opportunity's candidate once discovery ends, from\nthe plan and the discovery result alone. An endpoint that several\nseeds returned is credited to the seed that comes first in the plan's\nseed order, through the lowest query set that returned it. Each seed\nhands out its candidates in an order drawn at random by a generator of\nits own, seeded from the plan and the seed's place in that order. Slot\nj's first attempt comes from query set j mod 4 whenever a seed it may\ndraw from has one, so a single exit supplies at most two first\nattempts. Neither which seed answers first nor the order of a seed's\nanswers changes the assignment.\n\nImplements C2, R2, R4, R5a, R5b and R5c.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T15:55:22Z"
-      },
-      "sha": "fd48bcc37e16b65620089ad5a8bc727666aab98c"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDVjYzhkMjdlZjQ5Zjc2YTQyZjM1OTAxZTQwOTFhY2I2MDEzMWY4MzA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5cc8d27ef49f76a42f35901e4091acb60131f830",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/5cc8d27ef49f76a42f35901e4091acb60131f830",
-      "tree": {
-        "sha": "33b89f9598420f4c7a76842dfa870e0a8ce7ec21",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/33b89f9598420f4c7a76842dfa870e0a8ce7ec21"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fd48bcc37e16b65620089ad5a8bc727666aab98c",
-          "sha": "fd48bcc37e16b65620089ad5a8bc727666aab98c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/fd48bcc37e16b65620089ad5a8bc727666aab98c"
-        }
-      ],
-      "message": "privbcast: add a byte-driven SOCKS5 client\n\nA job reaches recipients and resolves DNS seed names through the proxy,\non streams its event loop drives without blocking. Socks5Client holds\nno socket: it offers the bytes to write, consumes the proxy's replies,\nand leaves bytes past the final reply to the P2P transport. It offers\nonly username and password authentication, with the credentials it is\ngiven or fresh ones, and sends a numeric address as IPV4 or IPV6\nwithout resolving anything.\n\nImplements B2 and the Proxy interface section.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T17:00:05Z"
-      },
-      "sha": "5cc8d27ef49f76a42f35901e4091acb60131f830"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDY0Y2I3ZjBkMzhhNjViMDE4ZjkxMmIwZjI2OTNmNTg3NTE0OGViMzM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/64cb7f0d38a65b018f912b0f2693f5875148eb33",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/64cb7f0d38a65b018f912b0f2693f5875148eb33",
-      "tree": {
-        "sha": "6946111ebe3a639aa6492c88b09c9295d31a1cce",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6946111ebe3a639aa6492c88b09c9295d31a1cce"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5cc8d27ef49f76a42f35901e4091acb60131f830",
-          "sha": "5cc8d27ef49f76a42f35901e4091acb60131f830",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/5cc8d27ef49f76a42f35901e4091acb60131f830"
-        }
-      ],
-      "message": "privbcast: add the attempt state machine\n\nAn attempt is one connection to a recipient once the proxy connected\nit: a BIP324 session as initiator, the handshake with the job's\nVERSION, one INV, the transaction served at most once, and the PING.\nIt holds no socket and reads no clock: the job's loop passes the bytes\nread and the time; each call records what happened (a completed write,\nthe connection, bytes received) and then enforces the attempt's\ndeadlines, so that nothing is acted on at or after one.\n\nThe attempt draws its VERSION and PING nonces from the random context\nit is given, and takes its BIP324 key, ellswift entropy and garbage\nfrom a key source. Without one, as in production, V2Transport draws\nthem from the strong RNG. The tests and the fuzz target inject a\nsource that draws from their seeded context, so that an attempt's\nbytes are a function of that context and of what the peer sent.\n\nImplements E1-E8, A2, B4, D3 and the attempt part of D2.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T17:30:51Z"
-      },
-      "sha": "64cb7f0d38a65b018f912b0f2693f5875148eb33"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDgwZGE2MzMwYmI4YTg0NzFiMTJkMzI4NGM5YzA3MWE2ZmI4ZjY1MTE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/80da6330bb8a8471b12d3284c9c071a6fb8f6511",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/80da6330bb8a8471b12d3284c9c071a6fb8f6511",
-      "tree": {
-        "sha": "86adfc43e09b9e2324b1daa5dbdb025e2d77a6d4",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/86adfc43e09b9e2324b1daa5dbdb025e2d77a6d4"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/64cb7f0d38a65b018f912b0f2693f5875148eb33",
-          "sha": "64cb7f0d38a65b018f912b0f2693f5875148eb33",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/64cb7f0d38a65b018f912b0f2693f5875148eb33"
-        }
-      ],
-      "message": "privbcast: add proxy streams and discovery\n\nA job reaches the network only through streams to the SOCKS5 proxy,\nwhich its event loop drives without blocking. ProxyStream connects to\nthe proxy by address or unix socket path, resolving nothing, and runs\nthe exchange of its Socks5Client; each stage, the connect and each\nstep of the exchange, times out on the steady clock. Once the proxy\nhas connected the stream, its socket carries the destination's bytes.\n\nDiscovery launches every RESOLVE query at job start, each on a stream\nof its own, in four query sets: each set has credentials of its own\nand one query of every seed, so Tor builds four circuits rather than\none per query, and each seed is still asked through four exits.\nDiscovery ends when every query has ended or when the discovery window\ndoes, whatever is still pending. It keeps the answers that are public\nroutable IPv4 or IPv6 addresses, with the chain's default port, and\ncounts the others; its result gives each seed's answers by the query\nset they came through, whatever order they arrived in. An exception\nthrown while it acts on one query ends only that query, as a failed\nstream would.\n\nThe tests run discovery against a scripted proxy behind fake sockets\nthat connect as non-blocking sockets do. The fake socket and the\nproxy's side of the SOCKS5 exchange go into the test utilities, as the\njob's tests use them too.\n\nImplements B1, B2, C3, D1, R1, R2 and C7 for the queries.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T18:18:54Z"
-      },
-      "sha": "80da6330bb8a8471b12d3284c9c071a6fb8f6511"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDU3NmQwMDZmNzRmZWQ4NTYxNWYwODI5ZjI4MGJjZTYxNDExMjMyMGM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/576d006f74fed85615f0829f280bce614112320c",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/576d006f74fed85615f0829f280bce614112320c",
-      "tree": {
-        "sha": "9bafe4557706e97c7970c8db6120ec2a383e1dd1",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9bafe4557706e97c7970c8db6120ec2a383e1dd1"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/80da6330bb8a8471b12d3284c9c071a6fb8f6511",
-          "sha": "80da6330bb8a8471b12d3284c9c071a6fb8f6511",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/80da6330bb8a8471b12d3284c9c071a6fb8f6511"
-        }
-      ],
-      "message": "privbcast: add the job\n\nA job is one event loop on its caller's thread. Step() runs the\ndeadlines and the dials that are due, waits on every open stream until\nthe next deadline, and does the I/O; Run() steps to the end. The plan\nis drawn when the job is made, before any socket exists, and discovery\nstarts with the first step. When discovery ends the assignment is\nfixed, and each slot dials its opportunities at their scheduled times,\none attempt at a time, until one reaches the announcement point or\nnone is left. The slots share only the loop, so a stalled stream holds\nup no other slot, and the cancel flag ends everything at the next step.\n\nAn exception thrown while the loop acts on one attempt ends only that\nattempt, as a failed stream would. One thrown anywhere else in a step\nfails the job: it stops as a cancelled job does, and its report gives\nthe error.\n\nThe report mirrors Interface/Report, every time an offset from job\nstart on the plan clock. Snapshot() gives the progress the node is to\nshow, from any thread. ExitStatus() gives the tool's exit status for a\nreport.\n\nImplements A1, A3, A4, C1-C8, D1, D2, H1, H3 and the report interface.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T18:31:42Z"
-      },
-      "sha": "576d006f74fed85615f0829f280bce614112320c"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDUwNzc1N2U5ZThiMGM3ZGJjNmViYzI5ZjVhMDNhY2YwOTNhMDc1YmU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/507757e9e8b0c7dbc6ebc29f5a03acf093a075be",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/507757e9e8b0c7dbc6ebc29f5a03acf093a075be",
-      "tree": {
-        "sha": "8ea2a94cec8d26458654ee1d4b8c26a652595b93",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8ea2a94cec8d26458654ee1d4b8c26a652595b93"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/576d006f74fed85615f0829f280bce614112320c",
-          "sha": "576d006f74fed85615f0829f280bce614112320c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/576d006f74fed85615f0829f280bce614112320c"
-        }
-      ],
-      "message": "test: extend the harness for bitcoin-privbcast\n\nThe SOCKS5 server gains Tor's RESOLVE command, reply delays for a slow\nor stalled proxy, a mode that offers only unauthenticated access and a\nmode that behaves as an ordinary non-Tor proxy. A client that hangs up\nbefore its greeting, as a cancelled job's streams can, and a connection\nthat Windows reports as aborted count as closed, not as errors. The P2P\nnetwork thread judges a failed protocol by its own reconnect flag, so\nthat several listeners can share one loop. The framework learns where\nbitcoin-privbcast is and how to skip a test without it.\n\nPrepares the functional test that the next commit adds with the binary.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T20:04:29Z"
-      },
-      "sha": "507757e9e8b0c7dbc6ebc29f5a03acf093a075be"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGJkMGI5ODZiMGVhMGZjOTVjYzU5ZjE3YjI0YjY4ODQyYzZjZTRjMmE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a",
-      "tree": {
-        "sha": "8d4f1ea52d965de3e6f29d736cba539fedd93bb2",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8d4f1ea52d965de3e6f29d736cba539fedd93bb2"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/507757e9e8b0c7dbc6ebc29f5a03acf093a075be",
-          "sha": "507757e9e8b0c7dbc6ebc29f5a03acf093a075be",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/507757e9e8b0c7dbc6ebc29f5a03acf093a075be"
-        }
-      ],
-      "message": "privbcast: add bitcoin-privbcast\n\nThe standalone tool: it reads one transaction on stdin, runs one job\nthrough the Tor proxy named by -tor and prints the report on stdout,\nwith progress lines on stderr. It takes no configuration file and only\na loopback proxy, refuses the regtest overrides on other chains and\nchecks its arguments and input before any network activity. The\ndiscover command runs discovery alone.\n\nBuild and packaging: the BUILD_PRIVBCAST option (on with BUILD_TESTS),\nthe privbcast subcommand of the bitcoin wrapper, the man page, the\nWindows resource file, the manpage generator and Windows CI lists, and\nthe test configuration that tells the functional framework the binary\nexists.\n\nThe functional tests tool_privbcast.py, tool_privbcast_proxy.py and\ntool_privbcast_peers.py, with their harness in\ntest_framework/privbcast.py, are the specification's black-box\nacceptance suite for the tool: scripted recipients and a scripted proxy\ncheck every wire-visible parameter, the schedule, the assignment, the\nexit statuses and cancellation.\n\nImplements B3, H2, U1 and the Interface section for bitcoin-privbcast.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T18:55:15Z"
-      },
-      "sha": "bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDM5NmMxZDMyOWZmMmZmZDRkYTc0ODZmYWIzOTQ1OTRmNTM0MjUwOGU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/396c1d329ff2ffd4da7486fab394594f5342508e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/396c1d329ff2ffd4da7486fab394594f5342508e",
-      "tree": {
-        "sha": "cdfe10a8af0ce834226576defb7086edf00ab384",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/cdfe10a8af0ce834226576defb7086edf00ab384"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a",
-          "sha": "bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/bd0b986b0ea0fc95cc59f17b24b68842c6ce4c2a"
-        }
-      ],
-      "message": "doc: describe bitcoin-privbcast\n\nAdd the user guide to private broadcast with its bitcoin-privbcast\npart: the Tor proxy the tool needs, how to send a transaction and read\nthe exit status and the report, discover, and the limits of what a job\nprotects.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T18:56:08Z"
-      },
-      "sha": "396c1d329ff2ffd4da7486fab394594f5342508e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDJiOWM5NDIwZDQxMzM5YTBhYzY1YTgyMjdmZDA4YWM5MDk2OTBhYjk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2b9c9420d41339a0ac65a8227fd08ac909690ab9",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2b9c9420d41339a0ac65a8227fd08ac909690ab9",
-      "tree": {
-        "sha": "5b503cd29ad4aa184edfbe99ac5d993191a9b4a3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5b503cd29ad4aa184edfbe99ac5d993191a9b4a3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/396c1d329ff2ffd4da7486fab394594f5342508e",
-          "sha": "396c1d329ff2ffd4da7486fab394594f5342508e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/396c1d329ff2ffd4da7486fab394594f5342508e"
-        }
-      ],
-      "message": "doc: release notes for bitcoin-privbcast",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T18:56:22Z"
-      },
-      "sha": "2b9c9420d41339a0ac65a8227fd08ac909690ab9"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGEyOWY5MjhkNmJiNDY5NThlNDc2ZmMwY2RmYzQ0NTY5NjA3MTM2NDg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a29f928d6bb46958e476fc0cdfc4456960713648",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a29f928d6bb46958e476fc0cdfc4456960713648",
-      "tree": {
-        "sha": "5b503cd29ad4aa184edfbe99ac5d993191a9b4a3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5b503cd29ad4aa184edfbe99ac5d993191a9b4a3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2b9c9420d41339a0ac65a8227fd08ac909690ab9",
-          "sha": "2b9c9420d41339a0ac65a8227fd08ac909690ab9",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2b9c9420d41339a0ac65a8227fd08ac909690ab9"
-        }
-      ],
-      "message": "--- part 3/4: bitcoind -privatebroadcast as jobs ---\n\nEmpty commit marking the start of part 3: the node runs each private broadcast as the tool's job, and the old relay and connections are removed.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "sha": "a29f928d6bb46958e476fc0cdfc4456960713648"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGRhNDkyZmYwZDljYzdmM2I5OTUwMTgwOWJlYzE5YTIwMWE3ZWY2Mzk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/da492ff0d9cc7f3b99501809bec19a201a7ef639",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/da492ff0d9cc7f3b99501809bec19a201a7ef639",
-      "tree": {
-        "sha": "8a32d36836297e904326243d558a56bf9d733b13",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8a32d36836297e904326243d558a56bf9d733b13"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a29f928d6bb46958e476fc0cdfc4456960713648",
-          "sha": "a29f928d6bb46958e476fc0cdfc4456960713648",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a29f928d6bb46958e476fc0cdfc4456960713648"
-        }
-      ],
-      "message": "node: add the private broadcast job queue\n\nThe node runs each private broadcast as a privbcast::Job, the tool's\njob, on a thread of its own. PrivbcastQueue queues the submitted\ntransactions, starts and cancels the jobs from one scheduler thread,\nand keeps in memory the records that getprivatebroadcastinfo and\nabortprivatebroadcast are to show. It reaches the node only through\ncallbacks for networking, the onion proxy and the mempool, and takes\nthe job runner as a parameter, so that the tests drive it with stub\njobs and mocked clocks. A job that failed, or whose runner threw, ends\naborted with the error in its record.\n\nThe scheduler's start rule is a pure function, StartPolicy::Decide(),\nwhich each pass of the scheduler applies: a fuzz target checks the\nrule on its own, and another the queue through its interface.\n\nbitcoin_node now links bitcoin_privbcast.\n\nImplements N3-N7, N9, N10, the node's D2 and D3, U3. Not yet wired:\nthe next commit switches -privatebroadcast to it.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T20:02:40Z"
-      },
-      "sha": "da492ff0d9cc7f3b99501809bec19a201a7ef639"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGMxYmZmZTE0ZTJjZWNiOGI1OWI5NDIwMjE1NGFjMDZiMDM5OTViM2Q",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c1bffe14e2cecb8b59b94202154ac06b03995b3d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/c1bffe14e2cecb8b59b94202154ac06b03995b3d",
-      "tree": {
-        "sha": "aca43661c491cde171221dbab4beeef848c1887b",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/aca43661c491cde171221dbab4beeef848c1887b"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/da492ff0d9cc7f3b99501809bec19a201a7ef639",
-          "sha": "da492ff0d9cc7f3b99501809bec19a201a7ef639",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/da492ff0d9cc7f3b99501809bec19a201a7ef639"
-        }
-      ],
-      "message": "node: run private broadcast as jobs\n\nWith -privatebroadcast, sendrawtransaction now queues a job on the\nnode's PrivbcastQueue instead of handing the transaction to the\nconnection manager, getprivatebroadcastinfo lists the jobs with their\nprogress and reports, and abortprivatebroadcast aborts them. Startup\nrequires onion to be able to become reachable, refuses the regtest\nseed overrides on other chains, -signetseednode, -signetchallenge, and\noff regtest a non-zero -mocktime, and refuses to start rather than trim\nconnections when the jobs' file descriptors are not available. -connect\nand -proxyrandomize no longer matter.\n\nThe old private broadcast connections and relay stay in the tree, no\nlonger fed, until the commits that remove them.\n\nImplements N1, N2, N8, N10, N11, U1, U2 and Interface/Node; replaces\nthe old implementation's tests with the specification's.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-01T22:52:09Z"
-      },
-      "sha": "c1bffe14e2cecb8b59b94202154ac06b03995b3d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGU2ZGQwYjEzMGVhNWE2ODVlMzU3ZWM2ZDcyM2ExN2M1YzkwZWY2ZWE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea",
-      "tree": {
-        "sha": "3b2bc04025b582bf1d352acdb4a50189b8c8eb90",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3b2bc04025b582bf1d352acdb4a50189b8c8eb90"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c1bffe14e2cecb8b59b94202154ac06b03995b3d",
-          "sha": "c1bffe14e2cecb8b59b94202154ac06b03995b3d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/c1bffe14e2cecb8b59b94202154ac06b03995b3d"
-        }
-      ],
-      "message": "net: remove the old private broadcast relay\n\nSince -privatebroadcast runs jobs, nothing hands PeerManager a\ntransaction for private broadcast any more. Remove its queue\n(src/private_broadcast.{h,cpp}) with the methods, the retry task and\nthe private_broadcast option that served it, and its handling of\nprivate broadcast connections: the fixed VERSION, the INV after\nVERACK, the GETDATA and PONG handling, the incoming message filter,\nthe lifetime limit and the exemption from discouragement. The unit and\nfuzz tests of that code go with it, including the net_tests case for\nthe addrman exception and the denialofservice_tests cases for the\ndiscouragement exemption.\n\nDelete-only: besides whole lines, conditions and arguments are cut out\nof lines, and the lines of a removed branch's alternative move out one\nindentation level. git show -w --word-diff-regex='[A-Za-z0-9_]+|[^[:space:]]'\nshows deletions only, apart from the size of the node array in\ndenialofservice_tests, which goes back from 5 to 3.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-21T16:18:53Z"
-      },
-      "sha": "e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGUwMzhjOGUwZjI1MzNlNjM4Y2E0NDY3Yjk3N2I5NTFiM2ZiYmMyMjg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e038c8e0f2533e638ca4467b977b951b3fbbc228",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/e038c8e0f2533e638ca4467b977b951b3fbbc228",
-      "tree": {
-        "sha": "4e56ab25911102e46080f698ffd6dc715ea7e2fa",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4e56ab25911102e46080f698ffd6dc715ea7e2fa"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea",
-          "sha": "e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/e6dd0b130ea5a685e357ec6d723a17c5c90ef6ea"
-        }
-      ],
-      "message": "net: remove the old private broadcast connections\n\nWith the relay gone, nothing asks CConnman for private broadcast\nconnections. Remove the connection type, the thread that opened such\nconnections with its counters and choice of network, and the places\nthat treated them specially: the incoming nonce check, the fresh I2P\nsession, the guard against direct connections, the outbound message\nfilter, the fixed protocol version, the exception in disconnection by\nsubnet and their term in the orphanage's static_assert. The type's\nnames go from getpeerinfo's help, bitcoin-cli -netinfo and the GUI. The\nproxy override of ConnectNode() and OpenNetworkConnection(), which only\nthat thread set, goes too, with its copy in CNode and in the\nreconnection record and the fuzz input for it.\n\nDelete-only: besides whole lines, conditions, arguments and list\nseparators are cut out of lines, what followed a cut argument joins\nits line, and one line moves out an indentation level with the if\naround it. git show -w --word-diff-regex='[A-Za-z0-9_]+|[^[:space:]]'\nshows deletions only.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T00:22:50Z"
-      },
-      "sha": "e038c8e0f2533e638ca4467b977b951b3fbbc228"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIzMThkOTgwNmE4Mjg4OTk2YzAyZTljYzczMGVlZGU1MWU2MGE5ODM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2318d9806a8288996c02e9cc730eede51e60a983",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2318d9806a8288996c02e9cc730eede51e60a983",
-      "tree": {
-        "sha": "0e15da84041b148b34dbd57499cab57f295b8dd2",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/0e15da84041b148b34dbd57499cab57f295b8dd2"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e038c8e0f2533e638ca4467b977b951b3fbbc228",
-          "sha": "e038c8e0f2533e638ca4467b977b951b3fbbc228",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/e038c8e0f2533e638ca4467b977b951b3fbbc228"
-        }
-      ],
-      "message": "refactor: drop the trivial AdvertisedVersion()\n\nWithout private broadcast connections, a node advertises\nPROTOCOL_VERSION on every connection, and CNode::AdvertisedVersion()\nonly returns it. Use the constant again where the method was called.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T04:31:35Z"
-      },
-      "sha": "2318d9806a8288996c02e9cc730eede51e60a983"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDEwMTUzMjZjYzRkYTVlMDkzYWNhMDUyNzY1MjU5YmMwNzdjZDQ1YzA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1015326cc4da5e093aca052765259bc077cd45c0",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/1015326cc4da5e093aca052765259bc077cd45c0",
-      "tree": {
-        "sha": "fde13e978d188fa0989af443ce39662b08c59e98",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fde13e978d188fa0989af443ce39662b08c59e98"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2318d9806a8288996c02e9cc730eede51e60a983",
-          "sha": "2318d9806a8288996c02e9cc730eede51e60a983",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2318d9806a8288996c02e9cc730eede51e60a983"
-        }
-      ],
-      "message": "doc: describe bitcoind -privatebroadcast\n\nAdd the node part of the private broadcast guide: which Tor proxy the\njobs use, how sendrawtransaction queues them and when they start, what\nis not queued again, how to follow and abort jobs, what disabling\nnetworking and shutdown do, which node settings do not apply, what\nthe default log shows, the file descriptors the jobs need, and the\nlink between a job's connections and the node's peers at shutdown.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T00:22:59Z"
-      },
-      "sha": "1015326cc4da5e093aca052765259bc077cd45c0"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGNjM2M1ZDczZGU0MGQ5OGViOGFlZDJkZTI5NWY2ZjdlZWY2ODQzYmQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/cc3c5d73de40d98eb8aed2de295f6f7eef6843bd",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/cc3c5d73de40d98eb8aed2de295f6f7eef6843bd",
-      "tree": {
-        "sha": "5d2efd59d8f72ae60e9553e4f158c344afb6e8a3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5d2efd59d8f72ae60e9553e4f158c344afb6e8a3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1015326cc4da5e093aca052765259bc077cd45c0",
-          "sha": "1015326cc4da5e093aca052765259bc077cd45c0",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/1015326cc4da5e093aca052765259bc077cd45c0"
-        }
-      ],
-      "message": "doc: release notes for private broadcast jobs",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T00:23:51Z"
-      },
-      "sha": "cc3c5d73de40d98eb8aed2de295f6f7eef6843bd"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGFjMTkyMzY0M2M4NjNjZDYwNzU3NjExMTY2Y2VlZDZkNDVlYTBlMmU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ac1923643c863cd60757611166ceed6d45ea0e2e",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/ac1923643c863cd60757611166ceed6d45ea0e2e",
-      "tree": {
-        "sha": "5d2efd59d8f72ae60e9553e4f158c344afb6e8a3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5d2efd59d8f72ae60e9553e4f158c344afb6e8a3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/cc3c5d73de40d98eb8aed2de295f6f7eef6843bd",
-          "sha": "cc3c5d73de40d98eb8aed2de295f6f7eef6843bd",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/cc3c5d73de40d98eb8aed2de295f6f7eef6843bd"
-        }
-      ],
-      "message": "--- part 4/4: package mode ---\n\nEmpty commit marking the start of part 4: one parent and its child. The validation commits here serve only this part.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "sha": "ac1923643c863cd60757611166ceed6d45ea0e2e"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIwNDBmMDI1ODdlNWI5NzRiOGI5ODFmMjNkYWMxNWIzN2I5NDk5MzU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2040f02587e5b974b8b981f23dac15b37b949935",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2040f02587e5b974b8b981f23dac15b37b949935",
-      "tree": {
-        "sha": "d39508146e34b2cbcc640a25b267823b727d3c75",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d39508146e34b2cbcc640a25b267823b727d3c75"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ac1923643c863cd60757611166ceed6d45ea0e2e",
-          "sha": "ac1923643c863cd60757611166ceed6d45ea0e2e",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/ac1923643c863cd60757611166ceed6d45ea0e2e"
-        }
-      ],
-      "message": "privbcast: serve a parent in package mode\n\nA child can pay for a parent too cheap to enter mempools alone when the\nrecipient takes the two together. A job may now carry the parent: each\nattempt announces only the child, serves the parent to a peer that asks\nfor it, and holds the PING for that request. A job without a parent\nruns and reports as before.\n\nImplements F1-F4 and the package amendments of E6-E8.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T02:52:39Z"
-      },
-      "sha": "2040f02587e5b974b8b981f23dac15b37b949935"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGI1MTRmODdlM2NmMGViMzg2Y2FmZmMyMmY4NjYwMTJiNTlkMDE4OTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b514f87e3cf0eb386caffc22f866012b59d01899",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/b514f87e3cf0eb386caffc22f866012b59d01899",
-      "tree": {
-        "sha": "9bc0f9bdabf5df839f11f6eb4c7da01c22abb988",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9bc0f9bdabf5df839f11f6eb4c7da01c22abb988"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2040f02587e5b974b8b981f23dac15b37b949935",
-          "sha": "2040f02587e5b974b8b981f23dac15b37b949935",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2040f02587e5b974b8b981f23dac15b37b949935"
-        }
-      ],
-      "message": "privbcast: accept a parent and child in the tool\n\nbitcoin-privbcast send also reads two transactions, an unconfirmed\nparent and its child in either order, checks that they are such a pair\nand runs the job in package mode. The acceptance suite gains its\npackage sections in tool_privbcast_package.py.\n\nImplements the Extension's Interface for bitcoin-privbcast.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T03:47:59Z"
-      },
-      "sha": "b514f87e3cf0eb386caffc22f866012b59d01899"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDViMTQzYmJmZmQ4ZTM1OTI4NjlhMWJjMmI4MzIxNDg2YzM1MzdlN2Y",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5b143bbffd8e3592869a1bc2b8321486c3537e7f",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/5b143bbffd8e3592869a1bc2b8321486c3537e7f",
-      "tree": {
-        "sha": "bb9083353c7cbc5c3d7e4f4885fdfaa82e20aaa9",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/bb9083353c7cbc5c3d7e4f4885fdfaa82e20aaa9"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b514f87e3cf0eb386caffc22f866012b59d01899",
-          "sha": "b514f87e3cf0eb386caffc22f866012b59d01899",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/b514f87e3cf0eb386caffc22f866012b59d01899"
-        }
-      ],
-      "message": "validation: sum a package's modified fees saturating\n\nTwo prioritisetransaction deltas near INT64_MIN made the sum overflow.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-21T19:34:17Z"
-      },
-      "sha": "5b143bbffd8e3592869a1bc2b8321486c3537e7f"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDRhZDBiYWNhYmViODMyY2E1Njc1MWNkNzYzODI3OTk4YWFlMDVjZWE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4ad0bacabeb832ca56751cd763827998aae05cea",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/4ad0bacabeb832ca56751cd763827998aae05cea",
-      "tree": {
-        "sha": "d1886cea0539b1c1a7a72b2610958b20c6f07e06",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d1886cea0539b1c1a7a72b2610958b20c6f07e06"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5b143bbffd8e3592869a1bc2b8321486c3537e7f",
-          "sha": "5b143bbffd8e3592869a1bc2b8321486c3537e7f",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/5b143bbffd8e3592869a1bc2b8321486c3537e7f"
-        }
-      ],
-      "message": "validation: test-accept a package as submission evaluates it\n\nProcessNewPackage's test mode checks each transaction without package\nfeerates or replacements, as testmempoolaccept does. With\ntest_as_submission it runs submission's evaluation instead and stops\nshort of the mempool, so a caller can learn whether a child pays for its\nparent before relaying them. A transaction that passed before another\nfailed is reported by its own result, as submission reports it. Results\ndo not list replaced transactions, and a parent that passes alone gives\nno answer for its child, which it does not stage.\n\nFrom #35286, without its RPC.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-21T21:19:08Z"
-      },
-      "sha": "4ad0bacabeb832ca56751cd763827998aae05cea"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDQwMjM3OWJjMDUyNjViZjlkNjRhYmEzNGQyNWVhY2E2NDdlNTIzZWM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/402379bc05265bf9d64aba34d25eaca647e523ec",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/402379bc05265bf9d64aba34d25eaca647e523ec",
-      "tree": {
-        "sha": "c59b67ee4cd03258bc48881a1c8cca1930bcfa0b",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c59b67ee4cd03258bc48881a1c8cca1930bcfa0b"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4ad0bacabeb832ca56751cd763827998aae05cea",
-          "sha": "4ad0bacabeb832ca56751cd763827998aae05cea",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/4ad0bacabeb832ca56751cd763827998aae05cea"
-        }
-      ],
-      "message": "validation: test a package whose parent passes alone\n\nA test does not stage a transaction that passes alone, so the child\nthat spends it was found missing its inputs. Test the new transactions\ntogether instead, each paying for itself. Their replacements get\npackage RBF's checks of fees, feerate diagram and cluster limits, but\nnot its rules that the package have no mempool ancestors and pay more\nper vbyte than the parent: submission would take the two in turn, each\nreplacing what it may. A replacement of an ancestor of the package is\nrefused instead, as it would take away the package's inputs. For a\nparent and child this accepts at least what submission accepts.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-21T22:21:00Z"
-      },
-      "sha": "402379bc05265bf9d64aba34d25eaca647e523ec"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGU1YWNiNDUyZjkyNGNmMjY0MmU4ZTg4YjkxMzM3ODllM2UzZWM2YTY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5acb452f924cf2642e8e88b9133789e3e3ec6a6",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/e5acb452f924cf2642e8e88b9133789e3e3ec6a6",
-      "tree": {
-        "sha": "6616104863e85b579ece99f578e90e9a7f2e038a",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6616104863e85b579ece99f578e90e9a7f2e038a"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/402379bc05265bf9d64aba34d25eaca647e523ec",
-          "sha": "402379bc05265bf9d64aba34d25eaca647e523ec",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/402379bc05265bf9d64aba34d25eaca647e523ec"
-        }
-      ],
-      "message": "rpc: queue submitpackage for private broadcast\n\nWith -privatebroadcast, submitpackage now queues a private broadcast\njob instead of adding the transactions to the mempool. It takes one\ntransaction, or a parent and its child, and queues one job, the\nchild's, which carries the parent. A transaction whose txid is in the\nmempool counts as accepted; the rest is test-accepted, one transaction\nalone as by sendrawtransaction, two as a package, after the package\nchecks on the whole submission, two as submitpackage evaluates them.\nmaxfeerate follows each path's own convention. Unit tests drive the RPC through its table.\n\nThe queue takes the parent with the transaction: a submission with a\nparent is covered only by a job with the same parent, one without by a\njob with any parent. getprivatebroadcastinfo lists the parent's txid\nand documents the report's package fields; abortprivatebroadcast\nmatches the child's ids only. Both submission RPCs ask the queue\nwhether an onion proxy is configured, which lets unit tests drive\nthem without the process-wide proxy registry. The acceptance suite gains its package\nsections, run as p2p_private_broadcast.py --package.\n\nImplements the Extension's N5 and N11 amendments and its Interface for\nsubmitpackage.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T05:26:51Z"
-      },
-      "sha": "e5acb452f924cf2642e8e88b9133789e3e3ec6a6"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDA5ZDhkZGJlMDg1MjkyYjVjMWJiZDZlMjA0YjlhYjkyZDU3YjVkMGM",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c",
-      "tree": {
-        "sha": "560cc13f27e29617cc9349034a59739f8baee70b",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/560cc13f27e29617cc9349034a59739f8baee70b"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e5acb452f924cf2642e8e88b9133789e3e3ec6a6",
-          "sha": "e5acb452f924cf2642e8e88b9133789e3e3ec6a6",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/e5acb452f924cf2642e8e88b9133789e3e3ec6a6"
-        }
-      ],
-      "message": "doc: specify package mode\n\nAdd the specification's section \"Extension: one parent, one child\",\nwhich the preceding commits implement: a job that carries a child and\nits unconfirmed parent announces only the child and serves the parent\non request (F1-F4), and the tool and the node take such a pair.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T05:26:56Z"
-      },
-      "sha": "09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDYwYzIwYzVmZmE1ODdkN2Y4MDJkNDBjOTVhMDY2N2Y5ZTU4MWU2NTY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60c20c5ffa587d7f802d40c95a0667f9e581e656",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/60c20c5ffa587d7f802d40c95a0667f9e581e656",
-      "tree": {
-        "sha": "6f21d76ddaf9882e6b2400abc86c625731af2d52",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6f21d76ddaf9882e6b2400abc86c625731af2d52"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c",
-          "sha": "09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/09d8ddbe085292b5c1bbd6e204b9ab92d57b5d0c"
-        }
-      ],
-      "message": "doc: describe package mode\n\nAdd the guide's part on a parent and its child: when it helps, which\nrecipients accept such a package, what the tool and the node check and\nwhat peers can tell; and how submitpackage queues a job under\n-privatebroadcast.",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T05:27:00Z"
-      },
-      "sha": "60c20c5ffa587d7f802d40c95a0667f9e581e656"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQzNTM5NjdlYjA1OTBkYmVkZTdiYmU0Y2RjNmQzMzMzYmUwMWE4OTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d353967eb0590dbede7bbe4cdc6d3333be01a899",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d353967eb0590dbede7bbe4cdc6d3333be01a899",
-      "tree": {
-        "sha": "3932ef251e641c396548b55b4d51aea0ec3619df",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3932ef251e641c396548b55b4d51aea0ec3619df"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60c20c5ffa587d7f802d40c95a0667f9e581e656",
-          "sha": "60c20c5ffa587d7f802d40c95a0667f9e581e656",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/60c20c5ffa587d7f802d40c95a0667f9e581e656"
-        }
-      ],
-      "message": "doc: release notes for package mode",
-      "committer": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-22T13:09:32Z"
-      },
-      "author": {
-        "name": "Greg Sanders",
-        "email": "gsanders87@gmail.com",
-        "date": "2026-10-02T05:27:10Z"
-      },
-      "sha": "d353967eb0590dbede7bbe4cdc6d3333be01a899"
-    },
-    {
       "event": "commented",
       "id": 6343646320,
       "node_id": "IC_kwDOABII588AAAABehxccA",
@@ -1777,9 +625,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2026-10-22T14:47:41Z",
-      "updated_at": "2026-10-22T14:48:35Z",
+      "updated_at": "2026-10-22T15:17:45Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### External sites\n\n* Code coverage & benchmarks: https://corecheck.dev/bitcoin/bitcoin/pulls/36608\n* Ralph review <img src=https://review.fish.foo/assets/bitcoin/bitcoin/36608.png alt=\"Ralph review status\"> https://git.fish.foo/bitcoin/bitcoin/pulls/36608#author-ralph\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\nA summary of reviews will appear here.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible typos and grammar issues:\n\n- `doc/design/private-broadcast-tool.md`: `One the job cannot dial by then is missed` → `An opportunity the job cannot dial by then is missed` [the original sentence is grammatically broken]\n- `doc/design/private-broadcast-tool.md`: `seen_in_mempool (Unix seconds, each once it applies; seen_in_mempool from when the node has the txid in its mempool, from submission if it already does)` → `seen_in_mempool (Unix seconds; set when the node first has the txid in its mempool, or to submission time if it was already present)` [the original parenthetical is difficult to parse]\n\n\n\n\nPossible places where comparison-specific test macros should replace generic comparisons:\n\n- `test/functional/test_framework/privbcast.py`: `assert abs(sched[0] - delivery_ms) <= tolerance_ms` → Prefer `assert_greater_than_or_equal(tolerance_ms, abs(sched[0] - delivery_ms))`.\n- `test/functional/tool_privbcast.py`: `assert value < 10**9` → Prefer `assert_greater_than(10**9, value)`.\n- `test/functional/tool_privbcast.py`: `assert a[\"ended_ms\"] <= a[\"scheduled_start_ms\"] + attempt_max_ms + 200` → Prefer `assert_greater_than_or_equal(a[\"scheduled_start_ms\"] + attempt_max_ms + 200, a[\"ended_ms\"])`.\n- `test/functional/tool_privbcast.py`: `assert s[\"slot\"] < 3` → Prefer `assert_greater_than(3, s[\"slot\"])`.\n- `test/functional/tool_privbcast.py`: `assert report[\"summary\"][\"duration_ms\"] <= max(s[\"scheduled_end_ms\"] for s in report[\"slots\"]) + 1500` → Prefer `assert_greater_than_or_equal(max(s[\"scheduled_end_ms\"] for s in report[\"slots\"]) + 1500, report[\"summary\"][\"duration_ms\"])`.\n- `test/functional/tool_privbcast_peers.py`: `assert a[\"bytes_recv\"] >= MAX_RECV_BYTES` → Prefer `assert_greater_than_or_equal(a[\"bytes_recv\"], MAX_RECV_BYTES)`.\n- `test/functional/tool_privbcast_peers.py`: `assert FloodingRecipient.MESSAGES * 36_000 > a[\"bytes_recv\"]` → Prefer `assert_greater_than(FloodingRecipient.MESSAGES * 36_000, a[\"bytes_recv\"])`.\n\n\n\n<sup>2026-10-22 14:48:34</sup>\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### External sites\n\n* Code coverage & benchmarks: https://corecheck.dev/bitcoin/bitcoin/pulls/36608\n* Ralph review <img src=https://review.fish.foo/assets/bitcoin/bitcoin/36608.png alt=\"Ralph review status\"> https://git.fish.foo/bitcoin/bitcoin/pulls/36608#author-ralph\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\nA summary of reviews will appear here.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible typos and grammar issues:\n\n- `src/net_transport.cpp`: `beginning om msg_bytes` → `beginning of msg_bytes` [misspelling]\n\n\n\n\nPossible places where named args for integral literals may be used (e.g. `func(x, /*named_arg=*/0)` in C++, and `func(x, named_arg=0)` in Python):\n\n- `src/test/privbcast_queue_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 0, ...)`\n- `src/test/privbcast_queue_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[1], 0, 0, ...)`\n- `src/test/privbcast_queue_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[2], 0, 0, ...)`\n- `src/test/privbcast_queue_tests.cpp`: `CreateValidMempoolTransaction(parent, 0, 0, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction(tx, 0, 101, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[0], 0, 0, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[1], 0, 0, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[2], 0, 0, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction({parent, m_coinbase_txns[1]}, {{parent->GetHash(), 0}, {m_coinbase_txns[1]->GetHash(), 0}}, 101, ...)`\n- `src/test/txpackage_tests.cpp`: `CreateValidMempoolTransaction(m_coinbase_txns[3], 0, 0, ...)`\n\n\n\n\nPossible places where comparison-specific test macros should replace generic comparisons:\n\n- `test/functional/test_framework/privbcast.py` (`check_profile`): `assert set(listener.last_message) <= {...}` → Prefer `assert_greater_than_or_equal({...}, set(listener.last_message))`.\n- `test/functional/test_framework/privbcast.py` (`check_schedule`): `assert delivery_ms + ... <= sched[0] <= delivery_ms + ...` → Prefer two `assert_greater_than_or_equal` checks, one for each bound.\n- `test/functional/test_framework/privbcast.py` (`check_schedule`): `assert BACKUP_MIN_S * ... <= sched[k] - sched[k - 1] <= BACKUP_MAX_S * ...` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/p2p_private_broadcast.py` (`run_test`): `assert back + START_SPACING_MIN_S <= started <= back + 2 * START_SPACING_MAX_S` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/tool_privbcast.py` (`test_bounded_job`): `assert_equal` is already used for the profile fields, but `assert set(listener.last_message) <= {...}` in `check_profile` should use `assert_greater_than_or_equal`.\n- `test/functional/tool_privbcast.py` (`test_bounded_job`): `assert -5 <= ... <= 1000` (the PONG-wait and request-window checks) → Prefer two `assert_greater_than_or_equal` checks for each bounded value.\n- `test/functional/tool_privbcast.py` (`test_bounded_job`): `assert 0 <= a[\"started_ms\"] - a[\"scheduled_start_ms\"] <= grace_ms` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/tool_privbcast_package.py` (`test_package_requests`): `assert -5 <= ... <= 1000` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/tool_privbcast_peers.py` (`test_unsuitable_peers`): `assert {a[\"endpoint\"] for _, a in self.attempts(report)} <= {...}` → Prefer `assert_greater_than_or_equal` with the allowed endpoint set first.\n- `test/functional/tool_privbcast_peers.py` (`test_unsuitable_peers`): `assert 0 <= a[\"started_ms\"] - a[\"scheduled_start_ms\"] <= grace_ms` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/tool_privbcast_peers.py` (`test_peer_deviations`): `assert -5 <= ... <= 1000` → Prefer two `assert_greater_than_or_equal` checks.\n- `test/functional/tool_privbcast.py` (`test_concurrent_invocations`): `assert ellswift_x(...) != ellswift_x(...)` and `assert ...nNonce != ...nNonce` → Prefer `assert_not_equal`.\n- `test/functional/tool_privbcast.py` (`test_concurrent_invocations`): `assert [s[\"scheduled_ms\"] ...] != [...]` → Prefer `assert_not_equal`.\n\n\n\n\n<sup>2026-10-22 15:17:45</sup>\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -1803,6 +651,1290 @@
         "patch_url": null
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/36608#issuecomment-6343646320",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36608"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGEwODMzOTBiNzNlODUzMDJlMDk2MmYxYmVkNGE5NTlkNmM2MDk3ZmI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a083390b73e85302e0962f1bed4a959d6c6097fb",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/a083390b73e85302e0962f1bed4a959d6c6097fb",
+      "tree": {
+        "sha": "ea78b3783450ab37ade8217179738b0f1fa3ede6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/ea78b3783450ab37ade8217179738b0f1fa3ede6"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6a0027f99bfa87ff9f5b40bd136f3786458ae924",
+          "sha": "6a0027f99bfa87ff9f5b40bd136f3786458ae924",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/6a0027f99bfa87ff9f5b40bd136f3786458ae924"
+        }
+      ],
+      "message": "doc: add the private broadcast specification\n\nThis is the design the following commits implement: what a private\nbroadcast job guarantees, the values peers and observers see, and the\ninterfaces of the tool and the node. Later commits cite its items by\nnumber.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T15:34:00Z"
+      },
+      "sha": "a083390b73e85302e0962f1bed4a959d6c6097fb"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMxZDNlYjgzZTBmYzkxNzA5ZDdhODk1ZjIzMTVmMDQxODQzYjc5Nzg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c1d3eb83e0fc91709d7a895f2315f041843b7978",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c1d3eb83e0fc91709d7a895f2315f041843b7978",
+      "tree": {
+        "sha": "201e559f132e16ff0d533f6e2d308c6846a289b6",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/201e559f132e16ff0d533f6e2d308c6846a289b6"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a083390b73e85302e0962f1bed4a959d6c6097fb",
+          "sha": "a083390b73e85302e0962f1bed4a959d6c6097fb",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a083390b73e85302e0962f1bed4a959d6c6097fb"
+        }
+      ],
+      "message": "privbcast: add the parameters and the schedule\n\nStart bitcoin_privbcast, the library that will run private broadcast\njobs for bitcoin-privbcast and the node. params.h holds the values of\nthe specification. DrawPlan draws a job's plan from the job's own\nrandomness: the schedule, the order of the DNS seeds and the seed of\nthe order in which each DNS seed hands out its candidates.\nMIN_DNS_SEEDS is the floor R3 sets for the mainnet seed list, and a\nunit test holds the list to it, so a release that drops seeds below\nwhat fills a job fails the test rather than leaving opportunities\nempty.\n\nImplements C1 and R3; the values of Parameters.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T15:51:39Z"
+      },
+      "sha": "c1d3eb83e0fc91709d7a895f2315f041843b7978"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQ2MzhhMDM1ZDA3YjMwNmRjNTQ1MDc0MmZjNWU3ODdjODc1ZGEwOGE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d638a035d07b306dc5450742fc5e787c875da08a",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d638a035d07b306dc5450742fc5e787c875da08a",
+      "tree": {
+        "sha": "487e53c9fdf4d283bd486f127962be55dbc37888",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/487e53c9fdf4d283bd486f127962be55dbc37888"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c1d3eb83e0fc91709d7a895f2315f041843b7978",
+          "sha": "c1d3eb83e0fc91709d7a895f2315f041843b7978",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c1d3eb83e0fc91709d7a895f2315f041843b7978"
+        }
+      ],
+      "message": "privbcast: add candidate assignment\n\nAssign fixes every opportunity's candidate once discovery ends, from\nthe plan and the discovery result alone. An endpoint that several\nseeds returned is credited to the seed that comes first in the plan's\nseed order, through the lowest query set that returned it. Each seed\nhands out its candidates in an order drawn at random by a generator of\nits own, seeded from the plan and the seed's place in that order. Slot\nj's first attempt comes from query set j mod 4 whenever a seed it may\ndraw from has one, so a single exit supplies at most two first\nattempts. Neither which seed answers first nor the order of a seed's\nanswers changes the assignment.\n\nImplements C2, R2, R4, R5a, R5b and R5c.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T15:55:22Z"
+      },
+      "sha": "d638a035d07b306dc5450742fc5e787c875da08a"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE5ODQ0ZWQ1YWYyNDQzNjkzYmJiYzdlM2NhY2QyYzk0YWMwZWYxYmM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc",
+      "tree": {
+        "sha": "c9b75ab86717bdc07f02a9a9e561a436393144fc",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c9b75ab86717bdc07f02a9a9e561a436393144fc"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d638a035d07b306dc5450742fc5e787c875da08a",
+          "sha": "d638a035d07b306dc5450742fc5e787c875da08a",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d638a035d07b306dc5450742fc5e787c875da08a"
+        }
+      ],
+      "message": "privbcast: add a byte-driven SOCKS5 client\n\nA job reaches recipients and resolves DNS seed names through the proxy,\non streams its event loop drives without blocking. Socks5Client holds\nno socket: it offers the bytes to write, consumes the proxy's replies,\nand leaves bytes past the final reply to the P2P transport. It offers\nonly username and password authentication, with the credentials it is\ngiven or fresh ones, and sends a numeric address as IPV4 or IPV6\nwithout resolving anything.\n\nImplements B2 and the Proxy interface section.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T17:00:05Z"
+      },
+      "sha": "19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDY1NTU1M2Q4ZGMyOTI1MjBiYmU3NjRiZGE0YTA5ZjU2ZmE4ZjIxM2Q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/655553d8dc292520bbe764bda4a09f56fa8f213d",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/655553d8dc292520bbe764bda4a09f56fa8f213d",
+      "tree": {
+        "sha": "eff5131352a44041fb19458a550e96ea9cbddc9d",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/eff5131352a44041fb19458a550e96ea9cbddc9d"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc",
+          "sha": "19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/19844ed5af2443693bbbc7e3cacd2c94ac0ef1bc"
+        }
+      ],
+      "message": "privbcast: add the attempt state machine\n\nAn attempt is one connection to a recipient once the proxy connected\nit: a BIP324 session as initiator, the handshake with the job's\nVERSION, one INV, the transaction served at most once, and the PING.\nIt holds no socket and reads no clock: the job's loop passes the bytes\nread and the time; each call records what happened (a completed write,\nthe connection, bytes received) and then enforces the attempt's\ndeadlines, so that nothing is acted on at or after one.\n\nThe attempt draws its VERSION and PING nonces from the random context\nit is given, and takes its BIP324 key, ellswift entropy and garbage\nfrom a key source. Without one, as in production, V2Transport draws\nthem from the strong RNG. The tests and the fuzz target inject a\nsource that draws from their seeded context, so that an attempt's\nbytes are a function of that context and of what the peer sent.\n\nImplements E1-E8, A2, B4, D3 and the attempt part of D2.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T17:30:51Z"
+      },
+      "sha": "655553d8dc292520bbe764bda4a09f56fa8f213d"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDdkYTZjZmQyY2M2YTA1NGFjYzY0NTZjZGRmNDc2MWJkY2E2NWNhNTY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7da6cfd2cc6a054acc6456cddf4761bdca65ca56",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/7da6cfd2cc6a054acc6456cddf4761bdca65ca56",
+      "tree": {
+        "sha": "1fa9bbf131c7141dfe62939ca299f6cbe3a89b3f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1fa9bbf131c7141dfe62939ca299f6cbe3a89b3f"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/655553d8dc292520bbe764bda4a09f56fa8f213d",
+          "sha": "655553d8dc292520bbe764bda4a09f56fa8f213d",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/655553d8dc292520bbe764bda4a09f56fa8f213d"
+        }
+      ],
+      "message": "privbcast: add proxy streams and discovery\n\nA job reaches the network only through streams to the SOCKS5 proxy,\nwhich its event loop drives without blocking. ProxyStream connects to\nthe proxy by address or unix socket path, resolving nothing, and runs\nthe exchange of its Socks5Client; each stage, the connect and each\nstep of the exchange, times out on the steady clock. Once the proxy\nhas connected the stream, its socket carries the destination's bytes.\n\nDiscovery launches every RESOLVE query at job start, each on a stream\nof its own, in four query sets: each set has credentials of its own\nand one query of every seed, so Tor builds four circuits rather than\none per query, and each seed is still asked through four exits.\nDiscovery ends when every query has ended or when the discovery window\ndoes, whatever is still pending. It keeps the answers that are public\nroutable IPv4 or IPv6 addresses, with the chain's default port, and\ncounts the others; its result gives each seed's answers by the query\nset they came through, whatever order they arrived in. An exception\nthrown while it acts on one query ends only that query, as a failed\nstream would.\n\nThe tests run discovery against a scripted proxy behind fake sockets\nthat connect as non-blocking sockets do. The fake socket and the\nproxy's side of the SOCKS5 exchange go into the test utilities, as the\njob's tests use them too.\n\nImplements B1, B2, C3, D1, R1, R2 and C7 for the queries.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T18:18:54Z"
+      },
+      "sha": "7da6cfd2cc6a054acc6456cddf4761bdca65ca56"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDI4OTI2ZmE4MThlYzA0ZGExNjk3ODAxZjVmYmE4MThhNTIxZDM2NmU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/28926fa818ec04da1697801f5fba818a521d366e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/28926fa818ec04da1697801f5fba818a521d366e",
+      "tree": {
+        "sha": "552f4568752a15e5a086f3dbcd2dd1600db07186",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/552f4568752a15e5a086f3dbcd2dd1600db07186"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7da6cfd2cc6a054acc6456cddf4761bdca65ca56",
+          "sha": "7da6cfd2cc6a054acc6456cddf4761bdca65ca56",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7da6cfd2cc6a054acc6456cddf4761bdca65ca56"
+        }
+      ],
+      "message": "privbcast: add the job\n\nA job is one event loop on its caller's thread. Step() runs the\ndeadlines and the dials that are due, waits on every open stream until\nthe next deadline, and does the I/O; Run() steps to the end. The plan\nis drawn when the job is made, before any socket exists, and discovery\nstarts with the first step. When discovery ends the assignment is\nfixed, and each slot dials its opportunities at their scheduled times,\none attempt at a time, until one reaches the announcement point or\nnone is left. The slots share only the loop, so a stalled stream holds\nup no other slot, and the cancel flag ends everything at the next step.\n\nAn exception thrown while the loop acts on one attempt ends only that\nattempt, as a failed stream would. One thrown anywhere else in a step\nfails the job: it stops as a cancelled job does, and its report gives\nthe error.\n\nThe report mirrors Interface/Report, every time an offset from job\nstart on the plan clock. Snapshot() gives the progress the node is to\nshow, from any thread. ExitStatus() gives the tool's exit status for a\nreport.\n\nImplements A1, A3, A4, C1-C8, D1, D2, H1, H3 and the report interface.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T18:31:42Z"
+      },
+      "sha": "28926fa818ec04da1697801f5fba818a521d366e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDY1ZGExMDBhZGI2MzFlMzAyMDAwMGNhNzc2ZjI2ZDAwMDMxODBkYmY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/65da100adb631e3020000ca776f26d0003180dbf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/65da100adb631e3020000ca776f26d0003180dbf",
+      "tree": {
+        "sha": "77605ebd0775a2c31a0e9b1d33bae675526fb247",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/77605ebd0775a2c31a0e9b1d33bae675526fb247"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/28926fa818ec04da1697801f5fba818a521d366e",
+          "sha": "28926fa818ec04da1697801f5fba818a521d366e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/28926fa818ec04da1697801f5fba818a521d366e"
+        }
+      ],
+      "message": "test: extend the harness for bitcoin-privbcast\n\nThe SOCKS5 server gains Tor's RESOLVE command, reply delays for a slow\nor stalled proxy, a mode that offers only unauthenticated access and a\nmode that behaves as an ordinary non-Tor proxy. A client that hangs up\nbefore its greeting, as a cancelled job's streams can, and a connection\nthat Windows reports as aborted count as closed, not as errors. The P2P\nnetwork thread judges a failed protocol by its own reconnect flag, so\nthat several listeners can share one loop. The framework learns where\nbitcoin-privbcast is and how to skip a test without it.\n\nPrepares the functional test that the next commit adds with the binary.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:12Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T20:04:29Z"
+      },
+      "sha": "65da100adb631e3020000ca776f26d0003180dbf"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDlmODEwNWEzM2NhYTI0ZjI3MWE4YmIxYTUyMjYzMWUxNWM5YzEzMDE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9f8105a33caa24f271a8bb1a522631e15c9c1301",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/9f8105a33caa24f271a8bb1a522631e15c9c1301",
+      "tree": {
+        "sha": "5cb16d62d16830e1ab3cd48b8d1731bd7f2e2fb7",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5cb16d62d16830e1ab3cd48b8d1731bd7f2e2fb7"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/65da100adb631e3020000ca776f26d0003180dbf",
+          "sha": "65da100adb631e3020000ca776f26d0003180dbf",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/65da100adb631e3020000ca776f26d0003180dbf"
+        }
+      ],
+      "message": "privbcast: add bitcoin-privbcast\n\nThe standalone tool: it reads one transaction on stdin, runs one job\nthrough the Tor proxy named by -tor and prints the report on stdout,\nwith progress lines on stderr. It takes no configuration file and only\na loopback proxy, refuses the regtest overrides on other chains and\nchecks its arguments and input before any network activity. The\ndiscover command runs discovery alone.\n\nBuild and packaging: the BUILD_PRIVBCAST option (on with BUILD_TESTS),\nthe privbcast subcommand of the bitcoin wrapper, the man page, the\nWindows resource file, the manpage generator and Windows CI lists, and\nthe test configuration that tells the functional framework the binary\nexists.\n\nThe functional tests tool_privbcast.py, tool_privbcast_proxy.py and\ntool_privbcast_peers.py, with their harness in\ntest_framework/privbcast.py, are the specification's black-box\nacceptance suite for the tool: scripted recipients and a scripted proxy\ncheck every wire-visible parameter, the schedule, the assignment, the\nexit statuses and cancellation.\n\nImplements B3, H2, U1 and the Interface section for bitcoin-privbcast.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T18:55:15Z"
+      },
+      "sha": "9f8105a33caa24f271a8bb1a522631e15c9c1301"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGNhNzg2Y2M3YjkwYjA0OTY1YjkwYmQxODY1M2RhNGQyYTBkYzFmNjg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ca786cc7b90b04965b90bd18653da4d2a0dc1f68",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ca786cc7b90b04965b90bd18653da4d2a0dc1f68",
+      "tree": {
+        "sha": "07e7dbdfd9d9e988e4343bfb1a6862e14415a1e4",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/07e7dbdfd9d9e988e4343bfb1a6862e14415a1e4"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9f8105a33caa24f271a8bb1a522631e15c9c1301",
+          "sha": "9f8105a33caa24f271a8bb1a522631e15c9c1301",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/9f8105a33caa24f271a8bb1a522631e15c9c1301"
+        }
+      ],
+      "message": "doc: describe bitcoin-privbcast\n\nAdd the user guide to private broadcast with its bitcoin-privbcast\npart: the Tor proxy the tool needs, how to send a transaction and read\nthe exit status and the report, discover, and the limits of what a job\nprotects.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T18:56:08Z"
+      },
+      "sha": "ca786cc7b90b04965b90bd18653da4d2a0dc1f68"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDMzZmU0N2MxZjcwNDFkYzE4MjFhM2VhM2Y4ZjJjZTMwZGUwZmFlMjU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25",
+      "tree": {
+        "sha": "28c4493f4711db7abbf3700a919276b1885d644e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/28c4493f4711db7abbf3700a919276b1885d644e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ca786cc7b90b04965b90bd18653da4d2a0dc1f68",
+          "sha": "ca786cc7b90b04965b90bd18653da4d2a0dc1f68",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ca786cc7b90b04965b90bd18653da4d2a0dc1f68"
+        }
+      ],
+      "message": "doc: release notes for bitcoin-privbcast",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T18:56:22Z"
+      },
+      "sha": "33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDY0ZjFmMjY0NTQzZTEwZDk2MTMwMWM1MTZhZTA4ZGFhMWI2NjM4OTg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/64f1f264543e10d961301c516ae08daa1b663898",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/64f1f264543e10d961301c516ae08daa1b663898",
+      "tree": {
+        "sha": "28c4493f4711db7abbf3700a919276b1885d644e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/28c4493f4711db7abbf3700a919276b1885d644e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25",
+          "sha": "33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/33fe47c1f7041dc1821a3ea3f8f2ce30de0fae25"
+        }
+      ],
+      "message": "--- part 3/4: bitcoind -privatebroadcast as jobs ---\n\nEmpty commit marking the start of part 3: the node runs each private broadcast as the tool's job, and the old relay and connections are removed.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T13:09:32Z"
+      },
+      "sha": "64f1f264543e10d961301c516ae08daa1b663898"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDcxZWExNGVhMzIwMDU4NzVlNTNlMTcyZWYwMGZlMjJlZDJhMjQ5ZWE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/71ea14ea32005875e53e172ef00fe22ed2a249ea",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/71ea14ea32005875e53e172ef00fe22ed2a249ea",
+      "tree": {
+        "sha": "8902a9c2b9624dc74efe4de335c3450266cff495",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8902a9c2b9624dc74efe4de335c3450266cff495"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/64f1f264543e10d961301c516ae08daa1b663898",
+          "sha": "64f1f264543e10d961301c516ae08daa1b663898",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/64f1f264543e10d961301c516ae08daa1b663898"
+        }
+      ],
+      "message": "node: add the private broadcast job queue\n\nThe node runs each private broadcast as a privbcast::Job, the tool's\njob, on a thread of its own. PrivbcastQueue queues the submitted\ntransactions, starts and cancels the jobs from one scheduler thread,\nand keeps in memory the records that getprivatebroadcastinfo and\nabortprivatebroadcast are to show. It reaches the node only through\ncallbacks for networking, the onion proxy and the mempool, and takes\nthe job runner as a parameter, so that the tests drive it with stub\njobs and mocked clocks. A job that failed, or whose runner threw, ends\naborted with the error in its record.\n\nThe scheduler's start rule is a pure function, StartPolicy::Decide(),\nwhich each pass of the scheduler applies: a fuzz target checks the\nrule on its own, and another the queue through its interface.\n\nbitcoin_node now links bitcoin_privbcast.\n\nImplements N3-N7, N9, N10, the node's D2 and D3, U3. Not yet wired:\nthe next commit switches -privatebroadcast to it.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T20:02:40Z"
+      },
+      "sha": "71ea14ea32005875e53e172ef00fe22ed2a249ea"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDhiZDAyOWI3MjBmOTdjMjdlMWY0ZTQyNzBjYmQ0MWNlOWRkY2YyYjA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0",
+      "tree": {
+        "sha": "c87f02437749980893a63a298a3d64ca045b6d3f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c87f02437749980893a63a298a3d64ca045b6d3f"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/71ea14ea32005875e53e172ef00fe22ed2a249ea",
+          "sha": "71ea14ea32005875e53e172ef00fe22ed2a249ea",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/71ea14ea32005875e53e172ef00fe22ed2a249ea"
+        }
+      ],
+      "message": "node: run private broadcast as jobs\n\nWith -privatebroadcast, sendrawtransaction now queues a job on the\nnode's PrivbcastQueue instead of handing the transaction to the\nconnection manager, getprivatebroadcastinfo lists the jobs with their\nprogress and reports, and abortprivatebroadcast aborts them. Startup\nrequires onion to be able to become reachable, refuses the regtest\nseed overrides on other chains, -signetseednode, -signetchallenge, and\noff regtest a non-zero -mocktime, and refuses to start rather than trim\nconnections when the jobs' file descriptors are not available. -connect\nand -proxyrandomize no longer matter.\n\nThe old private broadcast connections and relay stay in the tree, no\nlonger fed, until the commits that remove them.\n\nImplements N1, N2, N8, N10, N11, U1, U2 and Interface/Node; replaces\nthe old implementation's tests with the specification's.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-01T22:52:09Z"
+      },
+      "sha": "8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGU4NTFmNGQ5Nzg2MDE1MDVkNmM1YjZlN2Q4ZjIwM2E0ZTZkZGViZTA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e851f4d978601505d6c5b6e7d8f203a4e6ddebe0",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/e851f4d978601505d6c5b6e7d8f203a4e6ddebe0",
+      "tree": {
+        "sha": "0488ab2fd0dbf297351ba04b86b8d7ab0472857f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/0488ab2fd0dbf297351ba04b86b8d7ab0472857f"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0",
+          "sha": "8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/8bd029b720f97c27e1f4e4270cbd41ce9ddcf2b0"
+        }
+      ],
+      "message": "net: remove the old private broadcast relay\n\nSince -privatebroadcast runs jobs, nothing hands PeerManager a\ntransaction for private broadcast any more. Remove its queue\n(src/private_broadcast.{h,cpp}) with the methods, the retry task and\nthe private_broadcast option that served it, and its handling of\nprivate broadcast connections: the fixed VERSION, the INV after\nVERACK, the GETDATA and PONG handling, the incoming message filter,\nthe lifetime limit and the exemption from discouragement. The unit and\nfuzz tests of that code go with it, including the net_tests case for\nthe addrman exception and the denialofservice_tests cases for the\ndiscouragement exemption.\n\nDelete-only: besides whole lines, conditions and arguments are cut out\nof lines, and the lines of a removed branch's alternative move out one\nindentation level. git show -w --word-diff-regex='[A-Za-z0-9_]+|[^[:space:]]'\nshows deletions only, apart from the size of the node array in\ndenialofservice_tests, which goes back from 5 to 3.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-21T16:18:53Z"
+      },
+      "sha": "e851f4d978601505d6c5b6e7d8f203a4e6ddebe0"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGMzOTk3M2E0ZGY0N2YyNTE2Yzg0M2U4NGI3NTdkOWYxOGExOTYyN2M",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c39973a4df47f2516c843e84b757d9f18a19627c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c39973a4df47f2516c843e84b757d9f18a19627c",
+      "tree": {
+        "sha": "e951a9669e3d290a0b2ee1b45382232307d34412",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/e951a9669e3d290a0b2ee1b45382232307d34412"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e851f4d978601505d6c5b6e7d8f203a4e6ddebe0",
+          "sha": "e851f4d978601505d6c5b6e7d8f203a4e6ddebe0",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/e851f4d978601505d6c5b6e7d8f203a4e6ddebe0"
+        }
+      ],
+      "message": "net: remove the old private broadcast connections\n\nWith the relay gone, nothing asks CConnman for private broadcast\nconnections. Remove the connection type, the thread that opened such\nconnections with its counters and choice of network, and the places\nthat treated them specially: the incoming nonce check, the fresh I2P\nsession, the guard against direct connections, the outbound message\nfilter, the fixed protocol version, the exception in disconnection by\nsubnet and their term in the orphanage's static_assert. The type's\nnames go from getpeerinfo's help, bitcoin-cli -netinfo and the GUI. The\nproxy override of ConnectNode() and OpenNetworkConnection(), which only\nthat thread set, goes too, with its copy in CNode and in the\nreconnection record and the fuzz input for it.\n\nDelete-only: besides whole lines, conditions, arguments and list\nseparators are cut out of lines, what followed a cut argument joins\nits line, and one line moves out an indentation level with the if\naround it. git show -w --word-diff-regex='[A-Za-z0-9_]+|[^[:space:]]'\nshows deletions only.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T00:22:50Z"
+      },
+      "sha": "c39973a4df47f2516c843e84b757d9f18a19627c"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGZkZWQ4YmJmMzlkZTVmZDI1NTQwOTc3MzM4ZDgwZDBiZGVkNDU2ZGQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fded8bbf39de5fd25540977338d80d0bded456dd",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/fded8bbf39de5fd25540977338d80d0bded456dd",
+      "tree": {
+        "sha": "6eedddf13a861bcb3048f99f0bd3d8a633fae5dd",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6eedddf13a861bcb3048f99f0bd3d8a633fae5dd"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c39973a4df47f2516c843e84b757d9f18a19627c",
+          "sha": "c39973a4df47f2516c843e84b757d9f18a19627c",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c39973a4df47f2516c843e84b757d9f18a19627c"
+        }
+      ],
+      "message": "refactor: drop the trivial AdvertisedVersion()\n\nWithout private broadcast connections, a node advertises\nPROTOCOL_VERSION on every connection, and CNode::AdvertisedVersion()\nonly returns it. Use the constant again where the method was called.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T04:31:35Z"
+      },
+      "sha": "fded8bbf39de5fd25540977338d80d0bded456dd"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGM1YWM2NzJkOGRiMDE1YmQ5MDljZDEwNTYyOGM3MjRlMmNjZTIxNTM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c5ac672d8db015bd909cd105628c724e2cce2153",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c5ac672d8db015bd909cd105628c724e2cce2153",
+      "tree": {
+        "sha": "38b76838d12e93acdbb3d0fe10b6cf629153b24c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/38b76838d12e93acdbb3d0fe10b6cf629153b24c"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fded8bbf39de5fd25540977338d80d0bded456dd",
+          "sha": "fded8bbf39de5fd25540977338d80d0bded456dd",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/fded8bbf39de5fd25540977338d80d0bded456dd"
+        }
+      ],
+      "message": "doc: describe bitcoind -privatebroadcast\n\nAdd the node part of the private broadcast guide: which Tor proxy the\njobs use, how sendrawtransaction queues them and when they start, what\nis not queued again, how to follow and abort jobs, what disabling\nnetworking and shutdown do, which node settings do not apply, what\nthe default log shows, the file descriptors the jobs need, and the\nlink between a job's connections and the node's peers at shutdown.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T00:22:59Z"
+      },
+      "sha": "c5ac672d8db015bd909cd105628c724e2cce2153"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDI2ZTNhMjFlMWMzYjM2MGIyZTQ4NGRkZTc3NTE5MmZmNDNiOTk3NmE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/26e3a21e1c3b360b2e484dde775192ff43b9976a",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/26e3a21e1c3b360b2e484dde775192ff43b9976a",
+      "tree": {
+        "sha": "a0c89ba9f4c803c9084e999de96513829337db3e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a0c89ba9f4c803c9084e999de96513829337db3e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c5ac672d8db015bd909cd105628c724e2cce2153",
+          "sha": "c5ac672d8db015bd909cd105628c724e2cce2153",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/c5ac672d8db015bd909cd105628c724e2cce2153"
+        }
+      ],
+      "message": "doc: release notes for private broadcast jobs",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T00:23:51Z"
+      },
+      "sha": "26e3a21e1c3b360b2e484dde775192ff43b9976a"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGE4MGE5ZDQxNGFkZTAzNzc2NDkwMWU2YTRiNWY4MGUyOWMxMzUwMzA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a80a9d414ade037764901e6a4b5f80e29c135030",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/a80a9d414ade037764901e6a4b5f80e29c135030",
+      "tree": {
+        "sha": "a0c89ba9f4c803c9084e999de96513829337db3e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a0c89ba9f4c803c9084e999de96513829337db3e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/26e3a21e1c3b360b2e484dde775192ff43b9976a",
+          "sha": "26e3a21e1c3b360b2e484dde775192ff43b9976a",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/26e3a21e1c3b360b2e484dde775192ff43b9976a"
+        }
+      ],
+      "message": "--- part 4/4: package mode ---\n\nEmpty commit marking the start of part 4: one parent and its child. The validation commits here serve only this part.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T13:09:32Z"
+      },
+      "sha": "a80a9d414ade037764901e6a4b5f80e29c135030"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQ5ZjRjMzVjYzM1OGY2MzJkODI0Y2Q1NzM3ZmZlNGRiYWQ5NDJiMjY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d9f4c35cc358f632d824cd5737ffe4dbad942b26",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d9f4c35cc358f632d824cd5737ffe4dbad942b26",
+      "tree": {
+        "sha": "d6ea510f0f309917196ac7beac42b560fcbe604e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d6ea510f0f309917196ac7beac42b560fcbe604e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a80a9d414ade037764901e6a4b5f80e29c135030",
+          "sha": "a80a9d414ade037764901e6a4b5f80e29c135030",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/a80a9d414ade037764901e6a4b5f80e29c135030"
+        }
+      ],
+      "message": "privbcast: serve a parent in package mode\n\nA child can pay for a parent too cheap to enter mempools alone when the\nrecipient takes the two together. A job may now carry the parent: each\nattempt announces only the child, serves the parent to a peer that asks\nfor it, and holds the PING for that request. A job without a parent\nruns and reports as before.\n\nImplements F1-F4 and the package amendments of E6-E8.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T14:58:13Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T02:52:39Z"
+      },
+      "sha": "d9f4c35cc358f632d824cd5737ffe4dbad942b26"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGJlMTQzM2ExYmQ2MTQ2M2YxYmFkYmZlZjQ1ODkwYmZmYjM3NzYwYTg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/be1433a1bd61463f1badbfef45890bffb37760a8",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/be1433a1bd61463f1badbfef45890bffb37760a8",
+      "tree": {
+        "sha": "5692c53003168702edc2ce607a502adfb1e63b83",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5692c53003168702edc2ce607a502adfb1e63b83"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d9f4c35cc358f632d824cd5737ffe4dbad942b26",
+          "sha": "d9f4c35cc358f632d824cd5737ffe4dbad942b26",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d9f4c35cc358f632d824cd5737ffe4dbad942b26"
+        }
+      ],
+      "message": "privbcast: accept a parent and child in the tool\n\nbitcoin-privbcast send also reads two transactions, an unconfirmed\nparent and its child in either order, checks that they are such a pair\nand runs the job in package mode. The acceptance suite gains its\npackage sections in tool_privbcast_package.py.\n\nImplements the Extension's Interface for bitcoin-privbcast.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T03:47:59Z"
+      },
+      "sha": "be1433a1bd61463f1badbfef45890bffb37760a8"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGVlNTcxOWQwYzYyOGY4Nzc4ODlmMmU1YWY0YzFkOWRmMzgxNTljMDQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ee5719d0c628f877889f2e5af4c1d9df38159c04",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ee5719d0c628f877889f2e5af4c1d9df38159c04",
+      "tree": {
+        "sha": "86f6cc003aa49c562a55c24fc70badd92d67f5f1",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/86f6cc003aa49c562a55c24fc70badd92d67f5f1"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/be1433a1bd61463f1badbfef45890bffb37760a8",
+          "sha": "be1433a1bd61463f1badbfef45890bffb37760a8",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/be1433a1bd61463f1badbfef45890bffb37760a8"
+        }
+      ],
+      "message": "validation: sum a package's modified fees saturating\n\nTwo prioritisetransaction deltas near INT64_MIN made the sum overflow.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-21T19:34:17Z"
+      },
+      "sha": "ee5719d0c628f877889f2e5af4c1d9df38159c04"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDc2Nzk3MDQwYzIwMWMzYzE4ZDUzMjNjZTFmNjE2ZjQ0ZWJhYWRmZjY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/76797040c201c3c18d5323ce1f616f44ebaadff6",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/76797040c201c3c18d5323ce1f616f44ebaadff6",
+      "tree": {
+        "sha": "0455eab720cd08aa8b72042e441c171e2a68ec6d",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/0455eab720cd08aa8b72042e441c171e2a68ec6d"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ee5719d0c628f877889f2e5af4c1d9df38159c04",
+          "sha": "ee5719d0c628f877889f2e5af4c1d9df38159c04",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ee5719d0c628f877889f2e5af4c1d9df38159c04"
+        }
+      ],
+      "message": "validation: test-accept a package as submission evaluates it\n\nProcessNewPackage's test mode checks each transaction without package\nfeerates or replacements, as testmempoolaccept does. With\ntest_as_submission it runs submission's evaluation instead and stops\nshort of the mempool, so a caller can learn whether a child pays for its\nparent before relaying them. A transaction that passed before another\nfailed is reported by its own result, as submission reports it. Results\ndo not list replaced transactions, and a parent that passes alone gives\nno answer for its child, which it does not stage.\n\nFrom #35286, without its RPC.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-21T21:19:08Z"
+      },
+      "sha": "76797040c201c3c18d5323ce1f616f44ebaadff6"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQyN2Q0NTA4NzdhNzY4OTY5MjYzYmVkNWE0NzdiOGY4YTdmY2I4YjY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d27d450877a768969263bed5a477b8f8a7fcb8b6",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d27d450877a768969263bed5a477b8f8a7fcb8b6",
+      "tree": {
+        "sha": "1278ea2fef83b485ccdf20c889d2e4b7ea0b96bf",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1278ea2fef83b485ccdf20c889d2e4b7ea0b96bf"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/76797040c201c3c18d5323ce1f616f44ebaadff6",
+          "sha": "76797040c201c3c18d5323ce1f616f44ebaadff6",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/76797040c201c3c18d5323ce1f616f44ebaadff6"
+        }
+      ],
+      "message": "validation: test a package whose parent passes alone\n\nA test does not stage a transaction that passes alone, so the child\nthat spends it was found missing its inputs. Test the new transactions\ntogether instead, each paying for itself. Their replacements get\npackage RBF's checks of fees, feerate diagram and cluster limits, but\nnot its rules that the package have no mempool ancestors and pay more\nper vbyte than the parent: submission would take the two in turn, each\nreplacing what it may. A replacement of an ancestor of the package is\nrefused instead, as it would take away the package's inputs. For a\nparent and child this accepts at least what submission accepts.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-21T22:21:00Z"
+      },
+      "sha": "d27d450877a768969263bed5a477b8f8a7fcb8b6"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGRmM2Y0NDliYjAyZGIyNjQ1NDFhNDIwNDAxNjg4OWM1YzVkZGYxMTY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/df3f449bb02db264541a4204016889c5c5ddf116",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/df3f449bb02db264541a4204016889c5c5ddf116",
+      "tree": {
+        "sha": "aea0a121910aee3ed229f7c79ddf041086469aca",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/aea0a121910aee3ed229f7c79ddf041086469aca"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d27d450877a768969263bed5a477b8f8a7fcb8b6",
+          "sha": "d27d450877a768969263bed5a477b8f8a7fcb8b6",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d27d450877a768969263bed5a477b8f8a7fcb8b6"
+        }
+      ],
+      "message": "rpc: queue submitpackage for private broadcast\n\nWith -privatebroadcast, submitpackage now queues a private broadcast\njob instead of adding the transactions to the mempool. It takes one\ntransaction, or a parent and its child, and queues one job, the\nchild's, which carries the parent. A transaction whose txid is in the\nmempool counts as accepted; the rest is test-accepted, one transaction\nalone as by sendrawtransaction, two as a package, after the package\nchecks on the whole submission, two as submitpackage evaluates them.\nmaxfeerate follows each path's own convention. Unit tests drive the RPC through its table.\n\nThe queue takes the parent with the transaction: a submission with a\nparent is covered only by a job with the same parent, one without by a\njob with any parent. getprivatebroadcastinfo lists the parent's txid\nand documents the report's package fields; abortprivatebroadcast\nmatches the child's ids only. Both submission RPCs ask the queue\nwhether an onion proxy is configured, which lets unit tests drive\nthem without the process-wide proxy registry. The acceptance suite gains its package\nsections, run as p2p_private_broadcast.py --package.\n\nImplements the Extension's N5 and N11 amendments and its Interface for\nsubmitpackage.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T05:26:51Z"
+      },
+      "sha": "df3f449bb02db264541a4204016889c5c5ddf116"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE5ZmRhZjgwNzE3OWY1NWJiZWE1ZmRlMzgzY2RkMzJkOWE3MGM1MjI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19fdaf807179f55bbea5fde383cdd32d9a70c522",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/19fdaf807179f55bbea5fde383cdd32d9a70c522",
+      "tree": {
+        "sha": "c675143a7c2f875ce9824d5e6d278f37b3bf9c43",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c675143a7c2f875ce9824d5e6d278f37b3bf9c43"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/df3f449bb02db264541a4204016889c5c5ddf116",
+          "sha": "df3f449bb02db264541a4204016889c5c5ddf116",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/df3f449bb02db264541a4204016889c5c5ddf116"
+        }
+      ],
+      "message": "doc: specify package mode\n\nAdd the specification's section \"Extension: one parent, one child\",\nwhich the preceding commits implement: a job that carries a child and\nits unconfirmed parent announces only the child and serves the parent\non request (F1-F4), and the tool and the node take such a pair.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T05:26:56Z"
+      },
+      "sha": "19fdaf807179f55bbea5fde383cdd32d9a70c522"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDdkMjUxOWFlNGY2MDMyZTgyMmQ1OGMzZTVmOTc2YzdlOGQzMTM5ZTA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7d2519ae4f6032e822d58c3e5f976c7e8d3139e0",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/7d2519ae4f6032e822d58c3e5f976c7e8d3139e0",
+      "tree": {
+        "sha": "9cbce74eca16baa9cf215650d81867377a7a4a7e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/9cbce74eca16baa9cf215650d81867377a7a4a7e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19fdaf807179f55bbea5fde383cdd32d9a70c522",
+          "sha": "19fdaf807179f55bbea5fde383cdd32d9a70c522",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/19fdaf807179f55bbea5fde383cdd32d9a70c522"
+        }
+      ],
+      "message": "doc: describe package mode\n\nAdd the guide's part on a parent and its child: when it helps, which\nrecipients accept such a package, what the tool and the node check and\nwhat peers can tell; and how submitpackage queues a job under\n-privatebroadcast.",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T05:27:00Z"
+      },
+      "sha": "7d2519ae4f6032e822d58c3e5f976c7e8d3139e0"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQ2M2Y5ODU5YmI3MGNmYzRkNjRhZmYzMjdlNGQ0Zjc1ODJiNzdlZGY",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/463f9859bb70cfc4d64aff327e4d4f7582b77edf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/463f9859bb70cfc4d64aff327e4d4f7582b77edf",
+      "tree": {
+        "sha": "5ddefe7d3acf87b0cb89ff78dbad3417fd3ee28b",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5ddefe7d3acf87b0cb89ff78dbad3417fd3ee28b"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7d2519ae4f6032e822d58c3e5f976c7e8d3139e0",
+          "sha": "7d2519ae4f6032e822d58c3e5f976c7e8d3139e0",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7d2519ae4f6032e822d58c3e5f976c7e8d3139e0"
+        }
+      ],
+      "message": "doc: release notes for package mode",
+      "committer": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-22T15:15:19Z"
+      },
+      "author": {
+        "name": "Greg Sanders",
+        "email": "gsanders87@gmail.com",
+        "date": "2026-10-02T05:27:10Z"
+      },
+      "sha": "463f9859bb70cfc4d64aff327e4d4f7582b77edf"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 33964244721,
+      "node_id": "HRFPE_lADOABII588AAAABZIhsJs8AAAAH6G0-8Q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/33964244721",
+      "actor": {
+        "login": "instagibbs",
+        "id": 5767891,
+        "node_id": "MDQ6VXNlcjU3Njc4OTE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/5767891?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/instagibbs",
+        "html_url": "https://github.com/instagibbs",
+        "followers_url": "https://api.github.com/users/instagibbs/followers",
+        "following_url": "https://api.github.com/users/instagibbs/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/instagibbs/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/instagibbs/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/instagibbs/subscriptions",
+        "organizations_url": "https://api.github.com/users/instagibbs/orgs",
+        "repos_url": "https://api.github.com/users/instagibbs/repos",
+        "events_url": "https://api.github.com/users/instagibbs/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/instagibbs/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "463f9859bb70cfc4d64aff327e4d4f7582b77edf",
+      "commit_url": "https://api.github.com/repos/instagibbs/bitcoin/commits/463f9859bb70cfc4d64aff327e4d4f7582b77edf",
+      "created_at": "2026-10-22T15:15:40Z"
+    },
+    {
+      "event": "labeled",
+      "id": 33964462190,
+      "node_id": "LE_lADOABII588AAAABZIhsJs8AAAAH6HCQbg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/33964462190",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-10-22T15:17:48Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 6344313225,
+      "node_id": "IC_kwDOABII588AAAABeiaJiQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/6344313225",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-10-22T15:18:05Z",
+      "updated_at": "2026-10-22T15:18:05Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "<!--85328a0da195eb286784d51f73fa0af9-->\n🚧 At least one of the CI tasks failed.\n<sub>Task `MSan`: https://github.com/bitcoin/bitcoin/actions/runs/39798797867/job/119893347731</sub>\n<sub>LLM reason (✨ experimental): The build failed because Clang’s thread-safety analysis found calls to `AcceptSubPackage` without exclusive locks on `cs_main` and `m_pool.cs` in `validation.cpp`.</sub>\n\n<details><summary>Hints</summary>\n\nTry to run the tests locally, according to the documentation. However, a CI failure may still\nhappen due to a number of reasons, for example:\n\n* Possibly due to a silent merge conflict (the changes in this pull request being\nincompatible with the current code in the target branch). If so, make sure to rebase on the latest\ncommit of the target branch.\n\n* A sanitizer issue, which can only be found by compiling with the sanitizer and running the\n  affected test.\n\n* An intermittent issue.\n\nLeave a comment here, if you need help tracking down a confusing failure.\n\n</details>\n\n",
+      "user": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36608#issuecomment-6344313225",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36608"
     }
   ],
