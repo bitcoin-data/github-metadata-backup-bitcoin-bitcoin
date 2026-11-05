@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36521/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36521/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/2f7d50342a936256be093d849fe691b605fde5e6",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/c655a696d8d1013bf61b815ba7b477840d31765c",
     "number": 36521,
     "state": "open",
     "locked": false,
@@ -41,13 +41,23 @@
       "patch_url": null
     },
     "body": "`CScriptWitness` stores a witness stack as a `std::vector<std::vector<unsigned char>>`, which costs a 24-byte vector object and an allocation for every element. This makes it possible to construct transactions that take a large amount of memory after deserialization, while becoming very slow to deserialize.\r\n\r\nThis PR stores the stack as its serialization in a single allocation (or none if the stack is empty), with a small header holding its size and the offset of the last element. Witnesses can no longer be modified in place, only allowing replacing them entirely. Access to the individual witness stack elements is done by on-the-fly deserialization instead. `CScriptWitness` shrinks from 24 to 8 bytes, and `CTxIn` from 112 to 96 bytes.\r\n\r\nLater commits also introduce stricter checking during deserialization, rejecting the following before fully deserializing:\r\n* Transactions with more inputs/outputs than are possible in a valid transaction.\r\n* Transactions with 0 inputs or 0 outputs (applied in P2P, but not RPC etc. for backward compatibility).\r\n* Transactions/blocks that exceed the 4M weight limit (also only applied in P2P).\r\n\r\nThe result is a significant reduction in the worst-case time and memory allocations needed for deserialization, both in valid and invalid transactions. With it, the worst-case memory of a valid deserialized block drops from 106.8 MiB to 6.0 MiB. Memory usage during deserialization can temporarily be higher: up to 7.8 MiB for valid blocks, and up to 13.4 MiB for invalid blocks, which can combine a few temporary vector allocations of up to 5 MB each.\r\n\r\nDeserialization time and memory of the deserialized block, master → PR. Runtimes are medians in milliseconds. Memory usage is in MiB, and ✕ means rejected at deserialization time. Peak memory refers to the memory during deserialization itself, not persisted in the deserialized `CBlock` object. Numbers over 50 ms, 20 MiB usage, or 100 MiB peak are in **bold**.\r\n\r\n| block | gcc | clang | mem | peak mem |\r\n|---|--:|--:|--:|--:|\r\n| **Valid blocks** |\r\n| 1 tx, max 1-byte wit elems | **99.1** → 16.0 | **111.4** → 21.9 | **106.8** → 3.8 | **145.9** → 7.8 |\r\n| 1 tx, max empty wit elems | **279.2** → 18.7 | **293.7** → 25.1 | **91.5** → 3.8 | **182.2** → 7.8 |\r\n| max txs, 1 txin, 1 txout, 1-item wit | 12.33 → 13.39 | 15.00 → 15.43 | 6.7 → 6.0 | 6.7 → 6.0 |\r\n| max txs, 1 txin and 1 txout | 6.43 → 7.04 | 7.87 → 8.30 | 5.8 → 5.6 | 5.8 → 5.6 |\r\n| 1 tx, max txins, 1-elem wit | 4.53 → 4.68 | 5.04 → 5.37 | 4.0 → 2.9 | 4.0 → 2.9 |\r\n| mainnet block 969729 | 5.30 → 5.47 | 5.97 → 6.20 | 3.5 → 2.9 | 3.5 → 2.9 |\r\n| **Invalid blocks** |\r\n| 400k txs, many wit elems, truncated | **84.8** → 16.1 | **95.6** → 21.8 | ✕ → ✕ | **150.7** → 12.6 |\r\n| 400k txs, big wit+scriptsig, truncated | **84.0** → 16.1 | **96.0** → 21.7 | ✕ → ✕ | **150.7** → 13.4 |\r\n| 1 tx, 2M 1-byte wit elems | **98.0** → 10.6 | **109.9** → 16.2 | **106.8** → ✕ | **145.9** → 7.8 |\r\n| 1 tx, 4M empty wit elems | **271.0** → 13.4 | **288.9** → 19.6 | **91.6** → ✕ | **182.2** → 7.8 |\r\n| max empty txs | **101.0** → 0.006 | **139.0** → 0.008 | **67.1** → ✕ | 67.1 → 4.8 |\r\n| max txs, 1 txin, 1 txout | 27.6 → 7.3 | 34.5 → 8.5 | **23.4** → ✕ | 23.4 → 6.4 |\r\n\r\nSo in addition to improving worst cases very significantly, it also provides modest memory usage improvements to the common case. This translates to mildly increasing the effective capacity of memory-bounded data structures that store transactions, like the mempool.\r\n\r\nSome notable changes:\r\n* By implementing some checks (for inherently consensus-invalid things) in the deserialization logic, behavior may change. In particular, deserialization errors in P2P cause messages to be dropped/ignored, rather than triggering validation or net processing logic (which may include disconnections and/or inserting into reject filters).\r\n* The rejection of transactions with too many inputs or outputs applies everywhere, including in RPC. That's hopefully a desirable change, but a change in behavior still.\r\n* Random access to the witness stack elements becomes $\\mathcal{O}(n)$. This is not a problem for any validation logic, but may be relevant for the libbitcoinkernel API which exposes an individual element accessor.\r\n\r\nIssue reported by furszy and 0xB10C.\r\n\r\nThere are a few possible follow-ups:\r\n* Enforce the 400k WU policy limit during transaction deserialization when active (instead of the 4M WU consensus limit).\r\n* Extend this approach to entire `CTransaction`, allowing all transaction data to be stored packed together in a few allocations (rather than one per input, one per output, one per witness) plus some index structure to access it efficiently. That's a much bigger change, needing abstractions like #35569, but would reduce the maximum memory usage per WU for valid blocks from around 1.5 bytes/WU to 1.1 bytes/WU (compared to ~28 bytes/WU in master).",
-    "labels": [],
+    "labels": [
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
+      }
+    ],
     "created_at": "2026-10-14T06:23:27Z",
-    "updated_at": "2026-11-05T09:50:08Z",
+    "updated_at": "2026-11-05T10:47:14Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "fe6233812cad8698cdb9ef441ab58229dbe07348",
+    "merge_commit_sha": "d42e769292eca82f5999a22dc923c0012c4c4340",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -144,7 +154,7 @@
     "head": {
       "label": "sipa:202610_witpack",
       "ref": "202610_witpack",
-      "sha": "2f7d50342a936256be093d849fe691b605fde5e6",
+      "sha": "c655a696d8d1013bf61b815ba7b477840d31765c",
       "user": {
         "login": "sipa",
         "id": 548488,
@@ -257,7 +267,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-05T08:55:36Z",
+        "pushed_at": "2026-11-05T10:14:26Z",
         "created_at": "2011-03-09T10:46:59Z",
         "updated_at": "2026-04-09T09:41:02Z",
         "allow_forking": true,
@@ -383,7 +393,7 @@
         "watchers_count": 90609,
         "size": 331694,
         "default_branch": "master",
-        "open_issues_count": 779,
+        "open_issues_count": 776,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -400,9 +410,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-04T21:44:14Z",
+        "pushed_at": "2026-11-05T10:53:00Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-05T09:35:53Z",
+        "updated_at": "2026-11-05T10:56:50Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -428,12 +438,12 @@
     },
     "author_association": "MEMBER",
     "draft": false,
-    "additions": 1254,
-    "deletions": 279,
+    "additions": 1255,
+    "deletions": 280,
     "changed_files": 76,
     "commits": 17,
     "review_comments": 0,
-    "comments": 13
+    "comments": 14
   },
   "events": [
     {
@@ -2403,166 +2413,6 @@
       "sha": "2d869d8186d4ed493dc3fdcd89118f5c1e17a958"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDEzYzc4NmI1MTUzZTZmZTM4YjJjNGViZWE2NzA1ZmM3ZmU2NWQwZjc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7",
-      "tree": {
-        "sha": "71973c9bba7adedd9835fd898fbb16c9862a4ff0",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/71973c9bba7adedd9835fd898fbb16c9862a4ff0"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2d869d8186d4ed493dc3fdcd89118f5c1e17a958",
-          "sha": "2d869d8186d4ed493dc3fdcd89118f5c1e17a958",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2d869d8186d4ed493dc3fdcd89118f5c1e17a958"
-        }
-      ],
-      "message": "p2p: reject transactions without inputs or outputs when deserializing\n\nAdd a reject_empty flag to TransactionSerParams, which makes\ndeserialization fail as soon as a transaction is found to have no\ninputs or no outputs. Such transactions are never valid, but are\ncurrently fully deserialized (along with the rest of the message) before\nvalidation rejects them.\n\nThis reduces the memory a peer can make us allocate by sending a block.\nA block full of 10-byte empty transactions was the previous worst case;\nwith this change, the worst case becomes 1-input 1-output transactions\nwith a significantly lower per-WU memory usage.\n\nThe flag is enabled (as TX_WITH_WITNESS_P2P) only where transactions are\nreceived from P2P peers: tx and block messages, and the transactions in\ncmpctblock and blocktxn messages. Like other malformed messages, these\nare now ignored, rather than, for a block, causing the peer to be\ndisconnected, or, for a transaction, being added to the reject filters.\nThe functional tests are updated accordingly.",
-      "committer": {
-        "name": "Pieter Wuille",
-        "email": "pieter@wuille.net",
-        "date": "2026-11-05T08:33:24Z"
-      },
-      "author": {
-        "name": "Pieter Wuille",
-        "email": "bitcoin-dev@wuille.net",
-        "date": "2026-10-04T14:21:08Z"
-      },
-      "sha": "13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDFhNjMyNzlkYmRiMzJiNThkYjI3MWJjZGJlMDAwYTMyYWM0ZTMxMjI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1a63279dbdb32b58db271bcdbe000a32ac4e3122",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/1a63279dbdb32b58db271bcdbe000a32ac4e3122",
-      "tree": {
-        "sha": "eabd32ed7b0dc09606cb021ddf829dfe9d255027",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/eabd32ed7b0dc09606cb021ddf829dfe9d255027"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7",
-          "sha": "13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/13c786b5153e6fe38b2c4ebea6705fc7fe65d0f7"
-        }
-      ],
-      "message": "policy: iterate over witness stacks directly in IsWitnessStandard\n\nInstead of converting a witness stack to a vector of spans for the P2WSH\nand Taproot checks, use its size() and back() (which are constant-time)\nand iterate over its elements directly. This avoids an allocation for\nevery witness spend that is checked.",
-      "committer": {
-        "name": "Pieter Wuille",
-        "email": "pieter@wuille.net",
-        "date": "2026-11-05T08:33:24Z"
-      },
-      "author": {
-        "name": "Pieter Wuille",
-        "email": "bitcoin-dev@wuille.net",
-        "date": "2026-10-17T22:43:53Z"
-      },
-      "sha": "1a63279dbdb32b58db271bcdbe000a32ac4e3122"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDYzMTg4Y2FlMDBlMDY3NmNjYTViOWUzY2RkMmY0NDM4NDEzZWJlMTU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/63188cae00e0676cca5b9e3cdd2f4438413ebe15",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/63188cae00e0676cca5b9e3cdd2f4438413ebe15",
-      "tree": {
-        "sha": "77744d8e032e70f9d5f0342e4c387923079d6cb3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/77744d8e032e70f9d5f0342e4c387923079d6cb3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/1a63279dbdb32b58db271bcdbe000a32ac4e3122",
-          "sha": "1a63279dbdb32b58db271bcdbe000a32ac4e3122",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/1a63279dbdb32b58db271bcdbe000a32ac4e3122"
-        }
-      ],
-      "message": "refactor: use the stream's parameters for compact block transactions\n\nBlockTransactions and PrefilledTransaction (de)serialized their\ntransactions with TX_WITH_WITNESS_P2P, overriding any parameters of the\nstream. Use the stream's parameters instead, like CBlock does, and pass\nTX_WITH_WITNESS where they are serialized and TX_WITH_WITNESS_P2P where\nthey are deserialized. This does not change behavior (serialization only\ndepends on allow_witness), but makes it possible to deserialize them\nwith other parameters.",
-      "committer": {
-        "name": "Pieter Wuille",
-        "email": "pieter@wuille.net",
-        "date": "2026-11-05T08:33:24Z"
-      },
-      "author": {
-        "name": "Pieter Wuille",
-        "email": "bitcoin-dev@wuille.net",
-        "date": "2026-10-20T17:47:18Z"
-      },
-      "sha": "63188cae00e0676cca5b9e3cdd2f4438413ebe15"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDJmN2Q1MDM0MmE5MzYyNTZiZTA5M2Q4NDlmZTY5MWI2MDVmZGU1ZTY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2f7d50342a936256be093d849fe691b605fde5e6",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2f7d50342a936256be093d849fe691b605fde5e6",
-      "tree": {
-        "sha": "82854664f8a7501e1c21cf94f9aec8c8bfea7b7b",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/82854664f8a7501e1c21cf94f9aec8c8bfea7b7b"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/63188cae00e0676cca5b9e3cdd2f4438413ebe15",
-          "sha": "63188cae00e0676cca5b9e3cdd2f4438413ebe15",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/63188cae00e0676cca5b9e3cdd2f4438413ebe15"
-        }
-      ],
-      "message": "p2p: limit the weight of transactions and blocks while deserializing\n\nAdd an optional weight budget to TransactionSerParams. When it is set,\nthe budget is decremented while transactions are being deserialized\n(charging the minimum weight of inputs and outputs before allocating\nmemory for them), causing failure as soon as the budget is exceeded.\n\nUse this for tx, block, cmpctblock and blocktxn messages, with a budget\nof MAX_BLOCK_WEIGHT minus the header: the transactions in a block,\ncmpctblock or blocktxn message are part of one block (for blocktxn, this\ndoes not account for those of the block that are already known), and a\ntransaction that does not fit in a block cannot be valid.\n\nThe P2P message size limit allows blocks of up to 4 MB, which is up to\n16M weight, all of which is currently deserialized before validation\nrejects it (unless a transaction has more inputs or outputs than fit in\na block). With this change, the weight deserialized from a message is\nat most MAX_BLOCK_WEIGHT minus the header.\n\nMessages exceeding the budget are ignored, like other malformed\nmessages, rather than causing the peer to be disconnected for sending an\ninvalid block.",
-      "committer": {
-        "name": "Pieter Wuille",
-        "email": "pieter@wuille.net",
-        "date": "2026-11-05T08:35:26Z"
-      },
-      "author": {
-        "name": "Pieter Wuille",
-        "email": "bitcoin-dev@wuille.net",
-        "date": "2026-10-20T17:47:25Z"
-      },
-      "sha": "2f7d50342a936256be093d849fe691b605fde5e6"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 35221270112,
       "node_id": "HRFPE_lADOABII588AAAABXEV1Uc8AAAAIM1nuYA",
@@ -2627,6 +2477,414 @@
         "name": "Needs rebase",
         "color": "cccccc"
       }
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGIyZWU5ZDI5ZjJiYmQwNzhkYzY1MTAyMjBlYzU1ZTBjNzRhMGIwZmE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa",
+      "tree": {
+        "sha": "eaf6230b135ed539d2d4544c66f8070ce4b2cbbe",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/eaf6230b135ed539d2d4544c66f8070ce4b2cbbe"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2d869d8186d4ed493dc3fdcd89118f5c1e17a958",
+          "sha": "2d869d8186d4ed493dc3fdcd89118f5c1e17a958",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/2d869d8186d4ed493dc3fdcd89118f5c1e17a958"
+        }
+      ],
+      "message": "p2p: reject transactions without inputs or outputs when deserializing\n\nAdd a reject_empty flag to TransactionSerParams, which makes\ndeserialization fail as soon as a transaction is found to have no\ninputs or no outputs. Such transactions are never valid, but are\ncurrently fully deserialized (along with the rest of the message) before\nvalidation rejects them.\n\nThis reduces the memory a peer can make us allocate by sending a block.\nA block full of 10-byte empty transactions was the previous worst case;\nwith this change, the worst case becomes 1-input 1-output transactions\nwith a significantly lower per-WU memory usage.\n\nThe flag is enabled (as TX_WITH_WITNESS_P2P) only where transactions are\nreceived from P2P peers: tx and block messages, and the transactions in\ncmpctblock and blocktxn messages. Like other malformed messages, these\nare now ignored, rather than, for a block, causing the peer to be\ndisconnected, or, for a transaction, being added to the reject filters.\nThe functional tests are updated accordingly.",
+      "committer": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-11-05T10:04:29Z"
+      },
+      "author": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-10-04T14:21:08Z"
+      },
+      "sha": "b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYwYjJkYTNjYzg2YzBlMTk4ODQ2YmI2YTE2M2I2N2Y2ZmFlNDcxZDk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60b2da3cc86c0e198846bb6a163b67f6fae471d9",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/60b2da3cc86c0e198846bb6a163b67f6fae471d9",
+      "tree": {
+        "sha": "6df5de134e0c13d9b26428976d9fb47cbe3d9547",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6df5de134e0c13d9b26428976d9fb47cbe3d9547"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa",
+          "sha": "b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/b2ee9d29f2bbd078dc6510220ec55e0c74a0b0fa"
+        }
+      ],
+      "message": "policy: iterate over witness stacks directly in IsWitnessStandard\n\nInstead of converting a witness stack to a vector of spans for the P2WSH\nand Taproot checks, use its size() and back() (which are constant-time)\nand iterate over its elements directly. This avoids an allocation for\nevery witness spend that is checked.",
+      "committer": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-11-05T10:04:29Z"
+      },
+      "author": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-10-17T22:43:53Z"
+      },
+      "sha": "60b2da3cc86c0e198846bb6a163b67f6fae471d9"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDVlZDU3NmQ5OWFhZThjZGY2MjU4NzM5MzVhNTM2YjczNzhlNTIxOGM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5ed576d99aae8cdf625873935a536b7378e5218c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/5ed576d99aae8cdf625873935a536b7378e5218c",
+      "tree": {
+        "sha": "66e49b1551980aa5a4871f35abdd10ead605fa80",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/66e49b1551980aa5a4871f35abdd10ead605fa80"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60b2da3cc86c0e198846bb6a163b67f6fae471d9",
+          "sha": "60b2da3cc86c0e198846bb6a163b67f6fae471d9",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/60b2da3cc86c0e198846bb6a163b67f6fae471d9"
+        }
+      ],
+      "message": "refactor: use the stream's parameters for compact block transactions\n\nBlockTransactions and PrefilledTransaction (de)serialized their\ntransactions with TX_WITH_WITNESS_P2P, overriding any parameters of the\nstream. Use the stream's parameters instead, like CBlock does, and pass\nTX_WITH_WITNESS where they are serialized and TX_WITH_WITNESS_P2P where\nthey are deserialized. This does not change behavior (serialization only\ndepends on allow_witness), but makes it possible to deserialize them\nwith other parameters.",
+      "committer": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-11-05T10:04:29Z"
+      },
+      "author": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-10-20T17:47:18Z"
+      },
+      "sha": "5ed576d99aae8cdf625873935a536b7378e5218c"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGM2NTVhNjk2ZDhkMTAxM2JmNjFiODE1YmE3YjQ3Nzg0MGQzMTc2NWM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/c655a696d8d1013bf61b815ba7b477840d31765c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/c655a696d8d1013bf61b815ba7b477840d31765c",
+      "tree": {
+        "sha": "568a300a9721f5ad5e78de103699f6f5ed8b68e1",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/568a300a9721f5ad5e78de103699f6f5ed8b68e1"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5ed576d99aae8cdf625873935a536b7378e5218c",
+          "sha": "5ed576d99aae8cdf625873935a536b7378e5218c",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/5ed576d99aae8cdf625873935a536b7378e5218c"
+        }
+      ],
+      "message": "p2p: limit the weight of transactions and blocks while deserializing\n\nAdd an optional weight budget to TransactionSerParams. When it is set,\nthe budget is decremented while transactions are being deserialized\n(charging the minimum weight of inputs and outputs before allocating\nmemory for them), causing failure as soon as the budget is exceeded.\n\nUse this for tx, block, cmpctblock and blocktxn messages, with a budget\nof MAX_BLOCK_WEIGHT minus the header: the transactions in a block,\ncmpctblock or blocktxn message are part of one block (for blocktxn, this\ndoes not account for those of the block that are already known), and a\ntransaction that does not fit in a block cannot be valid.\n\nThe P2P message size limit allows blocks of up to 4 MB, which is up to\n16M weight, all of which is currently deserialized before validation\nrejects it (unless a transaction has more inputs or outputs than fit in\na block). With this change, the weight deserialized from a message is\nat most MAX_BLOCK_WEIGHT minus the header.\n\nMessages exceeding the budget are ignored, like other malformed\nmessages, rather than causing the peer to be disconnected for sending an\ninvalid block.",
+      "committer": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-11-05T10:04:29Z"
+      },
+      "author": {
+        "name": "Pieter Wuille",
+        "email": "bitcoin-dev@wuille.net",
+        "date": "2026-10-20T17:47:25Z"
+      },
+      "sha": "c655a696d8d1013bf61b815ba7b477840d31765c"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 35227926984,
+      "node_id": "HRFPE_lADOABII588AAAABXEV1Uc8AAAAIM7-ByA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35227926984",
+      "actor": {
+        "login": "sipa",
+        "id": 548488,
+        "node_id": "MDQ6VXNlcjU0ODQ4OA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/548488?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sipa",
+        "html_url": "https://github.com/sipa",
+        "followers_url": "https://api.github.com/users/sipa/followers",
+        "following_url": "https://api.github.com/users/sipa/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sipa/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sipa/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sipa/subscriptions",
+        "organizations_url": "https://api.github.com/users/sipa/orgs",
+        "repos_url": "https://api.github.com/users/sipa/repos",
+        "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sipa/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "c655a696d8d1013bf61b815ba7b477840d31765c",
+      "commit_url": "https://api.github.com/repos/sipa/bitcoin/commits/c655a696d8d1013bf61b815ba7b477840d31765c",
+      "created_at": "2026-11-05T10:14:27Z"
+    },
+    {
+      "event": "labeled",
+      "id": 35228013606,
+      "node_id": "LE_lADOABII588AAAABXEV1Uc8AAAAIM8DUJg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35228013606",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:15:24Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
+    },
+    {
+      "event": "commented",
+      "id": 6655976837,
+      "node_id": "IC_kwDOABII588AAAABjLolhQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/6655976837",
+      "actor": {
+        "login": "sipa",
+        "id": 548488,
+        "node_id": "MDQ6VXNlcjU0ODQ4OA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/548488?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sipa",
+        "html_url": "https://github.com/sipa",
+        "followers_url": "https://api.github.com/users/sipa/followers",
+        "following_url": "https://api.github.com/users/sipa/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sipa/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sipa/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sipa/subscriptions",
+        "organizations_url": "https://api.github.com/users/sipa/orgs",
+        "repos_url": "https://api.github.com/users/sipa/repos",
+        "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sipa/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:44:18Z",
+      "updated_at": "2026-11-05T10:47:14Z",
+      "author_association": "MEMBER",
+      "body": "@purpleKarrot \r\n\r\n> May I dare to NACK this? I understand that keeping the witness data in serialized format considerably improves performance, but as I wrote in [#35569 (comment)](https://github.com/bitcoin/bitcoin/pull/35569#issuecomment-6311323619), there sure are hundreds of possibilities for data layouts that may be even more optimized for fast data access.\r\n\r\nI consider this PR a bugfix for a significant problem. It doesn't rise to the level of vulnerability that needs immediate fixing and emergency releases, but I do think it's an issue that should be fixed and ideally soon. My goal is not at all to find the optimal solution; the goal is simply to get a sufficient and acceptable solution in, and I think this is one. Providing the ability to experiment with even better representations is what I'd consider a secondary goal here.\r\n\r\nThat said, I don't think it's far off from what an optimal solution can achieve. In terms of memory usage, it drops from ~28 bytes/WU to 1.6 bytes/WU. Clearly nothing can go below 1 byte/WU. In terms of deserialization performance it's harder to give a lower bound, but I think this brings values to an acceptable level regardless.\r\n\r\n> Instead pushing 17 commits touching over 1000 lines in 76 files, just to establish an implementation that is proven better but not proven best, should we maybe concentrate on the task that would allow us to make such a change localized in a single place? This would give us the possibility to easily experiment with different data layouts and lead to an even faster implementation?\r\n\r\nI think that is exactly what (the first half of) this PR is: the introduction of an abstraction layer for `CScriptWitness`, sufficient to hide the representation aspects. The later commits then introduce one particular representation that is decent, plus some optimizations to it, and to the P2P deserialization code to improve further upon what become the new worst-case scenarios. Nothing prevents experimenting with better layouts as follow-ups, and the changes here make that easy; this is demonstrated by how narrow the changes in a1cea0d7e024e838be8ea295688693116ec357a1 are.\r\n\r\nWhile I'm sure there are code-level conflicts with with #35569, I don't think those are of a conceptual nature. This PR is about an abstraction at the `CScriptWitness` level, while yours is about abstraction at the `CTransaction` level as I understand it. We can do either, or both, and I'm happy to rebase on yours if that were the consensus for going forward (though I personally think the changes here are more urgent). If we do both, in whatever order, it opens up the ability for a `CTransaction`-wide shared allocation approach (packing everything in 1 or a small number of per-transaction allocations + index structures). I've experimented with those too, getting down to around 1.1 bytes/WU memory usage, but I don't think those benefits are worth gating behind the more involved refactorings needed as we can get 90% of the benefit with a more localized change.\r\n\r\n---\r\n\r\n@alexanderwiederin That sounds pretty reasonable; the PR has grown a bit beyond its original intentions and it may be worth splitting up. I'll wait for a few more review comments to see what others think.",
+      "user": {
+        "login": "sipa",
+        "id": 548488,
+        "node_id": "MDQ6VXNlcjU0ODQ4OA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/548488?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/sipa",
+        "html_url": "https://github.com/sipa",
+        "followers_url": "https://api.github.com/users/sipa/followers",
+        "following_url": "https://api.github.com/users/sipa/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/sipa/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/sipa/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/sipa/subscriptions",
+        "organizations_url": "https://api.github.com/users/sipa/orgs",
+        "repos_url": "https://api.github.com/users/sipa/repos",
+        "events_url": "https://api.github.com/users/sipa/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/sipa/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36521#issuecomment-6655976837",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36521"
+    },
+    {
+      "event": "mentioned",
+      "id": 35230569329,
+      "node_id": "MEE_lADOABII588AAAABXEV1Uc8AAAAIM-fTcQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35230569329",
+      "actor": {
+        "login": "purpleKarrot",
+        "id": 185240,
+        "node_id": "MDQ6VXNlcjE4NTI0MA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/185240?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/purpleKarrot",
+        "html_url": "https://github.com/purpleKarrot",
+        "followers_url": "https://api.github.com/users/purpleKarrot/followers",
+        "following_url": "https://api.github.com/users/purpleKarrot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/purpleKarrot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/purpleKarrot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/purpleKarrot/subscriptions",
+        "organizations_url": "https://api.github.com/users/purpleKarrot/orgs",
+        "repos_url": "https://api.github.com/users/purpleKarrot/repos",
+        "events_url": "https://api.github.com/users/purpleKarrot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/purpleKarrot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:44:20Z"
+    },
+    {
+      "event": "subscribed",
+      "id": 35230570112,
+      "node_id": "SE_lADOABII588AAAABXEV1Uc8AAAAIM-fWgA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35230570112",
+      "actor": {
+        "login": "purpleKarrot",
+        "id": 185240,
+        "node_id": "MDQ6VXNlcjE4NTI0MA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/185240?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/purpleKarrot",
+        "html_url": "https://github.com/purpleKarrot",
+        "followers_url": "https://api.github.com/users/purpleKarrot/followers",
+        "following_url": "https://api.github.com/users/purpleKarrot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/purpleKarrot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/purpleKarrot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/purpleKarrot/subscriptions",
+        "organizations_url": "https://api.github.com/users/purpleKarrot/orgs",
+        "repos_url": "https://api.github.com/users/purpleKarrot/repos",
+        "events_url": "https://api.github.com/users/purpleKarrot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/purpleKarrot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:44:20Z"
+    },
+    {
+      "event": "mentioned",
+      "id": 35230571065,
+      "node_id": "MEE_lADOABII588AAAABXEV1Uc8AAAAIM-faOQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35230571065",
+      "actor": {
+        "login": "alexanderwiederin",
+        "id": 37130778,
+        "node_id": "MDQ6VXNlcjM3MTMwNzc4",
+        "avatar_url": "https://avatars.githubusercontent.com/u/37130778?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/alexanderwiederin",
+        "html_url": "https://github.com/alexanderwiederin",
+        "followers_url": "https://api.github.com/users/alexanderwiederin/followers",
+        "following_url": "https://api.github.com/users/alexanderwiederin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/alexanderwiederin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/alexanderwiederin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/alexanderwiederin/subscriptions",
+        "organizations_url": "https://api.github.com/users/alexanderwiederin/orgs",
+        "repos_url": "https://api.github.com/users/alexanderwiederin/repos",
+        "events_url": "https://api.github.com/users/alexanderwiederin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/alexanderwiederin/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:44:21Z"
+    },
+    {
+      "event": "subscribed",
+      "id": 35230571783,
+      "node_id": "SE_lADOABII588AAAABXEV1Uc8AAAAIM-fdBw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35230571783",
+      "actor": {
+        "login": "alexanderwiederin",
+        "id": 37130778,
+        "node_id": "MDQ6VXNlcjM3MTMwNzc4",
+        "avatar_url": "https://avatars.githubusercontent.com/u/37130778?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/alexanderwiederin",
+        "html_url": "https://github.com/alexanderwiederin",
+        "followers_url": "https://api.github.com/users/alexanderwiederin/followers",
+        "following_url": "https://api.github.com/users/alexanderwiederin/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/alexanderwiederin/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/alexanderwiederin/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/alexanderwiederin/subscriptions",
+        "organizations_url": "https://api.github.com/users/alexanderwiederin/orgs",
+        "repos_url": "https://api.github.com/users/alexanderwiederin/repos",
+        "events_url": "https://api.github.com/users/alexanderwiederin/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/alexanderwiederin/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-05T10:44:22Z"
     }
   ],
   "comments": []
