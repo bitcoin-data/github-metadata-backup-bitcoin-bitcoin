@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35558/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35558/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/5871f8666d5f6c882db0d146229474647dbe43be",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/aee9cc32881c8c926d0b4f1a1498a7a06737db44",
     "number": 35558,
     "state": "open",
     "locked": false,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "> ---> Review before this: #35724\r\n\r\nThis is an implementation based on 0xB10C's [proposal][proposal] and [implementation][implementation] of prefilling CMPCTBLOCK messages with what we[^1] needed during CMPCTBLOCK reconstruction in the hopes of providing everything our peers will need to reconstruct without having to ask us for transactions.\r\n\r\nAlthough full support for receiving prefills is [implemented][cb-og-pr] in Bitcoin Core, the only prefills sent presently are coinbases. The goal of prefilling is to improve compact block reconstruction rates, which reduces the number of roundtrips needed to propagate blocks per-hop, which reduces the amount of time needed for blocks to propagate on the network, which mitigates selfish mining attacks by lowering the stale rate and the ratio $γ$ of honest miners a selfish miner is able to recruit in a block race.[^2] The tradeoff of prefilling is that it uses a small amount of extra bandwidth and makes propagation slightly worse when the predictions are bad.\r\n\r\nMy primary contribution is limiting the prefill based on the connection's TCP window. Exceeding the boundary of the current TCP window will result in a ~[roundtrip][roundtrip] at the network layer,[^3] and any time a roundtrip is going to be incurred anyways, it would be [better][better] to let our peer tell us exactly what they are missing in a roundtrip instead of hazarding a guess, which risks sending redundant information.[^4]\r\n\r\n## Prefill do\r\n\r\nIn measurements I took from 2026-02-15 to 2026-03-16, a node receiving prefilled `CMPCTBLOCK`s limited to the TCP window size was able to reconstruct 89.7% of compact blocks received without a GETBLOCKTXN roundtrip, and a node receiving typical `CMPCTBLOCK`s with only coinbases prefilled was able to reconstruct 56.9% of blocks received without a GETBLOCKTXN roundtrip.[^5]\r\n\r\nThe mean prefill sent was 1,694.64 bytes and the median was 897 bytes. If all the bytes of every prefill were redundant [^6], the cost of prefilling 1,694.64 bytes would be 1.39 MiB per node in wasted bandwidth per day (counting both the sending and the receiving bandwidth for all 3 HB peers).\r\n\r\n## Prefill why\r\n\r\nThere are changes that are likely more effective at improving propagation times than prefilling, for example:\r\n- [Using a sketch instead of shortids][sketch-shortid] in CMPCTBLOCK messages\r\n- Using a UDP connection with FEC as [the FIBRE project does][the-fibre-project-does]\r\n- Sharing [block templates][block-templates]\r\n\r\nThe advantage of this approach is that it requires no protocol changes and is entirely backwards compatible with existing node software that has implemented the `CMPCTBLOCK` [protocol][protocol]. Concretely: An old version of Bitcoin Core that knows nothing about this PR can enjoy faster block reconstructions if it connects to a peer that prefills blocks. I think these benefits are worth the tradeoff of violating the layer cake and taking transport matters into our own hands.\r\n\r\n## Prefill what\r\n\r\n- The transactions which we were missing during reconstruction and received in a `GETBLOCKTXN->BLOCKTXN` round trip with our peer.\r\n- The transactions which were pulled from our extrapool during reconstruction.[^7]\r\n- Any transactions that were prefilled to us that we didn't already have in our mempool.\r\n\r\nThe reasons to like this heuristic are that it's simple, per-block rather than per-peer, makes sense on paper, and seems to be effective in practice.\r\n\r\n## Prefill when\r\n\r\nTo avoid having to generate unique CMPCTBLOCK messages for each of our peers, which might be costly[^8], we (lazily[^9]) build and cache 2 CMPCTBLOCK messages: one prefilled and one not prefilled.\r\n\r\nAt sending time we check the available bytes in our peer's TCP window, and if the total number of TCP windows occupied by the prefilled block is equal to the total number of windows occupied by the nonprefilled block, then we send the prefilled block.\r\n\r\n----\r\n\r\n## TCP Windows\r\n\r\nDiscussed in greater detail [elsewhere][elsewhere], I'll try to summarize here:\r\n\r\nIn [RFC 793][rfc-793], TCP was specified with receiver advertised window sizes because receivers allocate some buffer size to a given TCP connection, and this receiver advertised window represents the most **unacknowledged** data a receiver will process before dropping bytes on the ground or something awful like that. So the sender of a message over a TCP connection will only send up to the last acknowledged byte + the receiver's advertised window size in order to avoid filling up their peer's receive buffer.\r\n\r\nIt was later discovered that TCP was susceptible to [\"congestion collapse\"][congestion-collapse], which can probably describe any congestion feedback loop but in TCP is where packets being dropped due to congestion results in retransmissions that cause even more congestion. TCP implementers addressed this with \"congestion control\" algorithms which decide on the sending side to limit the number of bytes to send dynamically, based on how frequently packets are dropped on a TCP connection. For a more concrete account of various congestion control algorithms see [RFC 5681][rfc-5681]. A user's TCP implementation (typically in their OS kernel) will compute a window size dynamically for each TCP connection usually increasing as packets sent are ACKnowledged and decreasing when packets sent are dropped.\r\n\r\nComputed congestion control window sizes vary:\r\n- per-connection\r\n- over connection lifetime\r\n- with the congestion control algorithm used by the system TCP implementation\r\n- with user configuration of the TCP implementation.\r\n\r\nThere is not likely to be any way to guess or predict what the TCP window will be very effectively, and we must query the TCP implementation in order to learn what our connection window sizes are.\r\n\r\nThe usable window size is the smaller of the receiver advertised window and the sender computed congestion control window, but in practice the congestion control window is far smaller. In my observation node, the mean Bitcoin P2P congestion window observed was 17,360.52 bytes and the median was 14,480 bytes.\r\n\r\n[^1]: 'We' refers to the Royal Node.\r\n[^2]: (2013) Eyal and Sirer *Majority is not Enough* (pg. 8) https://arxiv.org/pdf/1311.0243 The claim that lowering block propagation times lowers γ probably needs serious analysis, but my hand-waving argument is that the faster public network-wide block propagation is, the more expensive any proportional propagation time advantage over the public network becomes, and γ is a function of propagation time advantage.\r\n[^3]: A network layer roundtrip will be faster than an application layer roundtrip, although probably not by much for most connections. Since at the application layer there will be some time your message spends waiting to be processed by your peer, at least for peers that use single-threaded message processing like Bitcoin Core does presently.\r\n[^4]: In practice exceeding the TCP window is ~not quite as bad as I've implied here and in the delving post: because the window is sliding, once the first 1.5 round-trips are completed there is a continuous stream as ACKnowledgements for the oldest segments arrive and the newest segments are fired out. The effect of this more precisely is that if a message exceeds a window boundary, the minimum travel time of the message becomes 1.5 round-trip-time (RTT) instead of 0.5 RTT and the throughput limit of the connection becomes $\\text{window size} / \\text{RTT}$. I am working on a more complete write-up that takes this more precise cost into consideration, but I think approximating it as a ~round trip is reasonable.\r\n[^5]: In reality, not all of the prefill is redundant otherwise prefilling would not be very useful. In my observation node that received prefilled compact blocks, the mean redundant prefill bytes was 865.62 bytes/block. 2 HB announcements will always be redundant so: 1.17 MiB per node in wasted bandwidth per day if one CMPCTBLOCK announcement only has 865.62 redundant bytes.\r\n[^6]: I will share a write-up describing my full experimental setup and data soon. It was mostly identical to the set up described here: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34 I had one node running a prefilling branch, and another node set up to only receive CMPCTBLOCK messages from the prefilling node. My infrastructure as code observation set up: https://github.com/davidgumberg/prefill-research and the script I used to analyze the results: https://radicle.network/nodes/iris.radicle.network/rad:z37pH1UAxFvazXnfAMS5qbcUjQaP6/tree/leave/scripts/prefill.py\r\n[^7]: The reason to pluck from the extrapool is because it is very likely to differ between nodes.\r\n[^8]: But maybe there is some cost here that is worth trading off, it's not something I've explored.\r\n[^9]: This is based on andrewtoth's #26755.\r\n\r\n[proposal]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/24\r\n[cb-og-pr]: https://github.com/bitcoin/bitcoin/pull/8068\r\n[sketch-shortid]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/30\r\n[the-fibre-project-does]: https://github.com/bitcoinfibre/bitcoinfibre/blob/master/src/udprelay.cpp\r\n[roundtrip]: https://en.wikipedia.org/wiki/TCP_window_scale_option#TCP_windows\r\n[better]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34\r\n[rfc-793]: https://www.rfc-editor.org/rfc/rfc793.html#section-2.6\r\n[elsewhere]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34\r\n[congestion-collapse]: https://dl.acm.org/doi/epdf/10.1145/52325.52356\r\n[rfc-5681]: https://datatracker.ietf.org/doc/html/rfc5681\r\n[block-templates]: https://delvingbitcoin.org/t/sharing-block-templates/1906\r\n[implementation]: https://github.com/0xB10C/bitcoin/tree/2025-03-prefill-cmpctblocks\r\n[protocol]: https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki\r\n\r\n\r\n> LLM Disclosure: LLMs were used frequently as a research tool while investigating this topic, but no code or text in this PR was generated with an LLM.\r\n",
+    "body": "> ---> Review before this: #36787\r\n\r\nThis is an implementation based on 0xB10C's [proposal][proposal] and [implementation][implementation] of prefilling CMPCTBLOCK messages with what we[^1] needed during CMPCTBLOCK reconstruction in the hopes of providing everything our peers will need to reconstruct without having to ask us for transactions.\r\n\r\nAlthough full support for receiving prefills is [implemented][cb-og-pr] in Bitcoin Core, the only prefills sent presently are coinbases. The goal of prefilling is to improve compact block reconstruction rates, which reduces the number of roundtrips needed to propagate blocks per-hop, which reduces the amount of time needed for blocks to propagate on the network, which mitigates selfish mining attacks by lowering the stale rate and the ratio $γ$ of honest miners a selfish miner is able to recruit in a block race.[^2] The tradeoff of prefilling is that it uses a small amount of extra bandwidth and makes propagation slightly worse when the predictions are bad.\r\n\r\nMy primary contribution is limiting the prefill based on the connection's TCP window. Exceeding the boundary of the current TCP window will result in a ~[roundtrip][roundtrip] at the network layer,[^3] and any time a roundtrip is going to be incurred anyways, it would be [better][better] to let our peer tell us exactly what they are missing in a roundtrip instead of hazarding a guess, which risks sending redundant information.[^4]\r\n\r\n## Prefill do\r\n\r\nIn measurements I took from 2026-02-15 to 2026-03-16, a node receiving prefilled `CMPCTBLOCK`s limited to the TCP window size was able to reconstruct 89.7% of compact blocks received without a GETBLOCKTXN roundtrip, and a node receiving typical `CMPCTBLOCK`s with only coinbases prefilled was able to reconstruct 56.9% of blocks received without a GETBLOCKTXN roundtrip.[^5]\r\n\r\nThe mean prefill sent was 1,694.64 bytes and the median was 897 bytes. If all the bytes of every prefill were redundant [^6], the cost of prefilling 1,694.64 bytes would be 1.39 MiB per node in wasted bandwidth per day (counting both the sending and the receiving bandwidth for all 3 HB peers).\r\n\r\n## Prefill why\r\n\r\nThere are changes that are likely more effective at improving propagation times than prefilling, for example:\r\n- [Using a sketch instead of shortids][sketch-shortid] in CMPCTBLOCK messages\r\n- Using a UDP connection with FEC as [the FIBRE project does][the-fibre-project-does]\r\n- Sharing [block templates][block-templates]\r\n\r\nThe advantage of this approach is that it requires no protocol changes and is entirely backwards compatible with existing node software that has implemented the `CMPCTBLOCK` [protocol][protocol]. Concretely: An old version of Bitcoin Core that knows nothing about this PR can enjoy faster block reconstructions if it connects to a peer that prefills blocks. I think these benefits are worth the tradeoff of violating the layer cake and taking transport matters into our own hands.\r\n\r\n## Prefill what\r\n\r\n- The transactions which we were missing during reconstruction and received in a `GETBLOCKTXN->BLOCKTXN` round trip with our peer.\r\n- The transactions which were pulled from our extrapool during reconstruction.[^7]\r\n- Any transactions that were prefilled to us that we didn't already have in our mempool.\r\n\r\nThe reasons to like this heuristic are that it's simple, per-block rather than per-peer, makes sense on paper, and seems to be effective in practice.\r\n\r\n## Prefill when\r\n\r\nTo avoid having to generate unique CMPCTBLOCK messages for each of our peers, which might be costly[^8], we (lazily[^9]) build and cache 2 CMPCTBLOCK messages: one prefilled and one not prefilled.\r\n\r\nAt sending time we check the available bytes in our peer's TCP window, and if the total number of TCP windows occupied by the prefilled block is equal to the total number of windows occupied by the nonprefilled block, then we send the prefilled block.\r\n\r\n----\r\n\r\n## TCP Windows\r\n\r\nDiscussed in greater detail [elsewhere][elsewhere], I'll try to summarize here:\r\n\r\nIn [RFC 793][rfc-793], TCP was specified with receiver advertised window sizes because receivers allocate some buffer size to a given TCP connection, and this receiver advertised window represents the most **unacknowledged** data a receiver will process before dropping bytes on the ground or something awful like that. So the sender of a message over a TCP connection will only send up to the last acknowledged byte + the receiver's advertised window size in order to avoid filling up their peer's receive buffer.\r\n\r\nIt was later discovered that TCP was susceptible to [\"congestion collapse\"][congestion-collapse], which can probably describe any congestion feedback loop but in TCP is where packets being dropped due to congestion results in retransmissions that cause even more congestion. TCP implementers addressed this with \"congestion control\" algorithms which decide on the sending side to limit the number of bytes to send dynamically, based on how frequently packets are dropped on a TCP connection. For a more concrete account of various congestion control algorithms see [RFC 5681][rfc-5681]. A user's TCP implementation (typically in their OS kernel) will compute a window size dynamically for each TCP connection usually increasing as packets sent are ACKnowledged and decreasing when packets sent are dropped.\r\n\r\nComputed congestion control window sizes vary:\r\n- per-connection\r\n- over connection lifetime\r\n- with the congestion control algorithm used by the system TCP implementation\r\n- with user configuration of the TCP implementation.\r\n\r\nThere is not likely to be any way to guess or predict what the TCP window will be very effectively, and we must query the TCP implementation in order to learn what our connection window sizes are.\r\n\r\nThe usable window size is the smaller of the receiver advertised window and the sender computed congestion control window, but in practice the congestion control window is far smaller. In my observation node, the mean Bitcoin P2P congestion window observed was 17,360.52 bytes and the median was 14,480 bytes.\r\n\r\n[^1]: 'We' refers to the Royal Node.\r\n[^2]: (2013) Eyal and Sirer *Majority is not Enough* (pg. 8) https://arxiv.org/pdf/1311.0243 The claim that lowering block propagation times lowers γ probably needs serious analysis, but my hand-waving argument is that the faster public network-wide block propagation is, the more expensive any proportional propagation time advantage over the public network becomes, and γ is a function of propagation time advantage.\r\n[^3]: A network layer roundtrip will be faster than an application layer roundtrip, although probably not by much for most connections. Since at the application layer there will be some time your message spends waiting to be processed by your peer, at least for peers that use single-threaded message processing like Bitcoin Core does presently.\r\n[^4]: In practice exceeding the TCP window is ~not quite as bad as I've implied here and in the delving post: because the window is sliding, once the first 1.5 round-trips are completed there is a continuous stream as ACKnowledgements for the oldest segments arrive and the newest segments are fired out. The effect of this more precisely is that if a message exceeds a window boundary, the minimum travel time of the message becomes 1.5 round-trip-time (RTT) instead of 0.5 RTT and the throughput limit of the connection becomes $\\text{window size} / \\text{RTT}$. I am working on a more complete write-up that takes this more precise cost into consideration, but I think approximating it as a ~round trip is reasonable.\r\n[^5]: In reality, not all of the prefill is redundant otherwise prefilling would not be very useful. In my observation node that received prefilled compact blocks, the mean redundant prefill bytes was 865.62 bytes/block. 2 HB announcements will always be redundant so: 1.17 MiB per node in wasted bandwidth per day if one CMPCTBLOCK announcement only has 865.62 redundant bytes.\r\n[^6]: I will share a write-up describing my full experimental setup and data soon. It was mostly identical to the set up described here: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34 I had one node running a prefilling branch, and another node set up to only receive CMPCTBLOCK messages from the prefilling node. My infrastructure as code observation set up: https://github.com/davidgumberg/prefill-research and the script I used to analyze the results: https://radicle.network/nodes/iris.radicle.network/rad:z37pH1UAxFvazXnfAMS5qbcUjQaP6/tree/leave/scripts/prefill.py\r\n[^7]: The reason to pluck from the extrapool is because it is very likely to differ between nodes.\r\n[^8]: But maybe there is some cost here that is worth trading off, it's not something I've explored.\r\n[^9]: This is based on andrewtoth's #26755.\r\n\r\n[proposal]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/24\r\n[cb-og-pr]: https://github.com/bitcoin/bitcoin/pull/8068\r\n[sketch-shortid]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/30\r\n[the-fibre-project-does]: https://github.com/bitcoinfibre/bitcoinfibre/blob/master/src/udprelay.cpp\r\n[roundtrip]: https://en.wikipedia.org/wiki/TCP_window_scale_option#TCP_windows\r\n[better]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34\r\n[rfc-793]: https://www.rfc-editor.org/rfc/rfc793.html#section-2.6\r\n[elsewhere]: https://delvingbitcoin.org/t/stats-on-compact-block-reconstructions/1052/34\r\n[congestion-collapse]: https://dl.acm.org/doi/epdf/10.1145/52325.52356\r\n[rfc-5681]: https://datatracker.ietf.org/doc/html/rfc5681\r\n[block-templates]: https://delvingbitcoin.org/t/sharing-block-templates/1906\r\n[implementation]: https://github.com/0xB10C/bitcoin/tree/2025-03-prefill-cmpctblocks\r\n[protocol]: https://github.com/bitcoin/bips/blob/master/bip-0152.mediawiki\r\n\r\n\r\n> LLM Disclosure: LLMs were used frequently as a research tool while investigating this topic, but no code or text in this PR was generated with an LLM.\r\n",
     "labels": [
       {
         "id": 98298007,
@@ -58,13 +58,23 @@
         "description": "",
         "color": "cccccc",
         "default": false
+      },
+      {
+        "id": 5334691551,
+        "node_id": "LA_kwDOABII588AAAABPfju3w",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/CI%20failed",
+        "name": "CI failed",
+        "description": "",
+        "color": "cccccc",
+        "default": false
       }
     ],
     "created_at": "2026-06-18T06:44:54Z",
-    "updated_at": "2026-11-05T00:13:35Z",
-    "mergeable": false,
-    "mergeable_state": "dirty",
+    "updated_at": "2026-11-06T01:48:22Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
     "merged": false,
+    "merge_commit_sha": "7fe12ffd6791e7ad518357f44b4d43e3efbd0ee8",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -201,11 +211,11 @@
       }
     ],
     "requested_teams": [],
-    "rebaseable": false,
+    "rebaseable": true,
     "head": {
       "label": "davidgumberg:2025-11-13-0xB10C-prefill-rebase-binary-limit",
       "ref": "2025-11-13-0xB10C-prefill-rebase-binary-limit",
-      "sha": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "sha": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "user": {
         "login": "davidgumberg",
         "id": 2257631,
@@ -305,7 +315,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 290000,
+        "size": 289999,
         "default_branch": "master",
         "open_issues_count": 8,
         "is_template": false,
@@ -318,7 +328,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-04T23:30:56Z",
+        "pushed_at": "2026-11-06T01:46:57Z",
         "created_at": "2022-08-27T00:44:27Z",
         "updated_at": "2026-09-25T00:35:05Z",
         "allow_forking": true,
@@ -342,7 +352,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "924f4c4ac78b0cd3b917c694f42c0651a6f3003a",
+      "sha": "fcf76ea549f8b6124ffd52526565cf736033b9be",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -439,12 +449,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39434,
-        "stargazers_count": 90602,
-        "watchers_count": 90602,
-        "size": 331694,
+        "forks_count": 39441,
+        "stargazers_count": 90610,
+        "watchers_count": 90610,
+        "size": 331951,
         "default_branch": "master",
-        "open_issues_count": 775,
+        "open_issues_count": 771,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -461,9 +471,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-04T21:44:14Z",
+        "pushed_at": "2026-11-06T00:11:32Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-05T00:59:23Z",
+        "updated_at": "2026-11-06T01:38:01Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -490,11 +500,11 @@
     "author_association": "CONTRIBUTOR",
     "draft": true,
     "additions": 631,
-    "deletions": 146,
+    "deletions": 152,
     "changed_files": 16,
     "commits": 13,
     "review_comments": 33,
-    "comments": 14
+    "comments": 15
   },
   "events": [
     {
@@ -527,9 +537,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2026-06-18T06:45:01Z",
-      "updated_at": "2026-10-29T10:37:34Z",
+      "updated_at": "2026-11-06T01:47:23Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### External sites\n\n* Code coverage & benchmarks: https://corecheck.dev/bitcoin/bitcoin/pulls/35558\n* Ralph review <img src=https://review.fish.foo/assets/bitcoin/bitcoin/35558.png alt=\"Ralph review status\"> https://git.fish.foo/bitcoin/bitcoin/pulls/35558#author-ralph\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [w0xlt](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4739425253), [ismaelsadeeq](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4740957399), [josibake](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4741030804), [edilmedeiros](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4742097236), [murchandamus](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4743728397), [0xB10C](https://github.com/bitcoin/bitcoin/pull/35558#pullrequestreview-4530717536), [johnnyasantoss](https://github.com/bitcoin/bitcoin/pull/35558#pullrequestreview-4583332964) |\n| Stale ACK | [m4ycon](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4995282022), [s00ly](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-5040544280) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#36608](https://github.com/bitcoin/bitcoin/pull/36608) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36608.svg\"></sub> (Reimplement private broadcast as node state-less jobs + package relay support by instagibbs)\n* [#36521](https://github.com/bitcoin/bitcoin/pull/36521) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36521.svg\"></sub> (Keep witness stacks in serialized form in CScriptWitness by sipa)\n* [#36372](https://github.com/bitcoin/bitcoin/pull/36372) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36372.svg\"></sub> (p2p: replace full outbound peers that don't support tx relay (take 2) by fjahr)\n* [#35561](https://github.com/bitcoin/bitcoin/pull/35561) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/35561.svg\"></sub> (net: move some CNodeState fields to Peer by Crypt-iQ)\n* [#35522](https://github.com/bitcoin/bitcoin/pull/35522) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/35522.svg\"></sub> (refactor: Extract per-message helpers from SendMessages() (move-only) by pablomartin4btc)\n* [#29418](https://github.com/bitcoin/bitcoin/pull/29418) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/29418.svg\"></sub> (rpc: provide per message stats for global traffic via new field in 'getnettotals' by vasild)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible typos and grammar issues:\n\n- `src/blockencodings.h`: `annoucements` → `announcements` [misspelling]\n- `src/net_processing.cpp`: `annoucements` → `announcements` [misspelling]\n- `src/net_processing.cpp`: `recontruct` → `reconstruct` [misspelling]\n- `src/util/sock.h`: `tcp_info on /Linux|e.BSD/` → `tcp_info on Linux/BSD` [broken wording]\n\n\n\n<sup>2026-10-09 04:18:55</sup>\n",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### External sites\n\n* Code coverage & benchmarks: https://corecheck.dev/bitcoin/bitcoin/pulls/35558\n* Ralph review <img src=https://review.fish.foo/assets/bitcoin/bitcoin/35558.png alt=\"Ralph review status\"> https://git.fish.foo/bitcoin/bitcoin/pulls/35558#author-ralph\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [w0xlt](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4739425253), [ismaelsadeeq](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4740957399), [josibake](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4741030804), [edilmedeiros](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4742097236), [murchandamus](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4743728397), [0xB10C](https://github.com/bitcoin/bitcoin/pull/35558#pullrequestreview-4530717536), [johnnyasantoss](https://github.com/bitcoin/bitcoin/pull/35558#pullrequestreview-4583332964) |\n| Stale ACK | [m4ycon](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-4995282022), [s00ly](https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-5040544280) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#36608](https://github.com/bitcoin/bitcoin/pull/36608) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36608.svg\"></sub> (Reimplement private broadcast as node state-less jobs + package relay support by instagibbs)\n* [#36521](https://github.com/bitcoin/bitcoin/pull/36521) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36521.svg\"></sub> (Keep witness stacks in serialized form in CScriptWitness by sipa)\n* [#36372](https://github.com/bitcoin/bitcoin/pull/36372) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/36372.svg\"></sub> (p2p: replace full outbound peers that don't support tx relay (take 2) by fjahr)\n* [#35561](https://github.com/bitcoin/bitcoin/pull/35561) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/35561.svg\"></sub> (net: move some CNodeState fields to Peer by Crypt-iQ)\n* [#35522](https://github.com/bitcoin/bitcoin/pull/35522) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/35522.svg\"></sub> (refactor: Extract per-message helpers from SendMessages() (move-only) by pablomartin4btc)\n* [#29418](https://github.com/bitcoin/bitcoin/pull/29418) <sub><img src=\"https://drahtbot.space/ack_count/bitcoin/bitcoin/29418.svg\"></sub> (rpc: provide per message stats for global traffic via new field in 'getnettotals' by vasild)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->\n### LLM Linter (✨ experimental)\n\n\n\nPossible typos and grammar issues:\n\n- `src/blockencodings.h`: `annoucements` → `announcements` [misspelling]\n- `src/net_processing.cpp`: `annoucements` → `announcements` [misspelling]\n- `src/net_processing.cpp`: `recontruct` → `reconstruct` [misspelling]\n- `src/util/sock.h`: `on /Linux|e.BSD/` → `on Linux/BSD` [malformed wording]\n\n\n\n<sup>2026-11-06 01:47:23</sup>\n",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -2706,526 +2716,6 @@
       }
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGRmN2NhOGI0YWQyYmMyNzNlMmMzYzdlZjQ5MmQ4YzZhYWJhYmU1YjA",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0",
-      "tree": {
-        "sha": "c06286f9083eb5599cc276986d25889c777de04b",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c06286f9083eb5599cc276986d25889c777de04b"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/924f4c4ac78b0cd3b917c694f42c0651a6f3003a",
-          "sha": "924f4c4ac78b0cd3b917c694f42c0651a6f3003a",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/924f4c4ac78b0cd3b917c694f42c0651a6f3003a"
-        }
-      ],
-      "message": "build: Bump minimum Windows to >= Windows 1703\n\nThis is needed for the use of the `SIO_TCP_INFO` API.\n\nhttps://learn.microsoft.com/en-us/windows/win32/api/mstcpip/ns-mstcpip-tcp_info_v0#requirements",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-12-03T19:51:44Z"
-      },
-      "sha": "df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGUyYTEwMDY1MmU3ZWNhNmIwMTUwN2E0MjY4MTQyYzU2YWNkNGEzNzc",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e2a100652e7eca6b01507a4268142c56acd4a377",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/e2a100652e7eca6b01507a4268142c56acd4a377",
-      "tree": {
-        "sha": "fec6db8ea635fc01662ec355081cae0d2892d021",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/fec6db8ea635fc01662ec355081cae0d2892d021"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0",
-          "sha": "df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/df7ca8b4ad2bc273e2c3c7ef492d8c6aababe5b0"
-        }
-      ],
-      "message": "sock: Add TCPInfo wrapper for getting socket info.",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-09-16T17:47:10Z"
-      },
-      "sha": "e2a100652e7eca6b01507a4268142c56acd4a377"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDcwMTlmZGJiNDdlMjc5ZjhhZjIwNTE0NzgzYzEwYWUwMTBkYjIwYTU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7019fdbb47e279f8af20514783c10ae010db20a5",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/7019fdbb47e279f8af20514783c10ae010db20a5",
-      "tree": {
-        "sha": "53ecf7db458a1c641d2fbeff401bb70976598c8a",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/53ecf7db458a1c641d2fbeff401bb70976598c8a"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/e2a100652e7eca6b01507a4268142c56acd4a377",
-          "sha": "e2a100652e7eca6b01507a4268142c56acd4a377",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/e2a100652e7eca6b01507a4268142c56acd4a377"
-        }
-      ],
-      "message": "sock: TCPInfo::GetTCPWindowSize()",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-06-18T02:06:38Z"
-      },
-      "sha": "7019fdbb47e279f8af20514783c10ae010db20a5"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIzODY0OTA1MTBiZjg2NmY4ZmQ2YzcyNDM0YTVlZDJkMGJmNGU5N2Q",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2386490510bf866f8fd6c72434a5ed2d0bf4e97d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/2386490510bf866f8fd6c72434a5ed2d0bf4e97d",
-      "tree": {
-        "sha": "f080168759c3dc358edf410b7a8da138540cee2e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f080168759c3dc358edf410b7a8da138540cee2e"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7019fdbb47e279f8af20514783c10ae010db20a5",
-          "sha": "7019fdbb47e279f8af20514783c10ae010db20a5",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/7019fdbb47e279f8af20514783c10ae010db20a5"
-        }
-      ],
-      "message": "sock: Add GetOSBytesQueued",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-06-18T02:06:49Z"
-      },
-      "sha": "2386490510bf866f8fd6c72434a5ed2d0bf4e97d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIwZTAxMzhmODdhMmZiOWRkMzY3Y2UwYmY3ZWU0MDQxNTYwMTllNjQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/20e0138f87a2fb9dd367ce0bf7ee404156019e64",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/20e0138f87a2fb9dd367ce0bf7ee404156019e64",
-      "tree": {
-        "sha": "8b58a8ee05321c3f5990a8ce5a1690e658271d6c",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/8b58a8ee05321c3f5990a8ce5a1690e658271d6c"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/2386490510bf866f8fd6c72434a5ed2d0bf4e97d",
-          "sha": "2386490510bf866f8fd6c72434a5ed2d0bf4e97d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/2386490510bf866f8fd6c72434a5ed2d0bf4e97d"
-        }
-      ],
-      "message": "net: Add Transport::GetMessageSize() for serialized msg sizes\n\nThis is unused here, but will be useful for estimating the serialized\nbytes in the application send queue.",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-06-18T02:00:04Z"
-      },
-      "sha": "20e0138f87a2fb9dd367ce0bf7ee404156019e64"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDhkNjRjMTBiOTEzMWI0Nzk0ZGZjMGM1ZDY1OTYxNjk2Y2E2ZTNjYjU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8d64c10b9131b4794dfc0c5d65961696ca6e3cb5",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/8d64c10b9131b4794dfc0c5d65961696ca6e3cb5",
-      "tree": {
-        "sha": "3228c8d5bedf06e871391e9e57a70613c59fd963",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3228c8d5bedf06e871391e9e57a70613c59fd963"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/20e0138f87a2fb9dd367ce0bf7ee404156019e64",
-          "sha": "20e0138f87a2fb9dd367ce0bf7ee404156019e64",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/20e0138f87a2fb9dd367ce0bf7ee404156019e64"
-        }
-      ],
-      "message": "net: Add GetSendQueueSize()\n\nNot used yet, but will be useful for deciding whether or not prefilling\na CMPCTBLOCK will cause the current message queue to overflow a TCP\nwindow boundary.",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-06-18T02:02:22Z"
-      },
-      "sha": "8d64c10b9131b4794dfc0c5d65961696ca6e3cb5"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGQ2NmUwMjgwYWRiMmM3MWQxY2NhNGE5YTZjOGNjZTU3NjNhMDQyMTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d66e0280adb2c71d1cca4a9a6c8cce5763a04219",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/d66e0280adb2c71d1cca4a9a6c8cce5763a04219",
-      "tree": {
-        "sha": "4853cecf12748581365ba86bdda8b3767e12669e",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4853cecf12748581365ba86bdda8b3767e12669e"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8d64c10b9131b4794dfc0c5d65961696ca6e3cb5",
-          "sha": "8d64c10b9131b4794dfc0c5d65961696ca6e3cb5",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8d64c10b9131b4794dfc0c5d65961696ca6e3cb5"
-        }
-      ],
-      "message": "net: Add CNode::WindowBytesTotalAndAvailable()",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-10-08T00:17:40Z"
-      },
-      "sha": "d66e0280adb2c71d1cca4a9a6c8cce5763a04219"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDVhNDI1M2FmNTA5MTM4NDQwNzZiNGUyOWZhZWExNmI5MGViMzk5OGQ",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5a4253af50913844076b4e29faea16b90eb3998d",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/5a4253af50913844076b4e29faea16b90eb3998d",
-      "tree": {
-        "sha": "cfa45bf9bf57e02a109caedbf3435fe2507fb3b6",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/cfa45bf9bf57e02a109caedbf3435fe2507fb3b6"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d66e0280adb2c71d1cca4a9a6c8cce5763a04219",
-          "sha": "d66e0280adb2c71d1cca4a9a6c8cce5763a04219",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/d66e0280adb2c71d1cca4a9a6c8cce5763a04219"
-        }
-      ],
-      "message": "p2p: refactor: Stuff m_most_recent* into a struct",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-11-20T00:42:45Z"
-      },
-      "sha": "5a4253af50913844076b4e29faea16b90eb3998d"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDkxYWY5YmRkODY1YzY0YTVjZTVlNGRlYmI0MmQ0NTc5NzU3MDI4YzI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/91af9bdd865c64a5ce5e4debb42d4579757028c2",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/91af9bdd865c64a5ce5e4debb42d4579757028c2",
-      "tree": {
-        "sha": "e0e50362f48e1677f99693b400786de488d8daf8",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/e0e50362f48e1677f99693b400786de488d8daf8"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5a4253af50913844076b4e29faea16b90eb3998d",
-          "sha": "5a4253af50913844076b4e29faea16b90eb3998d",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/5a4253af50913844076b4e29faea16b90eb3998d"
-        }
-      ],
-      "message": "p2p: Cache cmpct_block_msg for low bandwidth relay.\n\nThis commit is drawn from the closed #26755.\n(https://github.com/bitcoin/bitcoin/pull/26755)\n\nThis also changes `std::launch::deferred` to `std::launch::async` since\nwe are likely going to use this result very soon if someone has\nrequested HB blocks from us, and if no one has, then performance here is\nnot that critical.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-11-20T01:18:15Z"
-      },
-      "sha": "91af9bdd865c64a5ce5e4debb42d4579757028c2"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDIwNGUwNzkyNDA1MjMwMTY1ZjE2NDU2NDUxMTRlYzg2OTg2MDkzYzg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/204e0792405230165f1645645114ec86986093c8",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/204e0792405230165f1645645114ec86986093c8",
-      "tree": {
-        "sha": "4c2c41db55aa213346b0871b66d2c53c09f5d166",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4c2c41db55aa213346b0871b66d2c53c09f5d166"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/91af9bdd865c64a5ce5e4debb42d4579757028c2",
-          "sha": "91af9bdd865c64a5ce5e4debb42d4579757028c2",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/91af9bdd865c64a5ce5e4debb42d4579757028c2"
-        }
-      ],
-      "message": "net: refactor: Move common logic into SendCompactBlock\n\nAlso one non-refactor change which is setting the `pIndexBestHeaderSent`\non the `SendMessages` CMPCTBLOCK announcement fallback.",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-11-27T02:59:23Z"
-      },
-      "sha": "204e0792405230165f1645645114ec86986093c8"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGYxNjJlMWFjMjVkZWFhZjg0OWNiMDNmNjA0MTFlZDgwYTY1ZTIyYzg",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f162e1ac25deaaf849cb03f60411ed80a65e22c8",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/f162e1ac25deaaf849cb03f60411ed80a65e22c8",
-      "tree": {
-        "sha": "938fc8ab98133072fdaf62a6c0f964f7f2b513c3",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/938fc8ab98133072fdaf62a6c0f964f7f2b513c3"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/204e0792405230165f1645645114ec86986093c8",
-          "sha": "204e0792405230165f1645645114ec86986093c8",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/204e0792405230165f1645645114ec86986093c8"
-        }
-      ],
-      "message": "net: Protect PeerHasHeader from nullptr",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2025-11-27T03:00:34Z"
-      },
-      "sha": "f162e1ac25deaaf849cb03f60411ed80a65e22c8"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDY5NmNjMDQzMGE0NGVlNWI0MDgyMjA3OGJmMGFjYTU4MjBmMjMzOTk",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/696cc0430a44ee5b40822078bf0aca5820f23399",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/696cc0430a44ee5b40822078bf0aca5820f23399",
-      "tree": {
-        "sha": "574ec4d4cd9ffc72a1cc584b3001b282d134c6ba",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/574ec4d4cd9ffc72a1cc584b3001b282d134c6ba"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/f162e1ac25deaaf849cb03f60411ed80a65e22c8",
-          "sha": "f162e1ac25deaaf849cb03f60411ed80a65e22c8",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/f162e1ac25deaaf849cb03f60411ed80a65e22c8"
-        }
-      ],
-      "message": "p2p: keep track of cmpctblock prefill candidates\n\nKeep track of the block position of transactions that we didn't have in\nour mempool while reconstructing this compact block. We can use these to\npredictively prefill transactions in our compact block annoucements.\nThis includes transactions that:\n- were prefilled by the cmpctblock announcer and were not in our mempool\n- transactions we found in our extra_pool (but not mempool)\n- transactions we had to request from the announcer",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "0xb10c",
-        "email": "b10c@b10c.me",
-        "date": "2025-03-19T15:19:23Z"
-      },
-      "sha": "696cc0430a44ee5b40822078bf0aca5820f23399"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDU4NzFmODY2NmQ1ZjZjODgyZGIwZDE0NjIyOTQ3NDY0N2RiZTQzYmU",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/5871f8666d5f6c882db0d146229474647dbe43be",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/5871f8666d5f6c882db0d146229474647dbe43be",
-      "tree": {
-        "sha": "d9e1980cd50e12da2218c2150ea1e875c17400c1",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/d9e1980cd50e12da2218c2150ea1e875c17400c1"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/696cc0430a44ee5b40822078bf0aca5820f23399",
-          "sha": "696cc0430a44ee5b40822078bf0aca5820f23399",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/696cc0430a44ee5b40822078bf0aca5820f23399"
-        }
-      ],
-      "message": "p2p: prefill our compact blocks with candidates\n\nUpon receving a compact block, we keep a set of prefill candidates\n(transactions we didn't have in our mempool) for this block. When\nconstructing a compact block, we try to use these candiates to prefill\nour compact block annocement of this block.",
-      "committer": {
-        "name": "David Gumberg",
-        "email": "davidzgumberg@gmail.com",
-        "date": "2026-10-18T23:13:23Z"
-      },
-      "author": {
-        "name": "0xb10c",
-        "email": "b10c@b10c.me",
-        "date": "2025-03-19T15:50:42Z"
-      },
-      "sha": "5871f8666d5f6c882db0d146229474647dbe43be"
-    },
-    {
       "event": "head_ref_force_pushed",
       "id": 33597311610,
       "node_id": "HRFPE_lADOABII588AAAABF4oGfs8AAAAH0o5Keg",
@@ -3441,6 +2931,681 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-6645863958",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35558"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDdjNWMyMzJkYTZmN2M3ODM1MzUzNzA3MDIwZjEzNDAxZThlZDJmODE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7c5c232da6f7c7835353707020f13401e8ed2f81",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/7c5c232da6f7c7835353707020f13401e8ed2f81",
+      "tree": {
+        "sha": "f1705479f641a4dc7adbf1fac3ebd402784e914e",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/f1705479f641a4dc7adbf1fac3ebd402784e914e"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fcf76ea549f8b6124ffd52526565cf736033b9be",
+          "sha": "fcf76ea549f8b6124ffd52526565cf736033b9be",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/fcf76ea549f8b6124ffd52526565cf736033b9be"
+        }
+      ],
+      "message": "p2p: refactor: Stuff m_most_recent* into a struct",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:00:41Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-11-20T00:42:45Z"
+      },
+      "sha": "7c5c232da6f7c7835353707020f13401e8ed2f81"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 35305358426,
+      "node_id": "HRFPE_lADOABII588AAAABF4oGfs8AAAAIOF0EWg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35305358426",
+      "actor": {
+        "login": "davidgumberg",
+        "id": 2257631,
+        "node_id": "MDQ6VXNlcjIyNTc2MzE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2257631?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/davidgumberg",
+        "html_url": "https://github.com/davidgumberg",
+        "followers_url": "https://api.github.com/users/davidgumberg/followers",
+        "following_url": "https://api.github.com/users/davidgumberg/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/davidgumberg/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/davidgumberg/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/davidgumberg/subscriptions",
+        "organizations_url": "https://api.github.com/users/davidgumberg/orgs",
+        "repos_url": "https://api.github.com/users/davidgumberg/repos",
+        "events_url": "https://api.github.com/users/davidgumberg/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/davidgumberg/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "726a6d57c28fdce5697d6ac3b37b4c262b9c7632",
+      "commit_url": "https://api.github.com/repos/davidgumberg/bitcoin/commits/726a6d57c28fdce5697d6ac3b37b4c262b9c7632",
+      "created_at": "2026-11-06T01:42:37Z"
+    },
+    {
+      "event": "commented",
+      "id": 6674590563,
+      "node_id": "IC_kwDOABII588AAAABjdYrYw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/6674590563",
+      "actor": {
+        "login": "davidgumberg",
+        "id": 2257631,
+        "node_id": "MDQ6VXNlcjIyNTc2MzE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2257631?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/davidgumberg",
+        "html_url": "https://github.com/davidgumberg",
+        "followers_url": "https://api.github.com/users/davidgumberg/followers",
+        "following_url": "https://api.github.com/users/davidgumberg/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/davidgumberg/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/davidgumberg/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/davidgumberg/subscriptions",
+        "organizations_url": "https://api.github.com/users/davidgumberg/orgs",
+        "repos_url": "https://api.github.com/users/davidgumberg/repos",
+        "events_url": "https://api.github.com/users/davidgumberg/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/davidgumberg/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-06T01:44:20Z",
+      "updated_at": "2026-11-06T01:44:20Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Rebased on #36787, I've extracted some of the refactors and performance improvements here into that PR for separate review, and that PR should be reviewed before this one.",
+      "user": {
+        "login": "davidgumberg",
+        "id": 2257631,
+        "node_id": "MDQ6VXNlcjIyNTc2MzE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2257631?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/davidgumberg",
+        "html_url": "https://github.com/davidgumberg",
+        "followers_url": "https://api.github.com/users/davidgumberg/followers",
+        "following_url": "https://api.github.com/users/davidgumberg/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/davidgumberg/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/davidgumberg/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/davidgumberg/subscriptions",
+        "organizations_url": "https://api.github.com/users/davidgumberg/orgs",
+        "repos_url": "https://api.github.com/users/davidgumberg/repos",
+        "events_url": "https://api.github.com/users/davidgumberg/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/davidgumberg/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/35558#issuecomment-6674590563",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35558"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQyYTk5MjgxNmFjZWFjZWViNDA0MGYwN2QwNzE4OGZlYjZhZmMwNmM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/42a992816aceaceeb4040f07d07188feb6afc06c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/42a992816aceaceeb4040f07d07188feb6afc06c",
+      "tree": {
+        "sha": "dc67a6228dfdb9e22efc35816b4bdd339085c431",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/dc67a6228dfdb9e22efc35816b4bdd339085c431"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/7c5c232da6f7c7835353707020f13401e8ed2f81",
+          "sha": "7c5c232da6f7c7835353707020f13401e8ed2f81",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/7c5c232da6f7c7835353707020f13401e8ed2f81"
+        }
+      ],
+      "message": "p2p: Cache serialized `cmpct_block_msg` for relay.\n\nThis commit is drawn from the closed #26755.\n(https://github.com/bitcoin/bitcoin/pull/26755)\n\nThis also changes `std::launch::deferred` to `std::launch::async` since\nwe are likely going to use this result very soon if someone has\nrequested HB blocks from us, and if no one has, then performance here is\nnot that critical.\n\nCo-authored-by: Andrew Toth <andrewstoth@gmail.com>",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:45:09Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-11-20T01:18:15Z"
+      },
+      "sha": "42a992816aceaceeb4040f07d07188feb6afc06c"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGVhNTFkMWVhYTllMzRlMjU1YzViMTI2YzViNWM2NTRkMmYzOTkxMzg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ea51d1eaa9e34e255c5b126c5b5c654d2f399138",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/ea51d1eaa9e34e255c5b126c5b5c654d2f399138",
+      "tree": {
+        "sha": "a1e4e434feb33c123ef47619266d10e81aba632f",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/a1e4e434feb33c123ef47619266d10e81aba632f"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/42a992816aceaceeb4040f07d07188feb6afc06c",
+          "sha": "42a992816aceaceeb4040f07d07188feb6afc06c",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/42a992816aceaceeb4040f07d07188feb6afc06c"
+        }
+      ],
+      "message": "net: refactor: Move common logic into SendCompactBlock\n\nAlso one non-refactor change which is setting the `pIndexBestHeaderSent`\non the `SendMessages` CMPCTBLOCK announcement fallback.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:45:47Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-11-27T02:59:23Z"
+      },
+      "sha": "ea51d1eaa9e34e255c5b126c5b5c654d2f399138"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGQ4NGE1N2E5Zjc4Y2IxYTliMTBkMTdlMWRiYmI3NGE1OWZmODkyYTg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8",
+      "tree": {
+        "sha": "49a3f01e013f00157c95021bc9af0252e35af1fb",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/49a3f01e013f00157c95021bc9af0252e35af1fb"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/ea51d1eaa9e34e255c5b126c5b5c654d2f399138",
+          "sha": "ea51d1eaa9e34e255c5b126c5b5c654d2f399138",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/ea51d1eaa9e34e255c5b126c5b5c654d2f399138"
+        }
+      ],
+      "message": "qa: Make PeerHasHeader more robust against nullptr\n\nNoticed while making changes to compact blocks code, right now\n`PeerHasHeader` relies on callers to never make the mistake of calling\nit with a nullptr, `state` can be trivially made into a reference, and\nwe can add an Assume for pindex being nullptr, and fall back to returning\nfalse.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:45:47Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:13:32Z"
+      },
+      "sha": "d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDE5ZTc3MWE1NGQxMGJmNDZkZWI0Mzg4MDJkNzNiZGEyZDVkZjBhZjE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19e771a54d10bf46deb438802d73bda2d5df0af1",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/19e771a54d10bf46deb438802d73bda2d5df0af1",
+      "tree": {
+        "sha": "82ddc080a8ec34abe7341e7907f5a89c0a6c4882",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/82ddc080a8ec34abe7341e7907f5a89c0a6c4882"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8",
+          "sha": "d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/d84a57a9f78cb1a9b10d17e1dbbb74a59ff892a8"
+        }
+      ],
+      "message": "build: Bump minimum Windows to >= Windows 1703\n\nThis is needed for the use of the `SIO_TCP_INFO` API.\n\nhttps://learn.microsoft.com/en-us/windows/win32/api/mstcpip/ns-mstcpip-tcp_info_v0#requirements",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-12-03T19:51:44Z"
+      },
+      "sha": "19e771a54d10bf46deb438802d73bda2d5df0af1"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGIwMTlmYjkxMjgyYTMwOTc3YTg5ZGVmNWM2M2M3YWU1NjhkYTEwNWM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b019fb91282a30977a89def5c63c7ae568da105c",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/b019fb91282a30977a89def5c63c7ae568da105c",
+      "tree": {
+        "sha": "4f62ce382b065515fade2d19de997eb2735f7acb",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/4f62ce382b065515fade2d19de997eb2735f7acb"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/19e771a54d10bf46deb438802d73bda2d5df0af1",
+          "sha": "19e771a54d10bf46deb438802d73bda2d5df0af1",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/19e771a54d10bf46deb438802d73bda2d5df0af1"
+        }
+      ],
+      "message": "sock: Add TCPInfo wrapper for getting socket info.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-09-16T17:47:10Z"
+      },
+      "sha": "b019fb91282a30977a89def5c63c7ae568da105c"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQ0YTkzNzMwMjdhYmYxMjY3Yzc3OTFkMzhmMWY0N2YyZjMwZDhjZGE",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/44a9373027abf1267c7791d38f1f47f2f30d8cda",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/44a9373027abf1267c7791d38f1f47f2f30d8cda",
+      "tree": {
+        "sha": "dd91a5d70a5f7c1f8391406e83585e5b53a4c9a4",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/dd91a5d70a5f7c1f8391406e83585e5b53a4c9a4"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/b019fb91282a30977a89def5c63c7ae568da105c",
+          "sha": "b019fb91282a30977a89def5c63c7ae568da105c",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/b019fb91282a30977a89def5c63c7ae568da105c"
+        }
+      ],
+      "message": "sock: TCPInfo::GetTCPWindowSize()",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-06-18T02:06:38Z"
+      },
+      "sha": "44a9373027abf1267c7791d38f1f47f2f30d8cda"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGRlNzdjNzgzNDUwMTFiYzEzYWM5NmIxZDk4MmJmYTJhNDk2ZDk5NTM",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/de77c78345011bc13ac96b1d982bfa2a496d9953",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/de77c78345011bc13ac96b1d982bfa2a496d9953",
+      "tree": {
+        "sha": "7987f8072e670a717585736c16bb0c7f8634e9aa",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/7987f8072e670a717585736c16bb0c7f8634e9aa"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/44a9373027abf1267c7791d38f1f47f2f30d8cda",
+          "sha": "44a9373027abf1267c7791d38f1f47f2f30d8cda",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/44a9373027abf1267c7791d38f1f47f2f30d8cda"
+        }
+      ],
+      "message": "sock: Add GetOSBytesQueued",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-06-18T02:06:49Z"
+      },
+      "sha": "de77c78345011bc13ac96b1d982bfa2a496d9953"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYzODEzNjFkYmM1ZTFjY2Y2MjExMThhNzI3NDhkMjMzYzM2M2U1MGU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6381361dbc5e1ccf621118a72748d233c363e50e",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/6381361dbc5e1ccf621118a72748d233c363e50e",
+      "tree": {
+        "sha": "14e9831aed0675cffb8cc801c4cb5ce8b0faef4c",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/14e9831aed0675cffb8cc801c4cb5ce8b0faef4c"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/de77c78345011bc13ac96b1d982bfa2a496d9953",
+          "sha": "de77c78345011bc13ac96b1d982bfa2a496d9953",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/de77c78345011bc13ac96b1d982bfa2a496d9953"
+        }
+      ],
+      "message": "net: Add Transport::GetMessageSize() for serialized msg sizes\n\nThis is unused here, but will be useful for estimating the serialized\nbytes in the application send queue.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-06-18T02:00:04Z"
+      },
+      "sha": "6381361dbc5e1ccf621118a72748d233c363e50e"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQ2YWE3MzQyZjU4ZDQ3ZjE3YTNmMTFiNWZiYmJjNjIzZGQyM2MwMjk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/46aa7342f58d47f17a3f11b5fbbbc623dd23c029",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/46aa7342f58d47f17a3f11b5fbbbc623dd23c029",
+      "tree": {
+        "sha": "c2ec19a5b16da522b2a06b5a5d87083cc841382a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/c2ec19a5b16da522b2a06b5a5d87083cc841382a"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6381361dbc5e1ccf621118a72748d233c363e50e",
+          "sha": "6381361dbc5e1ccf621118a72748d233c363e50e",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/6381361dbc5e1ccf621118a72748d233c363e50e"
+        }
+      ],
+      "message": "net: Add GetSendQueueSize()\n\nNot used yet, but will be useful for deciding whether or not prefilling\na CMPCTBLOCK will cause the current message queue to overflow a TCP\nwindow boundary.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-06-18T02:02:22Z"
+      },
+      "sha": "46aa7342f58d47f17a3f11b5fbbbc623dd23c029"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDZkNWU1ZDgxMzcxOTlmMTgxZDNlMmY2OThjZjBjMTg5YTdlOGVjY2Y",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6d5e5d8137199f181d3e2f698cf0c189a7e8eccf",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/6d5e5d8137199f181d3e2f698cf0c189a7e8eccf",
+      "tree": {
+        "sha": "2345240f42517e2103608fb6dba63fac2c81c458",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2345240f42517e2103608fb6dba63fac2c81c458"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/46aa7342f58d47f17a3f11b5fbbbc623dd23c029",
+          "sha": "46aa7342f58d47f17a3f11b5fbbbc623dd23c029",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/46aa7342f58d47f17a3f11b5fbbbc623dd23c029"
+        }
+      ],
+      "message": "net: Add CNode::WindowBytesTotalAndAvailable()",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2025-10-08T00:17:40Z"
+      },
+      "sha": "6d5e5d8137199f181d3e2f698cf0c189a7e8eccf"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYwYWEzNGViMGIyYTRlY2Q1MWU1NWM3MjE2N2U2MDZmOTVhNTI2ZWI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60aa34eb0b2a4ecd51e55c72167e606f95a526eb",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/60aa34eb0b2a4ecd51e55c72167e606f95a526eb",
+      "tree": {
+        "sha": "2cea929413a155df02befaca716ff4446a25e6d4",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/2cea929413a155df02befaca716ff4446a25e6d4"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/6d5e5d8137199f181d3e2f698cf0c189a7e8eccf",
+          "sha": "6d5e5d8137199f181d3e2f698cf0c189a7e8eccf",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/6d5e5d8137199f181d3e2f698cf0c189a7e8eccf"
+        }
+      ],
+      "message": "p2p: keep track of cmpctblock prefill candidates\n\nKeep track of the block position of transactions that we didn't have in\nour mempool while reconstructing this compact block. We can use these to\npredictively prefill transactions in our compact block annoucements.\nThis includes transactions that:\n- were prefilled by the cmpctblock announcer and were not in our mempool\n- transactions we found in our extra_pool (but not mempool)\n- transactions we had to request from the announcer",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "0xb10c",
+        "email": "b10c@b10c.me",
+        "date": "2025-03-19T15:19:23Z"
+      },
+      "sha": "60aa34eb0b2a4ecd51e55c72167e606f95a526eb"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKGFlZTljYzMyODgxYzhjOTI2ZDBiNGYxYTE0OThhN2EwNjczN2RiNDQ",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/aee9cc32881c8c926d0b4f1a1498a7a06737db44",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/aee9cc32881c8c926d0b4f1a1498a7a06737db44",
+      "tree": {
+        "sha": "56c424ff14d7e18ade8e5cafe8b81bd234d42a68",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/56c424ff14d7e18ade8e5cafe8b81bd234d42a68"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/60aa34eb0b2a4ecd51e55c72167e606f95a526eb",
+          "sha": "60aa34eb0b2a4ecd51e55c72167e606f95a526eb",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/60aa34eb0b2a4ecd51e55c72167e606f95a526eb"
+        }
+      ],
+      "message": "p2p: prefill our compact blocks with candidates\n\nUpon receving a compact block, we keep a set of prefill candidates\n(transactions we didn't have in our mempool) for this block. When\nconstructing a compact block, we try to use these candiates to prefill\nour compact block annocement of this block.",
+      "committer": {
+        "name": "David Gumberg",
+        "email": "davidzgumberg@gmail.com",
+        "date": "2026-11-06T01:46:34Z"
+      },
+      "author": {
+        "name": "0xb10c",
+        "email": "b10c@b10c.me",
+        "date": "2025-03-19T15:50:42Z"
+      },
+      "sha": "aee9cc32881c8c926d0b4f1a1498a7a06737db44"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 35305621180,
+      "node_id": "HRFPE_lADOABII588AAAABF4oGfs8AAAAIOGEGvA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35305621180",
+      "actor": {
+        "login": "davidgumberg",
+        "id": 2257631,
+        "node_id": "MDQ6VXNlcjIyNTc2MzE=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/2257631?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/davidgumberg",
+        "html_url": "https://github.com/davidgumberg",
+        "followers_url": "https://api.github.com/users/davidgumberg/followers",
+        "following_url": "https://api.github.com/users/davidgumberg/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/davidgumberg/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/davidgumberg/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/davidgumberg/subscriptions",
+        "organizations_url": "https://api.github.com/users/davidgumberg/orgs",
+        "repos_url": "https://api.github.com/users/davidgumberg/repos",
+        "events_url": "https://api.github.com/users/davidgumberg/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/davidgumberg/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
+      "commit_url": "https://api.github.com/repos/davidgumberg/bitcoin/commits/aee9cc32881c8c926d0b4f1a1498a7a06737db44",
+      "created_at": "2026-11-06T01:46:59Z"
+    },
+    {
+      "event": "labeled",
+      "id": 35305700573,
+      "node_id": "LE_lADOABII588AAAABF4oGfs8AAAAIOGI83Q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/35305700573",
+      "actor": {
+        "login": "DrahtBot",
+        "id": 39886733,
+        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
+        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/DrahtBot",
+        "html_url": "https://github.com/DrahtBot",
+        "followers_url": "https://api.github.com/users/DrahtBot/followers",
+        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
+        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
+        "repos_url": "https://api.github.com/users/DrahtBot/repos",
+        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-06T01:48:22Z",
+      "label": {
+        "name": "CI failed",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
@@ -3764,7 +3929,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 2326,
+      "line": 2314,
       "original_line": 2221,
       "side": "RIGHT"
     },
@@ -3991,9 +4156,9 @@
       "node_id": "PRRC_kwDOABII587R3_GB",
       "diff_hunk": "@@ -2141,25 +2162,48 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha\n \n     if (!DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;\n \n-    uint256 hashBlock(pblock->GetHash());\n-    const std::shared_future<CSerializedNetMsg> lazy_ser{\n-        std::async(std::launch::deferred, [&] { return NetMsg::Make(NetMsgType::CMPCTBLOCK, *pcmpctblock); })};\n+    std::shared_future<CSerializedNetMsg> cb_msg_fut{\n+        std::async(std::launch::async, [pblock = pblock]  {",
       "path": "src/net_processing.cpp",
-      "position": 79,
+      "position": 71,
       "original_position": 79,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": null,
       "user": {
@@ -4034,7 +4199,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 2271,
+      "line": 2259,
       "original_line": 2166,
       "side": "RIGHT"
     },
@@ -4047,7 +4212,7 @@
       "path": "src/net_processing.cpp",
       "position": 30,
       "original_position": 30,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": null,
       "user": {
@@ -4088,7 +4253,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 968,
+      "line": 965,
       "original_line": 887,
       "side": "RIGHT"
     },
@@ -4101,7 +4266,7 @@
       "path": "src/net.cpp",
       "position": 121,
       "original_position": 155,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": null,
       "user": {
@@ -4142,7 +4307,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 4273,
+      "line": 4298,
       "original_line": 4204,
       "side": "RIGHT"
     },
@@ -4155,7 +4320,7 @@
       "path": "src/blockencodings.h",
       "position": 23,
       "original_position": 34,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": null,
       "user": {
@@ -4574,7 +4739,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 2326,
+      "line": 2314,
       "original_line": 2221,
       "side": "RIGHT"
     },
@@ -4639,9 +4804,9 @@
       "node_id": "PRRC_kwDOABII587VlV80",
       "diff_hunk": "@@ -2141,25 +2162,48 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha\n \n     if (!DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;\n \n-    uint256 hashBlock(pblock->GetHash());\n-    const std::shared_future<CSerializedNetMsg> lazy_ser{\n-        std::async(std::launch::deferred, [&] { return NetMsg::Make(NetMsgType::CMPCTBLOCK, *pcmpctblock); })};\n+    std::shared_future<CSerializedNetMsg> cb_msg_fut{\n+        std::async(std::launch::async, [pblock = pblock]  {",
       "path": "src/net_processing.cpp",
-      "position": 79,
+      "position": 71,
       "original_position": 79,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": 3521114497,
       "user": {
@@ -4682,7 +4847,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 2271,
+      "line": 2259,
       "original_line": 2166,
       "side": "RIGHT"
     },
@@ -4749,7 +4914,7 @@
       "path": "src/blockencodings.h",
       "position": 23,
       "original_position": 34,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": 3521178456,
       "user": {
@@ -4803,7 +4968,7 @@
       "path": "src/net.cpp",
       "position": 121,
       "original_position": 155,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": 3521130932,
       "user": {
@@ -4844,7 +5009,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 4273,
+      "line": 4298,
       "original_line": 4204,
       "side": "RIGHT"
     },
@@ -4857,7 +5022,7 @@
       "path": "src/net_processing.cpp",
       "position": 30,
       "original_position": 30,
-      "commit_id": "5871f8666d5f6c882db0d146229474647dbe43be",
+      "commit_id": "aee9cc32881c8c926d0b4f1a1498a7a06737db44",
       "original_commit_id": "63757da199e9ee8d858909b4ffde98a98298abbd",
       "in_reply_to_id": 3521122201,
       "user": {
@@ -4898,7 +5063,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 968,
+      "line": 965,
       "original_line": 887,
       "side": "RIGHT"
     },
