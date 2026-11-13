@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35195/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35195/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/16e77fdf1324e7419eff5adb358f2c9b27db948a",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/61046c54b910f3fcb413f1550a70198585ec9749",
     "number": 35195,
     "state": "open",
     "locked": false,
@@ -40,7 +40,7 @@
       "name": null,
       "patch_url": null
     },
-    "body": "**Problem:** `CCoinsMap` uses `SaltedOutpointHasher` for UTXO cache lookups. Since #16957 marked the hasher `noexcept`, `libstdc++` no longer stores cached hash codes in unordered-map nodes.\r\n\r\n#16957 optimized for memory: the original benchmark reported about `9.4%` lower peak RSS, but also about `1.6%` slower runtime from recomputing hashes. This PR takes the opposite side of that same tradeoff for the UTXO cache: allow `libstdc++` to store one cached hash code per unordered-map node, avoiding repeated `SipHash` work in rehashing and some table operations.\r\n\r\nBenchmarks consistently favored cached hash codes:\r\n* Full IBD/reindex-chainstate runs showed about 2-3% faster at both low and high `-dbcache`.\r\n* `AssumeUTXO` loading showed the strongest signal, up to about `11%` faster. This is the cleanest dbcache-exercising benchmark here because it avoids block download and full validation work, so the coins-cache effect is less diluted.\r\n* Compatibility measurements on top of the input-fetcher parallelization and `SipHash` optimization work still showed cached hash codes helping: about `3%` faster on an Intel N150 after the `SipHash` change, and still about `1%` faster on M4 with `-dbcache=10000`.\r\n* Theoretically, memory can increase on `libstdc++` by up to one cached `size_t` per node. In practice, recent Massif runs were roughly neutral at moderate dbcache values, while a very large dbcache run showed the expected higher peak.\r\n\r\nFor `CCoinsMap`, no allocator sizing change is needed since its [`PoolAllocator` block size](https://github.com/bitcoin/bitcoin/blob/ef499680c8d426ac04f3a5d4ad67cbb3426e0e21/src/coins.h#L215) already reserves implementation-defined node overhead and explicitly accounts for implementations where \"the hash value is stored as well\". That assumption remained in the code after the #16957 `noexcept` change disabled cached hash codes for this hasher, so there is no memory calculation to restore in this PR.\r\n\r\nThis is also consistent with concerns raised in the original [#16957](https://github.com/bitcoin/bitcoin/pull/16957) discussion: reviewers noted the `noexcept` change was slower, that it imposed a penalty when memory was not limiting, and that \"it might be possible to regain the performance loss by caching the hash ourselves.\" This PR lets `libstdc++` do that caching for us.\r\n\r\n**Fix:** Revert #16957's `SaltedOutpointHasher` `noexcept` change, then document the now-intentional `noexcept(false)` contract and add a focused unit test.\r\n\r\nThe implementation still does not throw; only the exception specification used by `libstdc++`'s unordered-map node policy changes: for a fast hash functor that may throw, `libstdc++` caches hash codes in nodes.\r\n\r\nThe test checks both inputs to that policy:\r\n* `SaltedOutpointHasher` is not nothrow-invocable\r\n* on `libstdc++`, it remains classified as a fast hash\r\n\r\nThis mirrors the type-level contract style used in [`libstdc++`'s own hash tests](https://github.com/gcc-mirror/gcc/blob/c0c911821bad196a2abb71e56564bf8c0dfcf231/libstdc%2B%2B-v3/testsuite/std/time/hash.cc#L62).\r\n\r\n**Reproducer:**\r\n\r\n<details>\r\n<summary>Fresh reindex-chainstate run</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000 30000; do \\\r\n    COMMITS=\"ef499680c8d426ac04f3a5d4ad67cbb3426e0e21 1016fba624f840fc893b8de61df4a149ac9551a8\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\nef499680c8 Merge bitcoin/bitcoin#34176: wallet: crash fix, handle non-writable db directories\r\n1016fba624 util: allow caching outpoint hash codes\r\n\r\n2026-04-30 | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n  Time (abs ≡):        19288.792 s               [User: 33333.953 s, System: 1949.252 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n  Time (abs ≡):        18968.171 s               [User: 33375.739 s, System: 2030.692 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n\r\nef499680c8 Merge bitcoin/bitcoin#34176: wallet: crash fix, handle non-writable db directories\r\n1016fba624 util: allow caching outpoint hash codes\r\n\r\n2026-04-30 | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n  Time (abs ≡):        17615.001 s               [User: 24395.224 s, System: 771.559 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n  Time (abs ≡):        17209.581 s               [User: 24079.479 s, System: 785.327 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Earlier supporting measurements</summary>\r\n\r\nOriginal #16957 result:\r\n\r\n```text\r\nmaster                                4:13:59   7696728 KiB\r\n2019-09-SaltedOutpointHasher-noexcept 4:18:11   6971412 KiB\r\nchange                                +1.65%    -9.42%\r\n```\r\n\r\n#16957 also showed that increasing dbcache on the `noexcept` branch could recover performance while staying below old memory use:\r\n\r\n```text\r\nmaster -dbcache=5000     4:13:59   7696728 KiB\r\nnoexcept -dbcache=5471   4:01:16   7282044 KiB\r\n```\r\n\r\nEarlier cached-hash measurements:\r\n\r\n```text\r\nIBD to height 909090, -dbcache=5000\r\nbaseline:     27046.236 s ± 631.042 s\r\ncached hash:  26226.707 s ± 373.829 s\r\nchange:       ~3.0% faster\r\n\r\nreindex-chainstate to height 909090, -dbcache=5000\r\nbaseline:     27728.594 s ± 96.850 s\r\ncached hash:  26847.390 s ± 105.590 s\r\nchange:       ~3.2% faster\r\n\r\nloadtxoutset, -dbcache=500\r\nbaseline:     451.699 s ± 1.126 s\r\ncached hash:  422.857 s ± 1.488 s\r\nchange:       ~6.4% faster\r\n\r\nloadtxoutset, -dbcache=3000\r\nbaseline:     426.088 s ± 1.824 s\r\ncached hash:  403.923 s ± 1.043 s\r\nchange:       ~5.2% faster\r\n\r\nloadtxoutset, -dbcache=4000\r\nbaseline:     440.708 s ± 2.242 s\r\ncached hash:  423.934 s ± 4.145 s\r\nchange:       ~3.8% faster\r\n```\r\n\r\nLater `noexcept` removal measurements:\r\n\r\n```text\r\nreindex-chainstate, height 916000, -dbcache=15000\r\nbaseline:     23856.269 s\r\nno noexcept:  22734.025 s\r\nchange:       ~4.7% faster\r\n\r\nreindex-chainstate, height 917000, -dbcache=30000\r\nbaseline:     12703.654 s\r\nno noexcept:  11957.649 s\r\nchange:       ~5.9% faster\r\n\r\nassumeutxo on i9 SSD, -dbcache=450\r\nbaseline:     347.241 s ± 3.282 s\r\nno noexcept:  309.558 s ± 1.951 s\r\nchange:       ~10.9% faster\r\n```\r\n\r\nMemory observations:\r\n\r\n```text\r\nOriginal #16957:\r\nmaster:      7696728 KiB\r\nnoexcept:    6971412 KiB\r\nchange:      -9.42%\r\n\r\nRecent Massif, assumeutxo -dbcache=450:\r\nbaseline:     744.5 MB\r\ncached hash:  737.7 MB\r\n\r\nRecent Massif, assumeutxo -dbcache=4500:\r\nbaseline:     4.640 GB\r\ncached hash:  4.641 GB\r\n\r\nVery large dbcache:\r\nbaseline:     24.11 GB\r\ncached hash:  25.49 GB\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Compatibility with input-fetcher and `SipHash` work</summary>\r\n\r\nThis change has been in my queue for more than a year, so some supporting measurements are older and were collected while adjacent input-fetcher and `SipHash` work was still evolving. The relevant compatibility measurements are documented in [this #31132 review comment](https://github.com/bitcoin/bitcoin/pull/31132#pullrequestreview-4179154342).\r\n\r\nAfter input fetching, `SipHash` inlining, and `noexcept` removal on an Intel N150:\r\n\r\n```text\r\nreindex-chainstate, height 943349, -dbcache=1000, Intel N150\r\n\r\ninput fetcher baseline:     20014.228 s\r\n`SipHash` optimized:          18933.341 s\r\nno noexcept:                18388.590 s\r\n\r\nchange from `SipHash` optimized to no noexcept: ~2.9% faster\r\nchange from input fetcher baseline to no noexcept: ~8.1% faster\r\n```\r\n\r\nAfter input fetching, `SipHash` inlining, and `noexcept` removal on an M4 Max:\r\n\r\n```text\r\nreindex-chainstate, height 943349, -dbcache=10000, Apple M4 Max\r\n\r\ninput fetcher baseline:     4836.390 s\r\n`SipHash` optimized:          4543.009 s\r\nno noexcept:                4493.407 s\r\n\r\nchange from `SipHash` optimized to no noexcept: ~1.1% faster\r\nchange from input fetcher baseline to no noexcept: ~7.1% faster\r\n```\r\n\r\nThese measurements suggest cached hash-code nodes remain useful even when the hasher itself gets faster and block input fetching is parallelized.\r\n\r\n</details>\r\n",
+    "body": "**Draft status:** Current master uses `SaltedCoinsCacheHasher` for the UTXO cache after #35215. I need to retarget this patch and remeasure it before taking it out of draft. The benchmarks below use the older bases shown.\r\n\r\n**Problem:** On this PR’s base, `CCoinsMap` uses `SaltedOutpointHasher` for UTXO cache lookups. Since #16957 marked the hasher `noexcept`, `libstdc++` no longer stores cached hash codes in unordered-map nodes.\r\n\r\n#16957 optimized for memory: the original benchmark reported about `9.4%` lower peak RSS, but also about `1.6%` slower runtime from recomputing hashes. This PR takes the opposite side of that same tradeoff for the UTXO cache: allow `libstdc++` to store one cached hash code per unordered-map node, avoiding repeated `SipHash` work in rehashing and some table operations.\r\n\r\nBenchmarks consistently favored cached hash codes:\r\n* Full IBD/reindex-chainstate runs showed about 2-3% faster at both low and high `-dbcache`.\r\n* `AssumeUTXO` loading showed the strongest signal, up to about `11%` faster. This is the cleanest dbcache-exercising benchmark here because it avoids block download and full validation work, so the coins-cache effect is less diluted.\r\n* Compatibility measurements on top of the input-fetcher parallelization and `SipHash` optimization work showed about `3%` faster on an Intel N150 after the `SipHash` change.\r\n* Theoretically, memory can increase on `libstdc++` by up to one cached `size_t` per node. In practice, recent Massif runs were roughly neutral at moderate dbcache values, while a very large dbcache run showed the expected higher peak.\r\n\r\nFor `CCoinsMap`, no allocator sizing change is needed since its [`PoolAllocator` block size](https://github.com/bitcoin/bitcoin/blob/ef499680c8d426ac04f3a5d4ad67cbb3426e0e21/src/coins.h#L215) already reserves implementation-defined node overhead and explicitly accounts for implementations where \"the hash value is stored as well\". That assumption remained in the code after the #16957 `noexcept` change disabled cached hash codes for this hasher, so there is no memory calculation to restore in this PR.\r\n\r\nThis is also consistent with concerns raised in the original [#16957](https://github.com/bitcoin/bitcoin/pull/16957) discussion: reviewers noted the `noexcept` change was slower, that it imposed a penalty when memory was not limiting, and that \"it might be possible to regain the performance loss by caching the hash ourselves.\" This PR lets `libstdc++` do that caching for us.\r\n\r\n**Fix:** Revert #16957's `SaltedOutpointHasher` `noexcept` change, then document the now-intentional `noexcept(false)` contract and add a focused unit test.\r\n\r\nThe implementation still does not throw. Only the exception specification used by `libstdc++`'s unordered-map node policy changes: for a fast hash functor that may throw, `libstdc++` caches hash codes in nodes.\r\n\r\nThe test checks both inputs to that policy:\r\n* `SaltedOutpointHasher` is not nothrow-invocable\r\n* on `libstdc++`, it remains classified as a fast hash\r\n\r\nThis mirrors the type-level contract style used in [`libstdc++`'s own hash tests](https://github.com/gcc-mirror/gcc/blob/c0c911821bad196a2abb71e56564bf8c0dfcf231/libstdc%2B%2B-v3/testsuite/std/time/hash.cc#L62).\r\n\r\n**Reproducer:**\r\n\r\n<details>\r\n<summary>Fresh reindex-chainstate run</summary>\r\n\r\n```bash\r\nfor DBCACHE in 1000 30000; do \\\r\n    COMMITS=\"ef499680c8d426ac04f3a5d4ad67cbb3426e0e21 1016fba624f840fc893b8de61df4a149ac9551a8\"; \\\r\n    STOP=946649; CC=gcc; CXX=g++; \\\r\n    BASE_DIR=\"/mnt/my_storage\"; DATA_DIR=\"$BASE_DIR/BitcoinData\"; LOG_DIR=\"$BASE_DIR/logs\"; \\\r\n    (echo \"\"; for c in $COMMITS; do git fetch -q origin \"$c\" 2>/dev/null || true; git log -1 --pretty='%h %s' $c || exit 1; done) && \\\r\n    (echo \"\" && echo \"$(date -I) | reindex-chainstate | ${STOP} blocks | dbcache ${DBCACHE} | $(hostname) | $(uname -m) | $(lscpu | grep 'Model name' | head -1 | cut -d: -f2 | xargs) | $(nproc) cores | $(free -h | awk '/^Mem:/{print $2}') RAM | $(lsblk -no ROTA $(df --output=source $BASE_DIR | tail -1) | grep -q 1 && echo HDD || echo SSD)\"; echo \"\") && \\\r\n    hyperfine \\\r\n    --sort command \\\r\n    --runs 1 \\\r\n    --export-json \"$BASE_DIR/rdx-$(sed -E 's/[^ ]+/\\L&/g;s/[.]/_/g;s/ /-/g'<<<\"$COMMITS\")-$STOP-$DBCACHE-$CC.json\" \\\r\n    --parameter-list COMMIT ${COMMITS// /,} \\\r\n    --prepare \"killall -9 bitcoind 2>/dev/null; rm -f ./build/bin/bitcoind; git clean -fxd; git reset --hard {COMMIT} && \\\r\n      cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ninja -C build bitcoind -j1 && \\\r\n      ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=1000 -printtoconsole=0; sleep 20; rm -f $DATA_DIR/debug.log; rm -rfd $DATA_DIR/indexes;\" \\\r\n    --conclude \"killall bitcoind || true; sleep 5; grep -q 'height=0' $DATA_DIR/debug.log && grep -q 'Disabling script verification at block #1' $DATA_DIR/debug.log && grep -q 'height=$STOP' $DATA_DIR/debug.log && grep 'Bitcoin Core version' $DATA_DIR/debug.log | grep -q \\\"\\$(git rev-parse --short=12 {COMMIT})\\\"; \\\r\n                cp $DATA_DIR/debug.log $LOG_DIR/debug-{COMMIT}-$(date +%s).log\" \\\r\n    \"COMPILER=$CC ./build/bin/bitcoind -datadir=$DATA_DIR -stopatheight=$STOP -dbcache=$DBCACHE -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0\";\r\ndone\r\n\r\nef499680c8 Merge bitcoin/bitcoin#34176: wallet: crash fix, handle non-writable db directories\r\n1016fba624 util: allow caching outpoint hash codes\r\n\r\n2026-04-30 | reindex-chainstate | 946649 blocks | dbcache 1000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n  Time (abs ≡):        19288.792 s               [User: 33333.953 s, System: 1949.252 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n  Time (abs ≡):        18968.171 s               [User: 33375.739 s, System: 2030.692 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=1000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n\r\nef499680c8 Merge bitcoin/bitcoin#34176: wallet: crash fix, handle non-writable db directories\r\n1016fba624 util: allow caching outpoint hash codes\r\n\r\n2026-04-30 | reindex-chainstate | 946649 blocks | dbcache 30000 | i9-ssd | x86_64 | Intel(R) Core(TM) i9-9900K CPU @ 3.60GHz | 16 cores | 62Gi RAM | SSD\r\n\r\nBenchmark 1: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n  Time (abs ≡):        17615.001 s               [User: 24395.224 s, System: 771.559 s]\r\n\r\nBenchmark 2: COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n  Time (abs ≡):        17209.581 s               [User: 24079.479 s, System: 785.327 s]\r\n\r\nRelative speed comparison\r\n        1.02          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = ef499680c8d426ac04f3a5d4ad67cbb3426e0e21)\r\n        1.00          COMPILER=gcc ./build/bin/bitcoind -datadir=/mnt/my_storage/BitcoinData -stopatheight=946649 -dbcache=30000 -reindex-chainstate -blocksonly -connect=0 -printtoconsole=0 (COMMIT = 1016fba624f840fc893b8de61df4a149ac9551a8)\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Earlier supporting measurements</summary>\r\n\r\nOriginal #16957 result:\r\n\r\n```text\r\nmaster                                4:13:59   7696728 KiB\r\n2019-09-SaltedOutpointHasher-noexcept 4:18:11   6971412 KiB\r\nchange                                +1.65%    -9.42%\r\n```\r\n\r\n#16957 also showed that increasing dbcache on the `noexcept` branch could recover performance while staying below old memory use:\r\n\r\n```text\r\nmaster -dbcache=5000     4:13:59   7696728 KiB\r\nnoexcept -dbcache=5471   4:01:16   7282044 KiB\r\n```\r\n\r\nEarlier cached-hash measurements:\r\n\r\n```text\r\nIBD to height 909090, -dbcache=5000\r\nbaseline:     27046.236 s ± 631.042 s\r\ncached hash:  26226.707 s ± 373.829 s\r\nchange:       ~3.0% faster\r\n\r\nreindex-chainstate to height 909090, -dbcache=5000\r\nbaseline:     27728.594 s ± 96.850 s\r\ncached hash:  26847.390 s ± 105.590 s\r\nchange:       ~3.2% faster\r\n\r\nloadtxoutset, -dbcache=500\r\nbaseline:     451.699 s ± 1.126 s\r\ncached hash:  422.857 s ± 1.488 s\r\nchange:       ~6.4% faster\r\n\r\nloadtxoutset, -dbcache=3000\r\nbaseline:     426.088 s ± 1.824 s\r\ncached hash:  403.923 s ± 1.043 s\r\nchange:       ~5.2% faster\r\n\r\nloadtxoutset, -dbcache=4000\r\nbaseline:     440.708 s ± 2.242 s\r\ncached hash:  423.934 s ± 4.145 s\r\nchange:       ~3.8% faster\r\n```\r\n\r\nLater `noexcept` removal measurements:\r\n\r\n```text\r\nreindex-chainstate, height 916000, -dbcache=15000\r\nbaseline:     23856.269 s\r\nno noexcept:  22734.025 s\r\nchange:       ~4.7% faster\r\n\r\nreindex-chainstate, height 917000, -dbcache=30000\r\nbaseline:     12703.654 s\r\nno noexcept:  11957.649 s\r\nchange:       ~5.9% faster\r\n\r\nassumeutxo on i9 SSD, -dbcache=450\r\nbaseline:     347.241 s ± 3.282 s\r\nno noexcept:  309.558 s ± 1.951 s\r\nchange:       ~10.9% faster\r\n```\r\n\r\nMemory observations:\r\n\r\n```text\r\nOriginal #16957:\r\nmaster:      7696728 KiB\r\nnoexcept:    6971412 KiB\r\nchange:      -9.42%\r\n\r\nRecent Massif, assumeutxo -dbcache=450:\r\nbaseline:     744.5 MB\r\ncached hash:  737.7 MB\r\n\r\nRecent Massif, assumeutxo -dbcache=4500:\r\nbaseline:     4.640 GB\r\ncached hash:  4.641 GB\r\n\r\nVery large dbcache:\r\nbaseline:     24.11 GB\r\ncached hash:  25.49 GB\r\n```\r\n\r\n</details>\r\n\r\n<details>\r\n<summary>Compatibility with input-fetcher and `SipHash` work</summary>\r\n\r\nThis change has been in my queue for more than a year, so some supporting measurements are older and were collected while adjacent input-fetcher and `SipHash` work was still evolving. The relevant compatibility measurements are documented in [this #31132 review comment](https://github.com/bitcoin/bitcoin/pull/31132#pullrequestreview-4179154342).\r\n\r\nAfter input fetching, `SipHash` inlining, and `noexcept` removal on an Intel N150:\r\n\r\n```text\r\nreindex-chainstate, height 943349, -dbcache=1000, Intel N150\r\n\r\ninput fetcher baseline:     20014.228 s\r\n`SipHash` optimized:          18933.341 s\r\nno noexcept:                18388.590 s\r\n\r\nchange from `SipHash` optimized to no noexcept: ~2.9% faster\r\nchange from input fetcher baseline to no noexcept: ~8.1% faster\r\n```\r\n\r\nAfter input fetching, `SipHash` inlining, and `noexcept` removal on an M4 Max:\r\n\r\n```text\r\nreindex-chainstate, height 943349, -dbcache=10000, Apple M4 Max\r\n\r\ninput fetcher baseline:     4836.390 s\r\n`SipHash` optimized:          4543.009 s\r\nno noexcept:                4493.407 s\r\n\r\nchange from `SipHash` optimized to no noexcept: ~1.1% faster\r\nchange from input fetcher baseline to no noexcept: ~7.1% faster\r\n```\r\n\r\nThe Intel N150 comparison supports cached hash codes helping alongside the other changes. The M4 measurement does not identify the C++ library, so I cannot attribute its improvement to this mechanism. `libc++` already stores hash codes regardless of `noexcept`.\r\n\r\n</details>\r\n",
     "labels": [
       {
         "id": 97470796,
@@ -49,30 +49,22 @@
         "name": "UTXO Db and Indexes",
         "color": "fbca04",
         "default": false
-      },
-      {
-        "id": 955867938,
-        "node_id": "MDU6TGFiZWw5NTU4Njc5Mzg=",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20rebase",
-        "name": "Needs rebase",
-        "description": "",
-        "color": "cccccc",
-        "default": false
       }
     ],
     "created_at": "2026-05-02T16:22:25Z",
-    "updated_at": "2026-07-31T17:39:15Z",
-    "mergeable": false,
-    "mergeable_state": "dirty",
+    "updated_at": "2026-11-13T17:46:27Z",
+    "mergeable": true,
+    "mergeable_state": "blocked",
     "merged": false,
+    "merge_commit_sha": "9baf3e2083ef03b125a2cec2dd064364e19e4352",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
-    "rebaseable": false,
+    "rebaseable": true,
     "head": {
       "label": "l0rinc:l0rinc/noexcept-false",
       "ref": "l0rinc/noexcept-false",
-      "sha": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
+      "sha": "61046c54b910f3fcb413f1550a70198585ec9749",
       "user": {
         "login": "l0rinc",
         "id": 1841944,
@@ -172,7 +164,7 @@
         "forks_count": 2,
         "stargazers_count": 5,
         "watchers_count": 5,
-        "size": 325531,
+        "size": 391336,
         "default_branch": "master",
         "open_issues_count": 134,
         "is_template": false,
@@ -185,9 +177,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-07-31T14:38:16Z",
+        "pushed_at": "2026-11-13T17:32:21Z",
         "created_at": "2023-08-03T09:49:12Z",
-        "updated_at": "2026-07-30T17:17:57Z",
+        "updated_at": "2026-11-09T21:31:15Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -209,7 +201,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "8f4a3ba8972dae9412ba975a040cea22c227f983",
+      "sha": "a527a0077a0fcae913188410214efe98021c0cca",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -306,12 +298,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39173,
-        "stargazers_count": 89738,
-        "watchers_count": 89738,
-        "size": 321082,
+        "forks_count": 39457,
+        "stargazers_count": 90671,
+        "watchers_count": 90671,
+        "size": 332493,
         "default_branch": "master",
-        "open_issues_count": 691,
+        "open_issues_count": 788,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -328,9 +320,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-07-30T11:32:31Z",
+        "pushed_at": "2026-11-13T16:59:34Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-07-31T20:40:16Z",
+        "updated_at": "2026-11-13T17:49:55Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -356,94 +348,14 @@
     },
     "author_association": "CONTRIBUTOR",
     "draft": true,
-    "additions": 21,
-    "deletions": 7,
+    "additions": 18,
+    "deletions": 3,
     "changed_files": 2,
-    "commits": 2,
+    "commits": 1,
     "review_comments": 4,
-    "comments": 2
+    "comments": 1
   },
   "events": [
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGZiMGMyMDc1Njc2OGMwZmIzOGY3ZGQ5ODEwNDc0NTU4NGQ1MDE1ZmE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fb0c20756768c0fb38f7dd98104745584d5015fa",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/fb0c20756768c0fb38f7dd98104745584d5015fa",
-      "tree": {
-        "sha": "3e90c17894be5db9e1ff12a4370e5aadcbbaaa40",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/3e90c17894be5db9e1ff12a4370e5aadcbbaaa40"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 3e90c17894be5db9e1ff12a4370e5aadcbbaaa40\nparent 8f4a3ba8972dae9412ba975a040cea22c227f983\nauthor Lőrinc <pap.lorinc@gmail.com> 1777735751 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777735867 +0200\n\nRevert \"make SaltedOutpointHasher noexcept\"\n\nThis reverts commit 67d99900b0d770038c9c5708553143137b124a6c.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn2GLsACgkQZp//D/pH\nenaxghAAyXVM0aozFqpmS/cA/yQ3TjAMtJBEPdcAg7jJ7QNXkTfzz3CmrBtS+43C\nHd0oEl7g0zOztOK5MjY44dFOEF4KpALVcdok43JA4rFDHtaLVOykA5vQil5TVg6X\ndK1bU10rZG+UETxnGj16+lXb5VYHTP12ve/o9T4JT5EzbqfYbUBUa5OT8ydU28jf\n1hg0UaP/V19KbhKIfYB3ZApwUGvKcTm0mRQ8bJcS658ox9QXGdqwJYDhTAcUAt70\nQYUW+36pBdvY/V1BGtxeBPE/gXJMCA53HJj/qMqkWAsiW1drxq7u+DTV1ucZqAz6\nTGp/qoqjqtQu90poZPIicK4pX4K+35lOBqBZT9TDUZZWyJ5zELGGaBxOmzI1FImw\nM0pvyFS1c/BeXkbs/oq20QY+oKK9HLYmTnXKVPOCXVAB5jz3eIZ8eDmaUJgZwsAX\nlKROKPwxUDLkIG8xxSbC7CVf6vEvB1sCIE0EU+c5Pyo2ODzsgy0uQFPaRQnAjyF/\nde57hpRoXV4SL9zBVCuq+nwCjhnPnRWmpnhFhDu7vGmWUA1RzpDKf7pRSs9yH4Un\nxVoSmogis1Fuk9l+l+O0+qfmveDr/MmKjk1g1elQNFHJtxEfPgDyOGfrHSTWhajE\nhyqsisoYCBvk0RG73YpYGXsVgh67jKuX2pqFW8VNZbfetTKO4pw=\n=4c6i\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8f4a3ba8972dae9412ba975a040cea22c227f983",
-          "sha": "8f4a3ba8972dae9412ba975a040cea22c227f983",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/8f4a3ba8972dae9412ba975a040cea22c227f983"
-        }
-      ],
-      "message": "Revert \"make SaltedOutpointHasher noexcept\"\n\nThis reverts commit 67d99900b0d770038c9c5708553143137b124a6c.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-02T15:31:07Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-02T15:29:11Z"
-      },
-      "sha": "fb0c20756768c0fb38f7dd98104745584d5015fa"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDE2ZTc3ZmRmMTMyNGU3NDE5ZWZmNWFkYjM1OGYyYzliMjdkYjk0OGE",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/16e77fdf1324e7419eff5adb358f2c9b27db948a",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/16e77fdf1324e7419eff5adb358f2c9b27db948a",
-      "tree": {
-        "sha": "1015d70c060b735425d0b9a0c2d80d12f2b99c45",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1015d70c060b735425d0b9a0c2d80d12f2b99c45"
-      },
-      "verification": {
-        "verified": true,
-        "reason": "valid",
-        "payload": "tree 1015d70c060b735425d0b9a0c2d80d12f2b99c45\nparent fb0c20756768c0fb38f7dd98104745584d5015fa\nauthor Lőrinc <pap.lorinc@gmail.com> 1777532024 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1777735868 +0200\n\nutil: allow caching outpoint hash codes\n\n`SaltedOutpointHasher` has been `noexcept` since #16957, which makes libstdc++ omit cached hash codes from `std::unordered_map` nodes.\n\nThat saves one `size_t` per node, but it also makes `CCoinsMap` recompute the outpoint hash in table operations that could otherwise reuse the cached code.\n\nDeclare the operator `noexcept(false)` to restore libstdc++ hash-code caching for this fast hash functor.\nThe implementation still does not throw; only the exception specification used by the container policy changes.\n\nThis restores a value that #16957 deliberately removed, but the pool-backed `CCoinsMap` allocation budget still accounts for implementations storing hash values.\nThe existing `PoolAllocator` comment says that \"in some cases the hash value is stored as well\" and that \"sizeof(void*)*4\" overhead \"should thus be sufficient so that all implementations can allocate the nodes from the PoolAllocator.\"\n\nAdd a unit test for the exception-specification contract and the libstdc++ fast-hash classification.\n",
-        "signature": "-----BEGIN PGP SIGNATURE-----\n\niQIzBAABCAAdFiEEqXy8dDLWkKQdUrTAZp//D/pHenYFAmn2GLwACgkQZp//D/pH\nenaVbRAArxPC6zOg7f0rcPuAVOkJvyTcVIlgbEpcNkH0w9WqsXPeBTWvAsmWG+7y\nVrrFBrAyZEWcdZDkGayRw+uVjfvsJ3Jh9KrtZpIkvderWlIBIBIWjWPAFGWI4LXn\nNlFBSjZ2NuMc29Z3+0lL/sUrngxcPDYcYvNlXx186fmyfdJ3edUdfZYj5ck6UR4f\nNGwZueY/d9RTKKFL08qdLcuQRsUF2P4Zgyn+cau9az1ioe2O2JOgbk7h/ilEiemD\nyCQp1W6Nsak+SLgqktEAmWrUfaJzsYZef/LYzZZkHfKwVZ8cTHk4IX5eHTNJEiEx\ne/Re4A/cs098Cdwgf7zARigqJEjPposATuB/SDT89cM7XKW3DeaW6KUhyHRwAanM\n8wz4Y+gn8PXxAe5Zq6NyMrTqcsyBgbhidFGeKFKi/PsL+efYIv/9tdIUJ9g5kEaq\nA4UzaXUNsYMas+CarZ1HU20IiYGGcqmU65mQDSASe4nkBDtW46iqTNCzM0q/lhyP\neK+eFowEOlWSExHPfNVh8/RMt8TcbVAtPfkmcEx1OijBmUg3dpPUFY6kgalGnTUG\nJh4P9W8NcHMeEhA/pLE7jJqQI/ZthD0oL3YmecBE/t3ddRPrqywv9j1lQKB9eWuk\nxH7A1lUWcNms8QRwZ71SjSaAIxEoQHXHPFW2Gkyal0kcv/XwU78=\n=6/Ss\n-----END PGP SIGNATURE-----"
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/fb0c20756768c0fb38f7dd98104745584d5015fa",
-          "sha": "fb0c20756768c0fb38f7dd98104745584d5015fa",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/fb0c20756768c0fb38f7dd98104745584d5015fa"
-        }
-      ],
-      "message": "util: allow caching outpoint hash codes\n\n`SaltedOutpointHasher` has been `noexcept` since #16957, which makes libstdc++ omit cached hash codes from `std::unordered_map` nodes.\n\nThat saves one `size_t` per node, but it also makes `CCoinsMap` recompute the outpoint hash in table operations that could otherwise reuse the cached code.\n\nDeclare the operator `noexcept(false)` to restore libstdc++ hash-code caching for this fast hash functor.\nThe implementation still does not throw; only the exception specification used by the container policy changes.\n\nThis restores a value that #16957 deliberately removed, but the pool-backed `CCoinsMap` allocation budget still accounts for implementations storing hash values.\nThe existing `PoolAllocator` comment says that \"in some cases the hash value is stored as well\" and that \"sizeof(void*)*4\" overhead \"should thus be sufficient so that all implementations can allocate the nodes from the PoolAllocator.\"\n\nAdd a unit test for the exception-specification contract and the libstdc++ fast-hash classification.",
-      "committer": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-05-02T15:31:08Z"
-      },
-      "author": {
-        "name": "Lőrinc",
-        "email": "pap.lorinc@gmail.com",
-        "date": "2026-04-30T06:53:44Z"
-      },
-      "sha": "16e77fdf1324e7419eff5adb358f2c9b27db948a"
-    },
     {
       "event": "labeled",
       "id": 25095947200,
@@ -509,9 +421,9 @@
       "commit_id": null,
       "commit_url": null,
       "created_at": "2026-05-02T16:22:38Z",
-      "updated_at": "2026-07-17T05:43:27Z",
+      "updated_at": "2026-11-13T17:32:38Z",
       "author_association": "CONTRIBUTOR",
-      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### Code Coverage & Benchmarks\nFor details see: https://corecheck.dev/bitcoin/bitcoin/pulls/35195.\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [optout21](https://github.com/bitcoin/bitcoin/pull/35195#pullrequestreview-4379811751) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35713](https://github.com/bitcoin/bitcoin/pull/35713) (Remove boost as a unit test runner by rustaceanrob)\n* [#35215](https://github.com/bitcoin/bitcoin/pull/35215) (coins: use SipHash-1-3-UJ for CCoinsMap keys by l0rinc)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
+      "body": "<!--e57a25ab6845829454e8d69fc972939a-->\n\nThe following sections might be updated with supplementary metadata relevant to reviewers and maintainers.\n\n<!--006a51241073e994b41acfe9ec718e94-->\n### External sites\n\n* Code coverage & benchmarks: https://corecheck.dev/bitcoin/bitcoin/pulls/35195\n* Ralph review <img src=https://review.fish.foo/assets/bitcoin/bitcoin/35195.png alt=\"Ralph review status\"> https://git.fish.foo/bitcoin/bitcoin/pulls/35195#author-ralph\n<!--021abf342d371248e50ceaed478a90ca-->\n### Reviews\nSee [the guideline](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#code-review) and [AI policy](https://github.com/bitcoin/bitcoin/blob/master/doc/AI_POLICY.md) for information on the review process.\n| Type | Reviewers |\n| ---- | --------- |\n| Concept ACK | [optout21](https://github.com/bitcoin/bitcoin/pull/35195#pullrequestreview-4379811751) |\n\nIf your review is incorrectly listed, please copy-paste <code>&lt;!--meta-tag:bot-skip--&gt;</code> into the comment that the bot should ignore.\n<!--174a7506f384e20aa4161008e828411d-->\n### Conflicts\nReviewers, this pull request conflicts with the following ones:\n\n* [#35713](https://github.com/bitcoin/bitcoin/pull/35713) (Remove boost as a unit test runner by rustaceanrob)\n* [#35215](https://github.com/bitcoin/bitcoin/pull/35215) (coins: use SipHash-1-3-UJ for CCoinsMap keys by l0rinc)\n\nIf you consider this pull request important, please also help to review the conflicting pull requests. Ideally, start with the one that should be merged first.\n<!--5faf32d7da4f0f540f40219e4f7537a3-->",
       "user": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -736,10 +648,143 @@
       }
     },
     {
-      "event": "commented",
-      "id": 5040203509,
-      "node_id": "IC_kwDOABII588AAAABLGtm9Q",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/5040203509",
+      "event": "referenced",
+      "id": 34123916005,
+      "node_id": "REFE_lADOABII588AAAABBHArqs8AAAAH8fGi5Q",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/34123916005",
+      "actor": {
+        "login": "paulscode",
+        "id": 499600,
+        "node_id": "MDQ6VXNlcjQ5OTYwMA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/499600?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/paulscode",
+        "html_url": "https://github.com/paulscode",
+        "followers_url": "https://api.github.com/users/paulscode/followers",
+        "following_url": "https://api.github.com/users/paulscode/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/paulscode/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/paulscode/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/paulscode/subscriptions",
+        "organizations_url": "https://api.github.com/users/paulscode/orgs",
+        "repos_url": "https://api.github.com/users/paulscode/repos",
+        "events_url": "https://api.github.com/users/paulscode/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/paulscode/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "f64eb0b3e469a984a2e1a1c483a183eba0ceb797",
+      "commit_url": "https://api.github.com/repos/paulscode/knots-sha256/commits/f64eb0b3e469a984a2e1a1c483a183eba0ceb797",
+      "created_at": "2026-10-24T10:45:23Z"
+    },
+    {
+      "event": "referenced",
+      "id": 34424803027,
+      "node_id": "REFE_lADOABII588AAAABBHArqs8AAAAIA-DO0w",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/34424803027",
+      "actor": {
+        "login": "paulscode",
+        "id": 499600,
+        "node_id": "MDQ6VXNlcjQ5OTYwMA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/499600?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/paulscode",
+        "html_url": "https://github.com/paulscode",
+        "followers_url": "https://api.github.com/users/paulscode/followers",
+        "following_url": "https://api.github.com/users/paulscode/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/paulscode/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/paulscode/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/paulscode/subscriptions",
+        "organizations_url": "https://api.github.com/users/paulscode/orgs",
+        "repos_url": "https://api.github.com/users/paulscode/repos",
+        "events_url": "https://api.github.com/users/paulscode/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/paulscode/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "7137a52cda01da9e16be8cdc1d4a707f396d7dd7",
+      "commit_url": "https://api.github.com/repos/paulscode/knots-sha256/commits/7137a52cda01da9e16be8cdc1d4a707f396d7dd7",
+      "created_at": "2026-10-28T00:02:37Z"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDYxMDQ2YzU0YjkxMGYzZmNiNDEzZjE1NTBhNzAxOTg1ODVlYzk3NDk",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/61046c54b910f3fcb413f1550a70198585ec9749",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/61046c54b910f3fcb413f1550a70198585ec9749",
+      "tree": {
+        "sha": "1ae7f52bb7bd7793d1bcfa5ae7951c6dac888580",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/1ae7f52bb7bd7793d1bcfa5ae7951c6dac888580"
+      },
+      "verification": {
+        "verified": true,
+        "reason": "valid",
+        "payload": "tree 1ae7f52bb7bd7793d1bcfa5ae7951c6dac888580\nparent 9183edd25e60aa410bc3e4728989a1d75c309a09\nauthor Lőrinc <pap.lorinc@gmail.com> 1777532024 +0200\ncommitter Lőrinc <pap.lorinc@gmail.com> 1794584633 +0100\n\ncoins: cache UTXO outpoint hash codes\n\nAllow libstdc++ to cache `CCoinsMap` hash codes instead of recomputing them during table operations.\n`CCoinsMap` uses `SaltedCoinsCacheHasher`, introduced in #35215.\nlibstdc++ caches hash codes for a fast hasher only when it is potentially throwing, so change its outpoint overload to `noexcept(false)`.\nThe implementation still does not throw.\nKeep the txid overload unchanged for the temporary txid sets used during input prefetching.\n\nThe pool allocator already reserves room for cached hash values.\nAdd a unit test for the exception specification and libstdc++ fast-hash classification.\n",
+        "signature": "-----BEGIN PGP SIGNATURE-----\n\niJEEABYKADkWIQQiU97U54YbP0PlTVgnCd/LLYEwhwUCavcwOhsUgAAAAAAEAA5t\nYW51MiwyLjUrMS4xMiwwLDMACgkQJwnfyy2BMIeIzgD+IrG/HtAXe16jKGbrZf1j\nbQshv0Kiv83dwwF4PF8Ct+IA/i9V9dcNMJr244b6vfGUjjcnVB6PIJ32oTsx0D4g\n4GID\n=TyBG\n-----END PGP SIGNATURE-----"
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/9183edd25e60aa410bc3e4728989a1d75c309a09",
+          "sha": "9183edd25e60aa410bc3e4728989a1d75c309a09",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/9183edd25e60aa410bc3e4728989a1d75c309a09"
+        }
+      ],
+      "message": "coins: cache UTXO outpoint hash codes\n\nAllow libstdc++ to cache `CCoinsMap` hash codes instead of recomputing them during table operations.\n`CCoinsMap` uses `SaltedCoinsCacheHasher`, introduced in #35215.\nlibstdc++ caches hash codes for a fast hasher only when it is potentially throwing, so change its outpoint overload to `noexcept(false)`.\nThe implementation still does not throw.\nKeep the txid overload unchanged for the temporary txid sets used during input prefetching.\n\nThe pool allocator already reserves room for cached hash values.\nAdd a unit test for the exception specification and libstdc++ fast-hash classification.",
+      "committer": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-11-13T15:43:53Z"
+      },
+      "author": {
+        "name": "Lőrinc",
+        "email": "pap.lorinc@gmail.com",
+        "date": "2026-04-30T06:53:44Z"
+      },
+      "sha": "61046c54b910f3fcb413f1550a70198585ec9749"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 36056215758,
+      "node_id": "HRFPE_lADOABII588AAAABBHArqs8AAAAIZR4wzg",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/36056215758",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "61046c54b910f3fcb413f1550a70198585ec9749",
+      "commit_url": "https://api.github.com/repos/l0rinc/bitcoin/commits/61046c54b910f3fcb413f1550a70198585ec9749",
+      "created_at": "2026-11-13T17:32:25Z"
+    },
+    {
+      "event": "unlabeled",
+      "id": 36057434424,
+      "node_id": "UNLE_lADOABII588AAAABBHArqs8AAAAIZTDJOA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/36057434424",
       "actor": {
         "login": "DrahtBot",
         "id": 39886733,
@@ -764,34 +809,11 @@
       },
       "commit_id": null,
       "commit_url": null,
-      "created_at": "2026-07-21T23:44:37Z",
-      "updated_at": "2026-07-21T23:44:37Z",
-      "author_association": "CONTRIBUTOR",
-      "body": "<!--cf906140f33d8803c4a75a2196329ecb-->\n🐙 This pull request conflicts with the target branch and [needs rebase](https://github.com/bitcoin/bitcoin/blob/master/CONTRIBUTING.md#rebasing-changes).\n",
-      "user": {
-        "login": "DrahtBot",
-        "id": 39886733,
-        "node_id": "MDQ6VXNlcjM5ODg2NzMz",
-        "avatar_url": "https://avatars.githubusercontent.com/u/39886733?v=4",
-        "gravatar_id": "",
-        "url": "https://api.github.com/users/DrahtBot",
-        "html_url": "https://github.com/DrahtBot",
-        "followers_url": "https://api.github.com/users/DrahtBot/followers",
-        "following_url": "https://api.github.com/users/DrahtBot/following%7B/other_user%7D",
-        "gists_url": "https://api.github.com/users/DrahtBot/gists%7B/gist_id%7D",
-        "starred_url": "https://api.github.com/users/DrahtBot/starred%7B/owner%7D%7B/repo%7D",
-        "subscriptions_url": "https://api.github.com/users/DrahtBot/subscriptions",
-        "organizations_url": "https://api.github.com/users/DrahtBot/orgs",
-        "repos_url": "https://api.github.com/users/DrahtBot/repos",
-        "events_url": "https://api.github.com/users/DrahtBot/events%7B/privacy%7D",
-        "received_events_url": "https://api.github.com/users/DrahtBot/received_events",
-        "type": "User",
-        "site_admin": false,
-        "name": null,
-        "patch_url": null
-      },
-      "html_url": "https://github.com/bitcoin/bitcoin/pull/35195#issuecomment-5040203509",
-      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/35195"
+      "created_at": "2026-11-13T17:46:25Z",
+      "label": {
+        "name": "Needs rebase",
+        "color": "cccccc"
+      }
     }
   ],
   "comments": [
@@ -802,7 +824,7 @@
       "node_id": "PRRC_kwDOABII587FssiC",
       "diff_hunk": "@@ -60,16 +60,7 @@ class SaltedOutpointHasher\n public:\n     SaltedOutpointHasher(bool deterministic = false);\n \n-    /**\n-     * Having the hash noexcept allows libstdc++'s unordered_map to recalculate\n-     * the hash during rehash, so it does not have to cache the value. This\n-     * reduces node's memory by sizeof(size_t). The required recalculation has\n-     * a slight performance penalty (around 1.6%), but this is compensated by\n-     * memory savings of about 9% which allow for a larger dbcache setting.\n-     *\n-     * @see https://gcc.gnu.org/onlinedocs/gcc-13.2.0/libstdc++/manual/manual/unordered_associative.html\n-     */\n-    size_t operator()(const COutPoint& id) const noexcept\n+    size_t operator()(const COutPoint& id) const",
       "path": "src/util/hasher.h",
-      "position": 14,
+      "position": 1,
       "original_position": 14,
       "commit_id": "fb0c20756768c0fb38f7dd98104745584d5015fa",
       "original_commit_id": "fb0c20756768c0fb38f7dd98104745584d5015fa",
@@ -845,7 +867,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 63,
+      "line": null,
       "original_line": 63,
       "side": "RIGHT"
     },
@@ -856,7 +878,7 @@
       "node_id": "PRRC_kwDOABII587FsxX8",
       "diff_hunk": "@@ -7,8 +7,15 @@\n #include <hash.h>\n #include <test/util/random.h>\n #include <test/util/setup_common.h>\n+#include <util/hasher.h>\n #include <util/strencodings.h>\n \n+#ifdef __GLIBCXX__\n+#include <bits/functional_hash.h>\n+#endif\n+\n+#include <type_traits>\n+",
       "path": "src/test/hash_tests.cpp",
-      "position": 12,
+      "position": 1,
       "original_position": 12,
       "commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
       "original_commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
@@ -896,10 +918,10 @@
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/35195"
         }
       },
-      "start_line": 16,
+      "start_line": null,
       "original_start_line": 16,
       "start_side": "RIGHT",
-      "line": 18,
+      "line": null,
       "original_line": 18,
       "side": "RIGHT"
     },
@@ -910,7 +932,7 @@
       "node_id": "PRRC_kwDOABII587FsyyP",
       "diff_hunk": "@@ -46,6 +53,16 @@ BOOST_AUTO_TEST_CASE(murmurhash3)\n #undef T\n }\n \n+BOOST_AUTO_TEST_CASE(salted_outpoint_hasher_cache_policy)\n+{\n+    constexpr bool nothrow_invocable{std::is_nothrow_invocable_v<const SaltedOutpointHasher&, const COutPoint&>};\n+    BOOST_CHECK(!nothrow_invocable);\n+#ifdef __GLIBCXX__",
       "path": "src/test/hash_tests.cpp",
-      "position": 24,
+      "position": 1,
       "original_position": 24,
       "commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
       "original_commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
@@ -953,7 +975,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 60,
+      "line": null,
       "original_line": 60,
       "side": "RIGHT"
     },
@@ -964,7 +986,7 @@
       "node_id": "PRRC_kwDOABII587Fs_xT",
       "diff_hunk": "@@ -60,7 +60,13 @@ class SaltedOutpointHasher\n public:\n     SaltedOutpointHasher(bool deterministic = false);\n \n-    size_t operator()(const COutPoint& id) const\n+    /**\n+     * `noexcept(false)` is intentional even though the body cannot throw:\n+     * libstdc++ caches hash codes for potentially throwing fast hash functions.\n+     *\n+     * @see https://gcc.gnu.org/onlinedocs/libstdc++/manual/unordered_associative.html\n+     */\n+    size_t operator()(const COutPoint& id) const noexcept(false)",
       "path": "src/util/hasher.h",
-      "position": 11,
+      "position": 1,
       "original_position": 11,
       "commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
       "original_commit_id": "16e77fdf1324e7419eff5adb358f2c9b27db948a",
@@ -1007,7 +1029,7 @@
       "start_line": null,
       "original_start_line": null,
       "start_side": null,
-      "line": 69,
+      "line": null,
       "original_line": 69,
       "side": "RIGHT"
     }
