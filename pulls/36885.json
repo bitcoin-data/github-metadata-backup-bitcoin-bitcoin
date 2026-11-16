@@ -41,9 +41,19 @@
       "patch_url": null
     },
     "body": "Part of the multisig setup work tracked in #35645. Based on #35918 (the first 3 commits).\n\nBefore importing a multisig descriptor received from a coordinator, each participant needs to check that it is the setup they agreed on: a k-of-n where any k cosigners can spend and nothing else can, that their own key is in it, and that they all derived the same first address. Today nothing in Core reports what a descriptor commits to, so tools had to parse the descriptor string by hand, as the multisig wizard in #36325 (now closed) did.\n\nThis PR adds that check in three layers:\n\n1. **Inspection** (commits by w0xlt, with small changes listed below): `GetKeyInfo()`, `GetKeyInventory()` and `GetPolicy()` describe a parsed descriptor's key expressions, where each key is used, and how they combine. `getdescriptorinfo` gains a `verbose` option that returns them as `keys` and `policy`.\n2. **Multisig analysis, no wallet:** `AnalyzeDescriptor()` tells whether a descriptor is a recognized k-of-n setup, and if not, why. `getdescriptorinfo verbose` returns it as `analysis`, so it works even with `-disablewallet`.\n3. **Wallet part:** `interfaces::Wallet::analyzeDescriptor` (for the GUI) and the `analyzedescriptor` wallet RPC add which keys the wallet holds, whether it can sign, and the first receive address. They accept any descriptor, single-sig included; `analysis.recognized` tells whether it is a safe k-of-n.\n\nRecognized setups are `wsh(multi)`/`wsh(sortedmulti)`, and `tr(K,multi_a)`/`tr(K,sortedmulti_a)` with a single leaf, where `K` is the BIP 341 NUMS point or a `musig()` of at least k distinct cosigners. Every cosigner must be an extended key with an unhardened ranged derivation, and no two cosigners may be the same key. Anything else is still analyzed and returned, with `recognized: false` and the list of issues: the analysis warns, it never refuses a descriptor.\n\nExample, run by one of the three cosigners:\n\n```\n$ bitcoin-cli -rpcwallet=alice analyzedescriptor \"wsh(sortedmulti(2,[a1b2c3d4/48h/1h/0h/2h]tpub.../<0;1>/*,...))\"\n{\n  \"keys\": [\n    { \"role\": \"ecdsa\", \"type\": \"bip32\", \"xpub\": \"tpub...\", \"derivation\": \"/0/*\",\n      \"origin\": { \"master_fingerprint\": \"a1b2c3d4\", \"path\": \"m/48h/1h/0h/2h\" }, \"wallet\": \"mine\" },\n    { ..., \"wallet\": \"not_mine\" },\n    { ..., \"wallet\": \"not_mine\" }\n  ],\n  \"analysis\": { \"recognized\": true, \"shape\": \"wsh_multi\", \"sorted\": true, \"threshold\": 2, \"cosigners\": [0, 1, 2], \"issues\": [] },\n  \"can_sign\": true,\n  \"first_address\": \"bcrt1q...\"\n}\n```\n\nA **locked wallet** is not an error: a cosigner key with a hardened origin path can't be checked without the private key, so it is reported as `\"unknown\"`, and `can_sign` is left out unless another key is already known to be the wallet's. Everything else (`analysis`, `first_address`) is still returned, and the caller can ask the user to unlock and retry. Only the candidate private key is decrypted.\n\n#### Commits\n\n| | Commit | Author |\n|---|---|---|\n| 1‑3 | #35918 | pseudoramdom |\n| 4‑7 | key/policy inspection, `getdescriptorinfo verbose` | w0xlt (see changes below) |\n| 8 | `script: add AnalyzeDescriptor() for multisig setups` | co-authored with w0xlt |\n| 9 | `rpc: add multisig analysis to getdescriptorinfo verbose` | |\n| 10 | `wallet: add analyzeDescriptor to the wallet interface` | co-authored with w0xlt |\n| 11 | `rpc: move descriptor key and analysis JSON helpers to a shared file` | move-only |\n| 12 | `wallet, rpc: add analyzedescriptor` | co-authored with w0xlt |\n\n\n#### Changes made to the inspection commits (4-7)\n\nThe inspection commits come from w0xlt's descriptor inspection [branch](https://github.com/bitcoin/bitcoin/compare/master...w0xlt:bitcoin:feature/descriptor-key-inspection-simplified). These changes were made on top, for w0xlt to review and agree with or not (this section will be removed once agreed):\n\n- *script: expose key expression structure* (was \"expose structured key program data\")\n  - Use `m_root_extkey` instead of `*GetRootExtPubKey()`.\n  - The derivation test also covers `/0h/*` and `/1/*h`, checking the last-hardened and derived caches.\n  - `wide += ')'` instead of `\")\"` in the participant test (clang-tidy `performance-prefer-single-char-overloads`).\n- *script: identify descriptor key occurrences*\n  - `KeyRole()` is pure virtual; descriptors without key arguments (`addr`, `raw`, `sh`, `wsh`) say so explicitly with `NONFATAL_UNREACHABLE()`.\n  - Comment noting that `frame` is invalidated by the following `push_back`.\n  - The walletload test mock is reduced to `return {}`.\n- *script: expose descriptor policy nodes*\n  - The header documents the two forms of the same construct (descriptor function vs Miniscript fragment).\n  - `Assert` → `CHECK_NONFATAL`; explicit `static_cast<uint32_t>` for the threshold.\n  - The fuzz target checks where each child role may appear (tap leaves only under `tr`, `script` only under `sh`/`wsh`, the Taproot internal key only on `tr`, the output key only on `rawtr`).\n- *rpc: add verbose option to getdescriptorinfo*\n  - The multipath note moved to the `verbose` argument help; the `policy` help explains both forms.\n  - Tests for an origin without a path and for MuSig participant origins.\n\nOpen question: `script/descriptor_analysis.h` describes and gives no verdict, while `script/descriptor_analyzer.h` gives the verdict; the names are easy to mix up. Rename the first to `script/descriptor_inspection.h`?\n\n#### Design choices\n\n- An unrecognized descriptor claims no setup: no threshold, cosigners, sorting or key path. For example `wsh(sortedmulti(2,A,A,C))` is not a 2-of-3, since A alone can spend. Each issue lists the key IDs involved instead.\n- The same xpub with different paths in two cosigner slots is a `repeated_key`, as is an xpub and its own child xpub. BIP 388 allows the same key with disjoint paths in general policies, but in a k-of-n it lets one holder fill two slots.\n- A Taproot key path is either `nums` or `musig`. Any other internal key, a `musig()` of fewer than k cosigners, or one with an outsider or a repeated cosigner is `key_path_spendable`.\n- For a multipath descriptor every path is analyzed and must be the same setup (`branches_differ` otherwise). `keys` and `policy` describe the first path.\n- `can_sign` means the wallet holds the private key for at least one key of the descriptor, whatever its shape. Whether it is a safe k-of-n is a separate answer, `analysis.recognized`.\n\nThe functional test scenarios of #36325 were adapted here. The analysis differs from that wizard in a few places:\n\n- `wsh(multi(...))` is recognized, with `sorted: false`: it is a valid k-of-n, and requiring `sortedmulti` was the wizard's own policy.\n- A `musig()` key path of at least k distinct cosigners is recognized: those cosigners can already spend through the leaf.\n- A single-path descriptor (`/0/*`) is recognized; `multipath_expansion` already shows whether it is multipath.\n\n#### Known limits\n\n- A cosigner key is matched against the wallet's HD keys exactly, or by deriving its origin path from the HD key with that fingerprint (normally the master key). If the wallet only holds an imported account xprv, keys below it are matched only exactly.\n\nA release note will follow.",
-    "labels": [],
+    "labels": [
+      {
+        "id": 493267104,
+        "node_id": "MDU6TGFiZWw0OTMyNjcxMDQ=",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/labels/Needs%20release%20note",
+        "name": "Needs release note",
+        "description": "",
+        "color": "d2db6d",
+        "default": false
+      }
+    ],
     "created_at": "2026-11-16T05:48:12Z",
-    "updated_at": "2026-11-16T05:48:55Z",
+    "updated_at": "2026-11-16T10:54:40Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -289,12 +299,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39458,
-        "stargazers_count": 90685,
-        "watchers_count": 90685,
+        "forks_count": 39459,
+        "stargazers_count": 90687,
+        "watchers_count": 90687,
         "size": 332493,
         "default_branch": "master",
-        "open_issues_count": 806,
+        "open_issues_count": 807,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -313,7 +323,7 @@
         "visibility": "public",
         "pushed_at": "2026-11-13T16:59:34Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-16T02:57:02Z",
+        "updated_at": "2026-11-16T08:55:01Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -884,6 +894,41 @@
       },
       "html_url": "https://github.com/bitcoin/bitcoin/pull/36885#issuecomment-6908503450",
       "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36885"
+    },
+    {
+      "event": "labeled",
+      "id": 36266960932,
+      "node_id": "LE_lADOABII588AAAABfl52Sc8AAAAIca3oJA",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/36266960932",
+      "actor": {
+        "login": "fanquake",
+        "id": 863730,
+        "node_id": "MDQ6VXNlcjg2MzczMA==",
+        "avatar_url": "https://avatars.githubusercontent.com/u/863730?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/fanquake",
+        "html_url": "https://github.com/fanquake",
+        "followers_url": "https://api.github.com/users/fanquake/followers",
+        "following_url": "https://api.github.com/users/fanquake/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/fanquake/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/fanquake/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/fanquake/subscriptions",
+        "organizations_url": "https://api.github.com/users/fanquake/orgs",
+        "repos_url": "https://api.github.com/users/fanquake/repos",
+        "events_url": "https://api.github.com/users/fanquake/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/fanquake/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-16T10:54:40Z",
+      "label": {
+        "name": "Needs release note",
+        "color": "d2db6d"
+      }
     }
   ],
   "comments": []
