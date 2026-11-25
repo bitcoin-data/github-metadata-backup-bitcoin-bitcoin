@@ -40,14 +40,14 @@
       "name": null,
       "patch_url": null
     },
-    "body": "**Problem:** Block and undo writers buffer serialized data, then rely on the `BufferedWriter` destructor to write the remaining bytes.\n`fwrite()` can report fewer bytes written than requested after a local storage error, e.g., if the filesystem fills up while a block is being written (my 1 TB benchmarking servers have recently been filling up, so I've been seeing these failures more often).\n`AutoFile::write_buffer()` converts that result into an exception, and because the destructor is implicitly non-throwing, the exception invokes `std::terminate`.\nCalling `flush()` before destruction is insufficient on its own because a failed flush leaves the same bytes pending, so the destructor retries the write while the original exception unwinds.\n\nI introduced this bug in #31551 when adding `BufferedWriter`.\n\nI’d update the **Fix** section to include `discard()` and describe exactly what the destructor checks. The problem statement and reproducer can stay as written.\n\n**Fix:** Block and undo writers now flush explicitly before destruction.\nIf serialization or writing throws `std::ios_base::failure`, they discard any pending bytes, log the error, close the file, and request shutdown through the existing fatal-error path.\n`BufferedWriter` clears the pending byte count before writing because the stream may obfuscate the bytes in place and a short write may already have put some of them on disk, making a retry unsafe.\nThe destructor uses `Assume` to check that no bytes are pending before attempting a fallback flush.\n`flush()` continues to propagate exceptions, and `AutoFile` remains unchanged.\n\n<details>\n<summary>Manual write-error reproducer</summary>\n\nForce the error path in `AutoFile::write_buffer()`:\n\n```sh\nsed -i '' '/^.*AutoFile::write_buffer(/,/^}/s/!= src.size()/!= 0/' src/streams.cpp\ncmake -B build && cmake --build build -j5 && build/bin/bitcoind -regtest -datadir=\"$(mktemp -d)\"; echo \"exit=$?\"\n```\n\nBefore this change, implicit flushing invokes `std::terminate`:\n\n> libc++abi: terminating due to uncaught exception of type std::__1::ios_base::failure: AutoFile::write_buffer: write failed: unspecified iostream_category error\n> zsh: abort      build/bin/bitcoind -regtest -datadir=\"$(mktemp -d)\"\n> exit=134\n\nWith this change, `bitcoind` logs the write failure, then completes normal shutdown and exits with status 1:\n\n> Checking all blk files are present...\n> [error] Failed to write block file FlatFilePos(nFile=0, nPos=8): AutoFile::write_buffer: write failed: unspecified iostream_category error\n> ...\n> Error: A fatal internal error occurred, see debug.log for details: Failed to write block.\n> [error] Writing genesis block to disk failed\n> [error] Error initializing block database\n> ...\n> Shutdown done\n> exit=1\n</details>",
+    "body": "**Problem:** Block and undo writers rely on the `BufferedWriter` destructor to write the last buffered bytes.\nIf the filesystem fills up, `fwrite()` can write fewer bytes than requested (my 1 TB benchmarking servers have been filling up, so I've been seeing these failures more often).\nWhen this happens during the final flush, `AutoFile::write_buffer()` throws and the exception escapes the implicitly non-throwing destructor, invoking `std::terminate` before the node can report the write error and shut down normally.\nAdding an explicit `flush()` alone would still leave the same bytes pending on failure, so the destructor would retry the write during unwinding.\n\nI introduced this bug in #31551 when adding `BufferedWriter`.\n\n**Fix:** Block and undo writers now flush explicitly. If serialization or flushing throws `std::ios_base::failure`, they call `discard()` to drop any pending bytes, log the error, close the file, and request shutdown.\n\n`BufferedWriter::flush()` clears the pending byte count before calling `write_buffer()` and propagates any exception. Retrying would be unsafe because the stream may have obfuscated the bytes in place and a short write may already have put some of them on disk.\nThe destructor uses `Assume` to check that no bytes are pending before its fallback flush.\n\n<details>\n<summary>Manual write-error reproducer</summary>\n\nForce `AutoFile::write_buffer()` to report a write failure even when `fwrite()` succeeds.\n\n```sh\nsed -i '' '/^.*AutoFile::write_buffer(/,/^}/s/!= src.size()/!= 0/' src/streams.cpp\ncmake -B build && cmake --build build -j5 && build/bin/bitcoind -regtest -datadir=\"$(mktemp -d)\"; echo \"exit=$?\"\n```\n\nBefore this change, flushing from the destructor invokes `std::terminate`.\n\n```text\nlibc++abi: terminating due to uncaught exception of type std::__1::ios_base::failure: AutoFile::write_buffer: write failed: unspecified iostream_category error\nzsh: abort      build/bin/bitcoind -regtest -datadir=\"$(mktemp -d)\"\nexit=134\n```\n\nWith this change, `bitcoind` logs the write failure, completes normal shutdown, and exits with status 1.\n\n```text\nChecking all blk files are present...\n[error] Failed to write block file FlatFilePos(nFile=0, nPos=8): AutoFile::write_buffer: write failed: unspecified iostream_category error\n...\nError: A fatal internal error occurred, see debug.log for details: Failed to write block.\n[error] Writing genesis block to disk failed\n[error] Error initializing block database\n...\nShutdown done\nexit=1\n```\n</details>",
     "labels": [],
     "created_at": "2026-08-20T22:06:29Z",
-    "updated_at": "2026-11-24T19:37:42Z",
+    "updated_at": "2026-11-25T13:50:03Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "f3f107462709fe2eeead619e03689a736027cbc5",
+    "merge_commit_sha": "2680398228864015b8aba7936425651fe3cd55b7",
     "assignees": [],
     "requested_reviewers": [
       {
@@ -222,7 +222,7 @@
         "forks_count": 2,
         "stargazers_count": 5,
         "watchers_count": 5,
-        "size": 392288,
+        "size": 392515,
         "default_branch": "master",
         "open_issues_count": 135,
         "is_template": false,
@@ -235,7 +235,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-24T19:34:14Z",
+        "pushed_at": "2026-11-25T13:00:51Z",
         "created_at": "2023-08-03T09:49:12Z",
         "updated_at": "2026-11-09T21:31:15Z",
         "allow_forking": true,
@@ -356,12 +356,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39462,
-        "stargazers_count": 90756,
-        "watchers_count": 90756,
-        "size": 333548,
+        "forks_count": 39460,
+        "stargazers_count": 90766,
+        "watchers_count": 90766,
+        "size": 333801,
         "default_branch": "master",
-        "open_issues_count": 822,
+        "open_issues_count": 823,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -378,9 +378,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-24T18:00:56Z",
+        "pushed_at": "2026-11-25T13:57:53Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-24T18:09:30Z",
+        "updated_at": "2026-11-25T13:15:25Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -410,8 +410,8 @@
     "deletions": 15,
     "changed_files": 3,
     "commits": 5,
-    "review_comments": 31,
-    "comments": 15
+    "review_comments": 32,
+    "comments": 16
   },
   "events": [
     {
@@ -2551,6 +2551,64 @@
         "name": null,
         "patch_url": null
       }
+    },
+    {
+      "event": "commented",
+      "id": 7164311791,
+      "node_id": "IC_kwDOABII588AAAABqwa47w",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/comments/7164311791",
+      "actor": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": "2026-11-25T13:48:11Z",
+      "updated_at": "2026-11-25T13:48:11Z",
+      "author_association": "CONTRIBUTOR",
+      "body": "Thanks, Russ! I've updated the PR description and removed the leftover AI proofreading note.\nIs there anything besides the `discard()` test that you think is missing here? Given that we're actively changing this area, it's probably simpler to leave the code as ACKed and pick up the test and error handling in follow-ups.",
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36049#issuecomment-7164311791",
+      "issue_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36049"
     }
   ],
   "comments": [
@@ -4216,6 +4274,60 @@
       "_links": {
         "self": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4684762185"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36049"
+        }
+      },
+      "start_line": 1176,
+      "original_start_line": 1176,
+      "start_side": "RIGHT",
+      "line": 1182,
+      "original_line": 1182,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4695855324",
+      "pull_request_review_id": 6058814459,
+      "id": 4695855324,
+      "node_id": "PRRC_kwDOABII588AAAABF-UQ3A",
+      "diff_hunk": "@@ -1160,14 +1165,20 @@ FlatFilePos BlockManager::WriteBlock(const CBlock& block, int nHeight)\n         m_opts.notifications.fatalError(_(\"Failed to write block.\"));\n         return FlatFilePos();\n     }\n-    {\n-        BufferedWriter fileout{file};\n-\n+    BufferedWriter fileout{file};\n+    try {\n         // Write index header\n         fileout << GetParams().MessageStart() << block_size;\n         pos.nPos += STORAGE_HEADER_BYTES;\n         // Write block\n         fileout << TX_WITH_WITNESS(block);\n+        fileout.flush();\n+    } catch (const std::ios_base::failure& e) {\n+        fileout.discard();\n+        LogError(\"Failed to write block file %s: %s\", pos.ToString(), e.what());\n+        (void)file.fclose();\n+        m_opts.notifications.fatalError(_(\"Failed to write block.\"));\n+        return FlatFilePos();\n     }",
+      "path": "src/node/blockstorage.cpp",
+      "position": 55,
+      "original_position": 55,
+      "commit_id": "1584299ae51d5c0bb821f4f51521ec6eaf9bdfbd",
+      "original_commit_id": "1584299ae51d5c0bb821f4f51521ec6eaf9bdfbd",
+      "in_reply_to_id": 4684762185,
+      "user": {
+        "login": "l0rinc",
+        "id": 1841944,
+        "node_id": "MDQ6VXNlcjE4NDE5NDQ=",
+        "avatar_url": "https://avatars.githubusercontent.com/u/1841944?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/l0rinc",
+        "html_url": "https://github.com/l0rinc",
+        "followers_url": "https://api.github.com/users/l0rinc/followers",
+        "following_url": "https://api.github.com/users/l0rinc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/l0rinc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/l0rinc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/l0rinc/subscriptions",
+        "organizations_url": "https://api.github.com/users/l0rinc/orgs",
+        "repos_url": "https://api.github.com/users/l0rinc/repos",
+        "events_url": "https://api.github.com/users/l0rinc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/l0rinc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "I don't mind pushing this if reviewers think this is simpler or better.",
+      "created_at": "2026-11-25T13:50:03Z",
+      "updated_at": "2026-11-25T13:50:03Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36049#discussion_r4695855324",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4695855324"
         },
         "pull_request": {
           "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36049"
