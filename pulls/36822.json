@@ -53,7 +53,7 @@
       }
     ],
     "created_at": "2026-11-10T00:06:02Z",
-    "updated_at": "2026-11-25T17:37:05Z",
+    "updated_at": "2026-11-25T18:28:08Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
@@ -188,7 +188,7 @@
         "forks_count": 0,
         "stargazers_count": 0,
         "watchers_count": 0,
-        "size": 287246,
+        "size": 287299,
         "default_branch": "master",
         "open_issues_count": 1,
         "is_template": false,
@@ -323,11 +323,11 @@
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
         "forks_count": 39460,
-        "stargazers_count": 90765,
-        "watchers_count": 90765,
+        "stargazers_count": 90766,
+        "watchers_count": 90766,
         "size": 333811,
         "default_branch": "master",
-        "open_issues_count": 824,
+        "open_issues_count": 825,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -346,7 +346,7 @@
         "visibility": "public",
         "pushed_at": "2026-11-25T17:59:19Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-25T17:22:55Z",
+        "updated_at": "2026-11-25T18:58:29Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -376,7 +376,7 @@
     "deletions": 30,
     "changed_files": 2,
     "commits": 8,
-    "review_comments": 17,
+    "review_comments": 18,
     "comments": 3
   },
   "events": [
@@ -2394,6 +2394,60 @@
       "start_side": null,
       "line": 107,
       "original_line": 89,
+      "side": "RIGHT"
+    },
+    {
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4699162514",
+      "pull_request_review_id": 6062882294,
+      "id": 4699162514,
+      "node_id": "PRRC_kwDOABII588AAAABGBeHkg",
+      "diff_hunk": "@@ -2,66 +2,467 @@\n // Distributed under the MIT software license, see the accompanying\n // file COPYING or http://www.opensource.org/licenses/mit-license.php.\n \n+#include <chainparams.h>\n+#include <common/args.h>\n+#include <crypto/hmac_sha256.h>\n+#include <net.h>\n+#include <netaddress.h>\n+#include <netbase.h>\n+#include <span.h>\n+#include <sync.h>\n #include <test/fuzz/FuzzedDataProvider.h>\n #include <test/fuzz/fuzz.h>\n #include <test/fuzz/util.h>\n+#include <test/util/net.h>\n+#include <test/util/random.h>\n #include <test/util/setup_common.h>\n+#include <test/util/time.h>\n+#include <tinyformat.h>\n #include <torcontrol.h>\n+#include <util/fs.h>\n+#include <util/readwritefile.h>\n+#include <util/strencodings.h>\n+#include <util/string.h>\n+#include <util/threadinterrupt.h>\n \n+#include <algorithm>\n+#include <array>\n+#include <cassert>\n+#include <chrono>\n #include <cstdint>\n+#include <deque>\n+#include <limits>\n+#include <map>\n+#include <memory>\n+#include <optional>\n+#include <set>\n #include <string>\n+#include <string_view>\n+#include <utility>\n #include <vector>\n \n+using namespace std::chrono_literals;\n+\n+//! Defined in torcontrol.cpp but not exported; used to parse replies as the controller does.\n+std::pair<std::string, std::string> SplitTorReplyLine(const std::string& s);\n+std::map<std::string, std::string> ParseTorReplyMapping(const std::string& s);\n+\n+namespace {\n+//! Fits every line the controller parses; the longest, an AUTHCHALLENGE reply, is 166 chars.\n+constexpr size_t MAX_LINE_LENGTH{256};\n+const std::string TOR_CONTROL_ADDRESS{\"127.0.0.1:9051\"};\n+const std::string COOKIE(32, 'c');\n+\n+constexpr std::string_view COOKIEFILE_KEY{\"COOKIEFILE\"};\n+\n+//! `COOKIEFILE=\"<path>\"` for a valid cookie, one of the wrong size and a missing file, created at init.\n+std::array<std::string, 3> g_cookie_args;\n+\n+//! Renames every COOKIEFILE key that doesn't name one of our cookie files. Tor input must not make\n+//! the controller read arbitrary host files: results would vary by host, and some reads block.\n+void RestrictCookieFiles(std::string& text)\n+{\n+    for (size_t pos{0}; (pos = text.find(COOKIEFILE_KEY, pos)) != std::string::npos; ++pos) {\n+        const std::string_view rest{std::string_view{text}.substr(pos)};\n+        if (std::ranges::none_of(g_cookie_args, [&](std::string_view arg) { return rest.starts_with(arg); })) {\n+            text[pos + COOKIEFILE_KEY.size() - 1] = 'X';\n+        }\n+    }\n+}\n+\n+constexpr std::string_view SERVER_HASH_KEY{\"Tor safe cookie authentication server-to-controller hash\"};\n+constexpr std::string_view CLIENT_HASH_KEY{\"Tor safe cookie authentication controller-to-server hash\"};\n+\n+//! Independent copy of the SAFECOOKIE HMAC, keyed with the harness cookie.\n+std::vector<uint8_t> SafeCookieHash(std::string_view key, std::span<const uint8_t> client_nonce, std::span<const uint8_t> server_nonce)\n+{\n+    std::vector<uint8_t> hash(CHMAC_SHA256::OUTPUT_SIZE);\n+    CHMAC_SHA256{UCharCast(key.data()), key.size()}\n+        .Write(UCharCast(COOKIE.data()), COOKIE.size())\n+        .Write(client_nonce.data(), client_nonce.size())\n+        .Write(server_nonce.data(), server_nonce.size())\n+        .Finalize(hash.data());\n+    return hash;\n+}\n+\n+//! The Tor side of the control connection.\n+struct FakeTor {\n+    std::shared_ptr<DynSock::Pipes> pipes{std::make_shared<DynSock::Pipes>()};\n+    //! Reply bytes queued but not yet written to the socket.\n+    std::string pending;\n+    //! End of the bytes already written, too short to hold a whole COOKIEFILE key.\n+    std::string written_tail;\n+    //! Bytes the controller sent that don't form a complete command yet.\n+    std::string sent;\n+    //! From the last AUTHCHALLENGE command, to answer with a matching server hash and check the\n+    //! proof. Kept across reconnects, as the controller keeps its own.\n+    std::vector<uint8_t> client_nonce;\n+    //! Every client nonce sent, to check none repeats.\n+    std::set<std::vector<uint8_t>> client_nonces;\n+    //! The -torpassword. While set, the controller authenticates with it rather than SAFECOOKIE.\n+    std::string password;\n+    //! Verbs of the commands not yet answered on this connection, oldest first. Other operations can\n+    //! also complete replies, so this may drift from the controller's queue; that's still valid input.\n+    std::deque<std::string> unanswered;\n+    //! Written bytes after the last line break.\n+    std::string written_line;\n+    //! Arguments of AUTH lines written on this connection. Parsing them all is slow, so Offered()\n+    //! only does it when a command needs it.\n+    std::vector<std::string> unparsed_auth_args;\n+    //! Authentication methods listed by the parsed AUTH lines.\n+    std::set<std::string> offered_methods;\n+    //! SERVERHASH and SERVERNONCE of every AUTHCHALLENGE line written on this connection that has\n+    //! both, however it was generated.\n+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> challenges;\n+    //! Onion services named by a ServiceID in a line written on this connection.\n+    std::set<CNetAddr> services;\n+\n+    void NewConnection()\n+    {\n+        pipes = std::make_shared<DynSock::Pipes>();\n+        pending.clear();\n+        written_tail.clear();\n+        sent.clear();\n+        unanswered.clear();\n+        written_line.clear();\n+        unparsed_auth_args.clear();\n+        offered_methods.clear();\n+        challenges.clear();\n+        services.clear();\n+    }\n+\n+    //! Records what a written line tells the controller, parsed as\n+    //! TorControlConnection::ProcessBuffer() and the reply callbacks do. Any line counts, whatever\n+    //! command it answers.\n+    void RecordLine(std::string_view line)\n+    {\n+        if (line.size() < 4) return;\n+        const std::string text{line.substr(4)};\n+        // add_onion_cb() parses whole lines, not a verb and its arguments.\n+        const auto line_mapping{ParseTorReplyMapping(text)};\n+        if (const auto it{line_mapping.find(\"ServiceID\")}; it != line_mapping.end()) {\n+            services.insert(LookupNumeric(it->second + \".onion\", Params().GetDefaultPort()));\n+        }\n+        const auto [verb, args]{SplitTorReplyLine(text)};\n+        if (verb == \"AUTH\") {\n+            unparsed_auth_args.push_back(args);\n+        } else if (verb == \"AUTHCHALLENGE\") {\n+            // authchallenge_cb() rejects a challenge missing a key, so skipping it loses nothing.\n+            const auto mapping{ParseTorReplyMapping(args)};\n+            const auto hash{mapping.find(\"SERVERHASH\")};\n+            const auto nonce{mapping.find(\"SERVERNONCE\")};\n+            if (hash != mapping.end() && nonce != mapping.end()) {\n+                challenges.emplace_back(ParseHex(hash->second), ParseHex(nonce->second));\n+            }\n+        }\n+    }\n+\n+    //! Whether a written challenge proved the cookie and `client_hash` is the matching proof.\n+    bool ProvedCookie(std::string_view client_hash) const\n+    {\n+        return std::ranges::any_of(challenges, [&](const auto& challenge) {\n+            const auto& [server_hash, server_nonce]{challenge};\n+            return server_hash == SafeCookieHash(SERVER_HASH_KEY, client_nonce, server_nonce) &&\n+                   client_hash == HexStr(SafeCookieHash(CLIENT_HASH_KEY, client_nonce, server_nonce));\n+        });\n+    }\n+\n+    //! Whether an AUTH line written on this connection, parsed as protocolinfo_cb() does, offered\n+    //! `method`.\n+    bool Offered(const std::string& method)\n+    {\n+        for (const auto& args : unparsed_auth_args) {\n+            const auto mapping{ParseTorReplyMapping(args)};\n+            if (const auto it{mapping.find(\"METHODS\")}; it != mapping.end()) {\n+                for (auto& offered : util::SplitString(it->second, ',')) {\n+                    offered_methods.insert(std::move(offered));\n+                }\n+            }\n+        }\n+        unparsed_auth_args.clear();\n+        return offered_methods.contains(method);\n+    }\n+\n+    //! Writes the first `n` queued bytes to the socket.\n+    void Write(size_t n)\n+    {\n+        // A key may span this write and the previous one; any rename lands past the written tail.\n+        std::string stream{written_tail + pending};\n+        RestrictCookieFiles(stream);\n+        pending = stream.substr(written_tail.size());\n+        pipes->recv.PushBytes(pending.data(), n);\n+        written_tail += pending.substr(0, n);\n+        written_tail.erase(0, written_tail.size() - std::min(written_tail.size(), COOKIEFILE_KEY.size() - 1));\n+        written_line += pending.substr(0, n);\n+        // No length limit: lines the controller rejects as too long only loosen the checks.\n+        util::LineReader reader{written_line, std::numeric_limits<size_t>::max()};\n+        while (const auto line{reader.ReadLine()}) RecordLine(*line);\n+        written_line.erase(0, reader.Consumed());\n+        pending.erase(0, n);\n+    }\n+\n+    //! Reads the commands the controller sent, checks them and queues them for answers.\n+    void ProcessCommands()\n+    {\n+        static constexpr std::array<std::string_view, 5> VERBS{\"PROTOCOLINFO\", \"AUTHENTICATE\", \"AUTHCHALLENGE\", \"GETINFO\", \"ADD_ONION\"};\n+        std::array<char, 4096> buf;\n+        for (ssize_t n; (n = pipes->send.GetBytes(buf.data(), buf.size())) > 0;) {\n+            sent.append(buf.data(), n);\n+        }\n+        for (size_t end; (end = sent.find(\"\\r\\n\")) != std::string::npos; sent.erase(0, end + 2)) {\n+            const std::string_view cmd{std::string_view{sent}.substr(0, end)};\n+            // Reply data must never break a command apart or inject a new one.\n+            assert(cmd.find_first_of(\"\\r\\n\") == std::string_view::npos);\n+            assert(std::ranges::any_of(VERBS, [&](std::string_view verb) { return cmd.starts_with(verb); }));\n+            unanswered.emplace_back(cmd.substr(0, cmd.find(' ')));\n+            // Each authentication method may only be used once Tor offered it on this connection.\n+            if (cmd == \"AUTHENTICATE\") {\n+                assert(Offered(\"NULL\"));\n+            } else if (cmd.starts_with(\"AUTHENTICATE \")) {\n+                const std::string_view arg{cmd.substr(std::string_view{\"AUTHENTICATE \"}.size())};\n+                if (password.empty()) {\n+                    // SAFECOOKIE: send the proof only after Tor proved it knows the cookie.\n+                    assert(ProvedCookie(arg));\n+                } else {\n+                    assert(Offered(\"HASHEDPASSWORD\"));\n+                }\n+            } else if (cmd.starts_with(\"AUTHCHALLENGE SAFECOOKIE \")) {\n+                assert(Offered(\"SAFECOOKIE\"));\n+                client_nonce = ParseHex(cmd.substr(std::string_view{\"AUTHCHALLENGE SAFECOOKIE \"}.size()));\n+                // A repeated nonce would let a recorded server hash prove the cookie again.\n+                assert(client_nonce.size() == 32 && client_nonces.insert(client_nonce).second);\n+            } else if (cmd.starts_with(\"ADD_ONION \")) {\n+                // One port mapping, always from the default virtual port, so the service doesn't\n+                // reveal a node using another port.\n+                std::vector<std::string> ports;\n+                for (auto& arg : util::SplitString(cmd, ' ')) {\n+                    if (arg.starts_with(\"Port=\")) ports.push_back(std::move(arg));\n+                }\n+                assert(ports.size() == 1);\n+                assert(ports.front().starts_with(strprintf(\"Port=%u,\", Params().GetDefaultPort())));\n+            }\n+        }\n+    }\n+};\n+\n+std::string QuoteTorString(std::string_view s)\n+{\n+    std::string quoted{'\"'};\n+    for (const char c : s) {\n+        if (c == '\\\\' || c == '\"') quoted += '\\\\';\n+        quoted += c;\n+    }\n+    return quoted + '\"';\n+}\n+\n+std::string ConsumeAuthLine(FuzzedDataProvider& provider)\n+{\n+    static constexpr std::array<std::string_view, 4> METHODS{\"NULL\", \"COOKIE\", \"SAFECOOKIE\", \"HASHEDPASSWORD\"};",
+      "path": "src/test/fuzz/torcontrol.cpp",
+      "position": 280,
+      "original_position": 259,
+      "commit_id": "cbd8dd443b547c92dac8fe8a535a64dc7561bc40",
+      "original_commit_id": "a0a7c77289dc260a8de7ddc7ff1ae54fa3436cab",
+      "in_reply_to_id": 4688458175,
+      "user": {
+        "login": "winterrdog",
+        "id": 87463258,
+        "node_id": "MDQ6VXNlcjg3NDYzMjU4",
+        "avatar_url": "https://avatars.githubusercontent.com/u/87463258?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/winterrdog",
+        "html_url": "https://github.com/winterrdog",
+        "followers_url": "https://api.github.com/users/winterrdog/followers",
+        "following_url": "https://api.github.com/users/winterrdog/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/winterrdog/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/winterrdog/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/winterrdog/subscriptions",
+        "organizations_url": "https://api.github.com/users/winterrdog/orgs",
+        "repos_url": "https://api.github.com/users/winterrdog/repos",
+        "events_url": "https://api.github.com/users/winterrdog/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/winterrdog/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "body": "> [!NOTE]\r\n> **EDIT**: ignore this i was reading from an old patchset 🤦‍♂️. it's been handled therefore it's resolved\r\n\r\n> shouldn't decrease much the efficiency of the fuzz target.\r\n\r\n~~fair point that it is cheap. my concern is more about the confusion it could cause: the controller does not handle `COOKIE`, and the spec marks it as [deprecated and unsafe](https://spec.torproject.org/control-spec/implementation-notes.html?highlight=__#:~:text=using%20the%20%22COOKIE,version%20of%20Tor.), so it seems very unlikely to ever be supported~~\r\n\r\n~~offering it in the fuzzer could give the impression that there is some code handling it, and someone might go out looking for it~~\r\n\r\n~~if you would rather keep it as a regression guard, could we add a short comment explaining that it is intentionally offered to check that it stays ignored ?~~\r\n\r\n```suggestion\r\n    // the COOKIE auth method is deprecated and the controller ignores it. Kept to check it stays ignored.\r\n    static constexpr std::array<std::string_view, 4> METHODS{\"NULL\", \"COOKIE\", \"SAFECOOKIE\", \"HASHEDPASSWORD\"};\r\n```\r\n\r\n",
+      "created_at": "2026-11-25T18:28:07Z",
+      "updated_at": "2026-11-25T18:41:25Z",
+      "html_url": "https://github.com/bitcoin/bitcoin/pull/36822#discussion_r4699162514",
+      "author_association": "CONTRIBUTOR",
+      "_links": {
+        "self": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments/4699162514"
+        },
+        "pull_request": {
+          "href": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36822"
+        }
+      },
+      "start_line": null,
+      "original_start_line": null,
+      "start_side": null,
+      "line": 281,
+      "original_line": 260,
       "side": "RIGHT"
     }
   ]
