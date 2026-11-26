@@ -12,7 +12,7 @@
     "review_comments_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/36885/comments",
     "review_comment_url": "https://api.github.com/repos/bitcoin/bitcoin/pulls/comments%7B/number%7D",
     "comments_url": "https://api.github.com/repos/bitcoin/bitcoin/issues/36885/comments",
-    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/386c55a4bfcb47a49320ec928b86aedf25101a02",
+    "statuses_url": "https://api.github.com/repos/bitcoin/bitcoin/statuses/029bc7f0b95d995c02b26b6a09f227952d3d7102",
     "number": 36885,
     "state": "open",
     "locked": false,
@@ -43,11 +43,11 @@
     "body": "Part of the multisig setup work tracked in #35645. Based on #35918 (the first 3 commits).\n\nBefore importing a multisig descriptor received from a coordinator, each participant needs to check that it is the setup they agreed on: a k-of-n where any k cosigners can spend and nothing else can, that their own key is in it, and that they all derived the same first address. Today nothing in Core reports what a descriptor commits to, so tools had to parse the descriptor string by hand, as the multisig wizard in #36325 (now closed) did.\n\nThis PR adds that check in three layers:\n\n1. **Inspection** (commits by w0xlt, with small changes listed below): `GetKeyInfo()`, `GetKeyInventory()` and `GetPolicy()` describe a parsed descriptor's key expressions, where each key is used, and how they combine. `getdescriptorinfo` gains a `verbose` option that returns them as `keys` and `policy`.\n2. **Multisig analysis, no wallet:** `AnalyzeDescriptor()` tells whether a descriptor is a recognized k-of-n setup, and if not, why. `getdescriptorinfo verbose` returns it as `analysis`, so it works even with `-disablewallet`.\n3. **Wallet part:** `interfaces::Wallet::analyzeDescriptor` (for the GUI) and the `analyzedescriptor` wallet RPC add which keys the wallet holds, whether it can sign, and the first receive address. They accept any descriptor, single-sig included; `analysis.recognized` tells whether it is a safe k-of-n.\n\nRecognized setups are `wsh(multi)`/`wsh(sortedmulti)`, and `tr(K,multi_a)`/`tr(K,sortedmulti_a)` with a single leaf, where `K` is the BIP 341 NUMS point or a `musig()` of at least k distinct cosigners. Every cosigner must be an extended key with an unhardened ranged derivation, and no two cosigners may be the same key. Anything else is still analyzed and returned, with `recognized: false` and the list of issues: the analysis warns, it never refuses a descriptor.\n\nExample, run by one of the three cosigners:\n\n```\n$ bitcoin-cli -rpcwallet=alice analyzedescriptor \"wsh(sortedmulti(2,[a1b2c3d4/48h/1h/0h/2h]tpub.../<0;1>/*,...))\"\n{\n  \"keys\": [\n    { \"role\": \"ecdsa\", \"type\": \"bip32\", \"xpub\": \"tpub...\", \"derivation\": \"/0/*\",\n      \"origin\": { \"master_fingerprint\": \"a1b2c3d4\", \"path\": \"m/48h/1h/0h/2h\" }, \"wallet\": \"mine\" },\n    { ..., \"wallet\": \"not_mine\" },\n    { ..., \"wallet\": \"not_mine\" }\n  ],\n  \"analysis\": { \"recognized\": true, \"shape\": \"wsh_multi\", \"sorted\": true, \"threshold\": 2, \"cosigners\": [0, 1, 2], \"issues\": [] },\n  \"can_sign\": true,\n  \"first_address\": \"bcrt1q...\"\n}\n```\n\nA **locked wallet** is not an error: a cosigner key with a hardened origin path can't be checked without the private key, so it is reported as `\"unknown\"`, and `can_sign` is left out unless another key is already known to be the wallet's. Everything else (`analysis`, `first_address`) is still returned, and the caller can ask the user to unlock and retry. Only the candidate private key is decrypted.\n\n#### Commits\n\n| | Commit | Author |\n|---|---|---|\n| 1‑3 | #35918 | pseudoramdom |\n| 4‑7 | key/policy inspection, `getdescriptorinfo verbose` | w0xlt (see changes below) |\n| 8 | `script: add AnalyzeDescriptor() for multisig setups` | co-authored with w0xlt |\n| 9 | `rpc: add multisig analysis to getdescriptorinfo verbose` | |\n| 10 | `wallet: add analyzeDescriptor to the wallet interface` | co-authored with w0xlt |\n| 11 | `rpc: move descriptor key and analysis JSON helpers to a shared file` | move-only |\n| 12 | `wallet, rpc: add analyzedescriptor` | co-authored with w0xlt |\n\n\n#### Changes made to the inspection commits (4-7)\n\nThe inspection commits come from w0xlt's descriptor inspection [branch](https://github.com/bitcoin/bitcoin/compare/master...w0xlt:bitcoin:feature/descriptor-key-inspection-simplified). These changes were made on top, for w0xlt to review and agree with or not (this section will be removed once agreed):\n\n- *script: expose key expression structure* (was \"expose structured key program data\")\n  - Use `m_root_extkey` instead of `*GetRootExtPubKey()`.\n  - The derivation test also covers `/0h/*` and `/1/*h`, checking the last-hardened and derived caches.\n  - `wide += ')'` instead of `\")\"` in the participant test (clang-tidy `performance-prefer-single-char-overloads`).\n- *script: identify descriptor key occurrences*\n  - `KeyRole()` is pure virtual; descriptors without key arguments (`addr`, `raw`, `sh`, `wsh`) say so explicitly with `NONFATAL_UNREACHABLE()`.\n  - Comment noting that `frame` is invalidated by the following `push_back`.\n  - The walletload test mock is reduced to `return {}`.\n- *script: expose descriptor policy nodes*\n  - The header documents the two forms of the same construct (descriptor function vs Miniscript fragment).\n  - `Assert` → `CHECK_NONFATAL`; explicit `static_cast<uint32_t>` for the threshold.\n  - The fuzz target checks where each child role may appear (tap leaves only under `tr`, `script` only under `sh`/`wsh`, the Taproot internal key only on `tr`, the output key only on `rawtr`).\n- *rpc: add verbose option to getdescriptorinfo*\n  - The multipath note moved to the `verbose` argument help; the `policy` help explains both forms.\n  - Tests for an origin without a path and for MuSig participant origins.\n\nOpen question: `script/descriptor_analysis.h` describes and gives no verdict, while `script/descriptor_analyzer.h` gives the verdict; the names are easy to mix up. Rename the first to `script/descriptor_inspection.h`?\n\n#### Design choices\n\n- An unrecognized descriptor claims no setup: no threshold, cosigners, sorting or key path. For example `wsh(sortedmulti(2,A,A,C))` is not a 2-of-3, since A alone can spend. Each issue lists the key IDs involved instead.\n- The same xpub with different paths in two cosigner slots is a `repeated_key`, as is an xpub and its own child xpub. BIP 388 allows the same key with disjoint paths in general policies, but in a k-of-n it lets one holder fill two slots.\n- A Taproot key path is either `nums` or `musig`. Any other internal key, a `musig()` of fewer than k cosigners, or one with an outsider or a repeated cosigner is `key_path_spendable`.\n- For a multipath descriptor every path is analyzed and must be the same setup (`branches_differ` otherwise). `keys` and `policy` describe the first path.\n- `can_sign` means the wallet holds the private key for at least one key of the descriptor, whatever its shape. Whether it is a safe k-of-n is a separate answer, `analysis.recognized`.\n\nThe functional test scenarios of #36325 were adapted here. The analysis differs from that wizard in a few places:\n\n- `wsh(multi(...))` is recognized, with `sorted: false`: it is a valid k-of-n, and requiring `sortedmulti` was the wizard's own policy.\n- A `musig()` key path of at least k distinct cosigners is recognized: those cosigners can already spend through the leaf.\n- A single-path descriptor (`/0/*`) is recognized; `multipath_expansion` already shows whether it is multipath.\n\n#### Known limits\n\n- A cosigner key is matched against the wallet's HD keys exactly, or by deriving its origin path from the HD key with that fingerprint (normally the master key). If the wallet only holds an imported account xprv, keys below it are matched only exactly.\n\nA release note will follow.",
     "labels": [],
     "created_at": "2026-11-16T05:48:12Z",
-    "updated_at": "2026-11-26T06:16:16Z",
+    "updated_at": "2026-11-26T15:33:09Z",
     "mergeable": true,
     "mergeable_state": "blocked",
     "merged": false,
-    "merge_commit_sha": "6db1334bd2c2e1000001f462d2cf9b26f771fcc5",
+    "merge_commit_sha": "c2da842ad8c7c7a902c37e45a2de2d3bb1a3622c",
     "assignees": [],
     "requested_reviewers": [],
     "requested_teams": [],
@@ -55,7 +55,7 @@
     "head": {
       "label": "pablomartin4btc:analyze-descriptor",
       "ref": "analyze-descriptor",
-      "sha": "386c55a4bfcb47a49320ec928b86aedf25101a02",
+      "sha": "029bc7f0b95d995c02b26b6a09f227952d3d7102",
       "user": {
         "login": "pablomartin4btc",
         "id": 110166421,
@@ -168,7 +168,7 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-26T06:16:14Z",
+        "pushed_at": "2026-11-26T15:33:08Z",
         "created_at": "2022-07-29T15:13:24Z",
         "updated_at": "2026-11-04T21:43:07Z",
         "allow_forking": true,
@@ -192,7 +192,7 @@
     "base": {
       "label": "bitcoin:master",
       "ref": "master",
-      "sha": "0e8f70a86314bc73539b110d947c41d40c4886fc",
+      "sha": "63a3c03235b3263cda1ded2459188106c838438d",
       "user": {
         "login": "bitcoin",
         "id": 528860,
@@ -289,12 +289,12 @@
         "svn_url": "https://github.com/bitcoin/bitcoin",
         "homepage": "https://bitcoincore.org/en/download",
         "language": "C++",
-        "forks_count": 39458,
-        "stargazers_count": 90774,
-        "watchers_count": 90774,
-        "size": 333899,
+        "forks_count": 39459,
+        "stargazers_count": 90775,
+        "watchers_count": 90775,
+        "size": 333937,
         "default_branch": "master",
-        "open_issues_count": 822,
+        "open_issues_count": 824,
         "is_template": false,
         "topics": [
           "bitcoin",
@@ -311,9 +311,9 @@
         "archived": false,
         "disabled": false,
         "visibility": "public",
-        "pushed_at": "2026-11-25T20:38:45Z",
+        "pushed_at": "2026-11-26T14:04:48Z",
         "created_at": "2010-12-19T15:16:43Z",
-        "updated_at": "2026-11-26T05:43:53Z",
+        "updated_at": "2026-11-26T15:23:52Z",
         "allow_forking": true,
         "license": {
           "key": "mit",
@@ -339,7 +339,7 @@
     },
     "author_association": "MEMBER",
     "draft": false,
-    "additions": 4340,
+    "additions": 4349,
     "deletions": 104,
     "changed_files": 28,
     "commits": 13,
@@ -1717,124 +1717,35 @@
       "created_at": "2026-11-26T05:19:23Z"
     },
     {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDNiOGZjYzkyYzFjNjMwNzA0NDU2MzdlYzk0YjdjMGU4ODE0OGM4ZmY",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3b8fcc92c1c63070445637ec94b7c0e88148c8ff",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/3b8fcc92c1c63070445637ec94b7c0e88148c8ff",
-      "tree": {
-        "sha": "5f3dc07a35df04552625c8ab2807810aecb489bb",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5f3dc07a35df04552625c8ab2807810aecb489bb"
+      "event": "referenced",
+      "id": 37335311062,
+      "node_id": "REFE_lADOABII588AAAABfl52Sc8AAAAIsVui1g",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/37335311062",
+      "actor": {
+        "login": "pablomartin4btc",
+        "id": 110166421,
+        "node_id": "U_kgDOBpEBlQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/110166421?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pablomartin4btc",
+        "html_url": "https://github.com/pablomartin4btc",
+        "followers_url": "https://api.github.com/users/pablomartin4btc/followers",
+        "following_url": "https://api.github.com/users/pablomartin4btc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pablomartin4btc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pablomartin4btc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pablomartin4btc/subscriptions",
+        "organizations_url": "https://api.github.com/users/pablomartin4btc/orgs",
+        "repos_url": "https://api.github.com/users/pablomartin4btc/repos",
+        "events_url": "https://api.github.com/users/pablomartin4btc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pablomartin4btc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
       },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/69105f7aa9cd3fa0ba2c2dfef838db4278989d78",
-          "sha": "69105f7aa9cd3fa0ba2c2dfef838db4278989d78",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/69105f7aa9cd3fa0ba2c2dfef838db4278989d78"
-        }
-      ],
-      "message": "wallet: add analyzeDescriptor to the wallet interface\n\nCombine AnalyzeDescriptor() with what only the wallet knows: which of\nthe descriptor's keys it holds, and so whether it can sign. Also return\nthe first address of each path (e.g. receive and change), which\nparticipants compare to confirm they all built the same wallet. For a\npath with several scripts, like combo(), that is the first script with\nan address, as deriveaddresses lists. Any descriptor is accepted; the\nmultisig analysis tells whether it is a recognized setup.\n\nAn extended key is the wallet's if it is one of the wallet's HD keys, or\nif deriving the rest of its origin path from one of them gives the same\nkey: from the HD key with the origin fingerprint, or after the origin\nthe wallet's descriptors give that HD key, e.g. an account xprv imported\nwith its master's origin. It is mine only if a descriptor holding it also\nholds its private key, as in gethdkeys: the wallet signs with each\ndescriptor's own keys. A cosigner key usually has a hardened origin\npath, so checking it needs the private key. A locked wallet is not an\nerror: such keys are reported as unknown, and the caller can ask the\nuser to unlock and retry, even when the wallet also holds the key\nwithout its private key. Only the one candidate key is decrypted.\n\nA constant key is the wallet's if the wallet stores its private key, or\nif it was derived from one of the wallet's HD keys, checked the same way\nfrom its origin: the one in the descriptor, or the one the wallet\nrecorded when it derived the key, as for a public key from\ngetaddressinfo. The new DescriptorScriptPubKeyMan::GetPubKeyOrigin()\nreturns that recorded origin without any private key. A key the wallet\nhas derived is at least watch-only.\n\nKeys the wallet holds only as musig() participants are matched too, even\nthough GetHDPubKeys() (and so gethdkeys) leaves them out.\n\nCo-authored-by: w0xlt <w0xlt@users.noreply.github.com>",
-      "committer": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-26T06:09:48Z"
-      },
-      "author": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-15T22:15:23Z"
-      },
-      "sha": "3b8fcc92c1c63070445637ec94b7c0e88148c8ff"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKGEzM2U4NGJkYTNmOWM2MzZlYWM1NDI2MGI3OGYxN2UyMDM3YzA2Y2Q",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a33e84bda3f9c636eac54260b78f17e2037c06cd",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/a33e84bda3f9c636eac54260b78f17e2037c06cd",
-      "tree": {
-        "sha": "47e9f34c5d6e70d2e033c42f1717e60b8b79b924",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/47e9f34c5d6e70d2e033c42f1717e60b8b79b924"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/3b8fcc92c1c63070445637ec94b7c0e88148c8ff",
-          "sha": "3b8fcc92c1c63070445637ec94b7c0e88148c8ff",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/3b8fcc92c1c63070445637ec94b7c0e88148c8ff"
-        }
-      ],
-      "message": "wallet, rpc: add analyzedescriptor\n\nExpose the wallet's descriptor analysis as an RPC: the same keys and\nmultisig analysis as getdescriptorinfo verbose, plus which keys this\nwallet holds, whether it can sign, and the first address of each path\nthat participants compare. Any descriptor is accepted.\n\nIt follows the usual wallet RPC rules (-rpcwallet when several wallets\nare loaded, unavailable with -disablewallet). A locked wallet is not an\nerror: keys that need a private key to check are reported as \"unknown\"\nand can_sign is left out. Without a wallet, getdescriptorinfo verbose\ngives the rest.\n\nCo-authored-by: w0xlt <w0xlt@users.noreply.github.com>",
-      "committer": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-26T06:09:48Z"
-      },
-      "author": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-15T22:29:03Z"
-      },
-      "sha": "a33e84bda3f9c636eac54260b78f17e2037c06cd"
-    },
-    {
-      "event": "committed",
-      "id": null,
-      "node_id": "C_kwDOABII59oAKDM4NmM1NWE0YmZjYjQ3YTQ5MzIwZWM5MjhiODZhZWRmMjUxMDFhMDI",
-      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/386c55a4bfcb47a49320ec928b86aedf25101a02",
-      "actor": null,
-      "commit_id": null,
-      "commit_url": null,
-      "created_at": null,
-      "html_url": "https://github.com/bitcoin/bitcoin/commit/386c55a4bfcb47a49320ec928b86aedf25101a02",
-      "tree": {
-        "sha": "6504ff1de61470157cd4590f21e86c9a209d9b5c",
-        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/6504ff1de61470157cd4590f21e86c9a209d9b5c"
-      },
-      "verification": {
-        "verified": false,
-        "reason": "unsigned",
-        "payload": null,
-        "signature": null
-      },
-      "parents": [
-        {
-          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/a33e84bda3f9c636eac54260b78f17e2037c06cd",
-          "sha": "a33e84bda3f9c636eac54260b78f17e2037c06cd",
-          "html_url": "https://github.com/bitcoin/bitcoin/commit/a33e84bda3f9c636eac54260b78f17e2037c06cd"
-        }
-      ],
-      "message": "doc: add release note for #36885",
-      "committer": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-26T06:09:48Z"
-      },
-      "author": {
-        "name": "pablomartin4btc",
-        "email": "pablomartin4btc@gmail.com",
-        "date": "2026-11-16T05:49:12Z"
-      },
-      "sha": "386c55a4bfcb47a49320ec928b86aedf25101a02"
+      "commit_id": "386c55a4bfcb47a49320ec928b86aedf25101a02",
+      "commit_url": "https://api.github.com/repos/pablomartin4btc/bitcoin/commits/386c55a4bfcb47a49320ec928b86aedf25101a02",
+      "created_at": "2026-11-26T06:16:15Z"
     },
     {
       "event": "head_ref_force_pushed",
@@ -1866,6 +1777,157 @@
       "commit_id": "386c55a4bfcb47a49320ec928b86aedf25101a02",
       "commit_url": "https://api.github.com/repos/pablomartin4btc/bitcoin/commits/386c55a4bfcb47a49320ec928b86aedf25101a02",
       "created_at": "2026-11-26T06:16:16Z"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDQxMTdmNGEwMGM4MmI2Y2I3ZmUxNDgxMjQ3NmNiNDg1YTk1ODBjZjc",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4117f4a00c82b6cb7fe14812476cb485a9580cf7",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/4117f4a00c82b6cb7fe14812476cb485a9580cf7",
+      "tree": {
+        "sha": "316383f2e4c85246acf1f29adbc0750aa99fff4a",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/316383f2e4c85246acf1f29adbc0750aa99fff4a"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/69105f7aa9cd3fa0ba2c2dfef838db4278989d78",
+          "sha": "69105f7aa9cd3fa0ba2c2dfef838db4278989d78",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/69105f7aa9cd3fa0ba2c2dfef838db4278989d78"
+        }
+      ],
+      "message": "wallet: add analyzeDescriptor to the wallet interface\n\nCombine AnalyzeDescriptor() with what only the wallet knows: which of\nthe descriptor's keys it holds, and so whether it can sign. Also return\nthe first address of each path (e.g. receive and change), which\nparticipants compare to confirm they all built the same wallet. For a\npath with several scripts, like combo(), that is the first script with\nan address, as deriveaddresses lists. Any descriptor is accepted; the\nmultisig analysis tells whether it is a recognized setup.\n\nAn extended key is the wallet's if it is one of the wallet's HD keys, or\nif deriving the rest of its origin path from one of them gives the same\nkey: from the HD key with the origin fingerprint, or after the origin\nthe wallet's descriptors give that HD key, e.g. an account xprv imported\nwith its master's origin. It is mine only if a descriptor holding it also\nholds its private key, as in gethdkeys: the wallet signs with each\ndescriptor's own keys. A cosigner key usually has a hardened origin\npath, so checking it needs the private key. A locked wallet is not an\nerror: such keys are reported as unknown, and the caller can ask the\nuser to unlock and retry, even when the wallet also holds the key\nwithout its private key. Only the one candidate key is decrypted.\n\nA constant key is the wallet's if the wallet stores its private key, or\nif it was derived from one of the wallet's HD keys, checked the same way\nfrom its origin: the one in the descriptor, or the one the wallet\nrecorded when it derived the key, as for a public key from\ngetaddressinfo. The new DescriptorScriptPubKeyMan::GetPubKeyOrigin()\nreturns that recorded origin without any private key. A key the wallet\nhas derived is at least watch-only.\n\nKeys the wallet holds only as musig() participants are matched too, even\nthough GetHDPubKeys() (and so gethdkeys) leaves them out.\n\nCo-authored-by: w0xlt <w0xlt@users.noreply.github.com>",
+      "committer": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-26T15:20:43Z"
+      },
+      "author": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-15T22:15:23Z"
+      },
+      "sha": "4117f4a00c82b6cb7fe14812476cb485a9580cf7"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDhmYjZhZjczZDdkMWE5NjdjYjZkNzE2MTQwYWVlNzcwOWE2Zjg2ZDU",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8fb6af73d7d1a967cb6d716140aee7709a6f86d5",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/8fb6af73d7d1a967cb6d716140aee7709a6f86d5",
+      "tree": {
+        "sha": "5773ca1f4efd0a2ce2df6f2ee969abf67064ff06",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/5773ca1f4efd0a2ce2df6f2ee969abf67064ff06"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/4117f4a00c82b6cb7fe14812476cb485a9580cf7",
+          "sha": "4117f4a00c82b6cb7fe14812476cb485a9580cf7",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/4117f4a00c82b6cb7fe14812476cb485a9580cf7"
+        }
+      ],
+      "message": "wallet, rpc: add analyzedescriptor\n\nExpose the wallet's descriptor analysis as an RPC: the same keys and\nmultisig analysis as getdescriptorinfo verbose, plus which keys this\nwallet holds, whether it can sign, and the first address of each path\nthat participants compare. Any descriptor is accepted.\n\nIt follows the usual wallet RPC rules (-rpcwallet when several wallets\nare loaded, unavailable with -disablewallet). A locked wallet is not an\nerror: keys that need a private key to check are reported as \"unknown\"\nand can_sign is left out. Without a wallet, getdescriptorinfo verbose\ngives the rest.\n\nCo-authored-by: w0xlt <w0xlt@users.noreply.github.com>",
+      "committer": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-26T15:20:53Z"
+      },
+      "author": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-15T22:29:03Z"
+      },
+      "sha": "8fb6af73d7d1a967cb6d716140aee7709a6f86d5"
+    },
+    {
+      "event": "committed",
+      "id": null,
+      "node_id": "C_kwDOABII59oAKDAyOWJjN2YwYjk1ZDk5NWMwMmIyNmI2YTA5ZjIyNzk1MmQzZDcxMDI",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/029bc7f0b95d995c02b26b6a09f227952d3d7102",
+      "actor": null,
+      "commit_id": null,
+      "commit_url": null,
+      "created_at": null,
+      "html_url": "https://github.com/bitcoin/bitcoin/commit/029bc7f0b95d995c02b26b6a09f227952d3d7102",
+      "tree": {
+        "sha": "047af9270dfd32d0ce7d1d8255db9f5bca20d97b",
+        "url": "https://api.github.com/repos/bitcoin/bitcoin/git/trees/047af9270dfd32d0ce7d1d8255db9f5bca20d97b"
+      },
+      "verification": {
+        "verified": false,
+        "reason": "unsigned",
+        "payload": null,
+        "signature": null
+      },
+      "parents": [
+        {
+          "url": "https://api.github.com/repos/bitcoin/bitcoin/git/commits/8fb6af73d7d1a967cb6d716140aee7709a6f86d5",
+          "sha": "8fb6af73d7d1a967cb6d716140aee7709a6f86d5",
+          "html_url": "https://github.com/bitcoin/bitcoin/commit/8fb6af73d7d1a967cb6d716140aee7709a6f86d5"
+        }
+      ],
+      "message": "doc: add release note for #36885",
+      "committer": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-26T15:20:53Z"
+      },
+      "author": {
+        "name": "pablomartin4btc",
+        "email": "pablomartin4btc@gmail.com",
+        "date": "2026-11-16T05:49:12Z"
+      },
+      "sha": "029bc7f0b95d995c02b26b6a09f227952d3d7102"
+    },
+    {
+      "event": "head_ref_force_pushed",
+      "id": 37384694431,
+      "node_id": "HRFPE_lADOABII588AAAABfl52Sc8AAAAItE0qnw",
+      "url": "https://api.github.com/repos/bitcoin/bitcoin/issues/events/37384694431",
+      "actor": {
+        "login": "pablomartin4btc",
+        "id": 110166421,
+        "node_id": "U_kgDOBpEBlQ",
+        "avatar_url": "https://avatars.githubusercontent.com/u/110166421?v=4",
+        "gravatar_id": "",
+        "url": "https://api.github.com/users/pablomartin4btc",
+        "html_url": "https://github.com/pablomartin4btc",
+        "followers_url": "https://api.github.com/users/pablomartin4btc/followers",
+        "following_url": "https://api.github.com/users/pablomartin4btc/following%7B/other_user%7D",
+        "gists_url": "https://api.github.com/users/pablomartin4btc/gists%7B/gist_id%7D",
+        "starred_url": "https://api.github.com/users/pablomartin4btc/starred%7B/owner%7D%7B/repo%7D",
+        "subscriptions_url": "https://api.github.com/users/pablomartin4btc/subscriptions",
+        "organizations_url": "https://api.github.com/users/pablomartin4btc/orgs",
+        "repos_url": "https://api.github.com/users/pablomartin4btc/repos",
+        "events_url": "https://api.github.com/users/pablomartin4btc/events%7B/privacy%7D",
+        "received_events_url": "https://api.github.com/users/pablomartin4btc/received_events",
+        "type": "User",
+        "site_admin": false,
+        "name": null,
+        "patch_url": null
+      },
+      "commit_id": "029bc7f0b95d995c02b26b6a09f227952d3d7102",
+      "commit_url": "https://api.github.com/repos/pablomartin4btc/bitcoin/commits/029bc7f0b95d995c02b26b6a09f227952d3d7102",
+      "created_at": "2026-11-26T15:33:09Z"
     }
   ],
   "comments": []
